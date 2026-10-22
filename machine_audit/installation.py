@@ -154,16 +154,16 @@ def job_plists(candidate: dict) -> dict[str, dict]:
     }
 
 
-def install(config: Config, *, json_output=False) -> int:
+def install(config: Config, *, json_output=False, yes=False) -> int:
     if sys.platform != 'darwin':
         from .installation_linux import install as linux
-        return linux(config, json_output=json_output)
+        return linux(config, json_output=json_output, yes=yes)
     try:
         candidate = plan(config)
     except (ValueError, RuntimeError, OSError) as exc:
         print(json.dumps({'status': 'not_ready', 'reason': str(exc) if isinstance(exc, (ValueError, RuntimeError)) else type(exc).__name__}))
         return 2
-    if json_output or not sys.stdin.isatty():
+    if json_output or (not sys.stdin.isatty() and not yes):
         print(json.dumps(candidate, indent=2))
         return 0
     print('Install this source revision with the selected Python runtime.')
@@ -171,7 +171,7 @@ def install(config: Config, *, json_output=False) -> int:
     print('Creates a CLI and two background job definitions. Starts neither job.')
     print('Full Disk Access and the optional administrator helper are separate choices.')
     from .onboarding import _yes_no
-    if not _yes_no('Install these files?', True):
+    if not yes and not _yes_no('Install these files?', True):
         return 1
     try:
         _install_files(config, candidate)

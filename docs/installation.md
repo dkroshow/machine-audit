@@ -110,24 +110,36 @@ The scanner and full process workload require their own native measurements.
 ### Linux (Ubuntu) install
 
 The collector and scanner run as a dedicated system user under system units;
-no user unit or linger is needed. Not yet validated on a target.
+no user unit or linger is needed. First validated on an Ubuntu 26.04 VM.
+
+Every product command runs as that user. Once installed, the wrapper is:
+
+```sh
+sudo -u machine-audit -H /var/lib/machine-audit/.local/bin/machine-audit <command>
+```
+
+Before installation, use `python3.12 -m machine_audit <command>` from the
+checkout in its place. `doctor` run as root refuses, because it would read
+root's configuration.
 
 1. As an administrator, create the user, with its home under `/var/lib`:
    `sudo useradd --system --create-home --home-dir /var/lib/machine-audit --shell /usr/sbin/nologin machine-audit`.
 2. Clone the source as that user, so Git trusts the checkout:
    `sudo -u machine-audit -H git clone <repository> /var/lib/machine-audit/source`.
-3. From that checkout, run `sudo -u machine-audit -H python3.12 -m machine_audit setup`.
-   Linux setup asks only about the helper and dashboard hosts, and maps folders
-   and large files (`scanner_grain: folders`).
-4. Add `scanner_exclusions` to that user's
-   `~/.local/share/machine-audit/config.json` if needed. `/proc`, `/sys`, `/dev`,
-   `/run`, `/tmp` and other users' homes are never entered.
-5. Run `sudo -u machine-audit -H python3.12 -m machine_audit install`. It
-   writes a release, a CLI (`~/.local/bin/machine-audit`) and three unit files,
-   then prints the two root commands that place them in `/etc/systemd/system`.
-6. Start with `sudo /var/lib/machine-audit/.local/bin/machine-audit start`,
+3. From that checkout, run `setup` as the user. In a terminal it asks only
+   about the helper and dashboard hosts. Unattended, give the answers as
+   flags: `setup --non-interactive --helper no --hosts dash.example.org
+   --exclude /srv/private`, with one `--exclude` per folder the scanner must
+   not enter. Either way the map keeps folders and large files
+   (`scanner_grain: folders`). `/proc`, `/sys`, `/dev`, `/run`, `/tmp` and
+   other users' homes are never entered.
+4. Run `install` as the user, or `install --yes` unattended. It writes a
+   release, the wrapper above and three unit files, then prints the two
+   root commands that place them in `/etc/systemd/system`.
+5. Start with `sudo /var/lib/machine-audit/.local/bin/machine-audit start`,
    which runs `systemctl enable --now machine-audit.service machine-audit-scan.timer`.
-   Check with `sudo -u machine-audit -H /var/lib/machine-audit/.local/bin/machine-audit doctor`.
+   Then run `doctor` as the user. It says whether the product is installed
+   and running, and shows `Map timer: active, next run <time>`.
 
 `machine-audit.service` runs the collector; `machine-audit-scan.timer` runs
 `machine-audit-scan.service` hourly, and a run between 01:00 and 05:00 walks in
@@ -137,19 +149,28 @@ full once a day. Every unit has `User=`, `ProtectSystem=strict`,
 collector has `CPUWeight=20`, the scanner `Nice=10`, `IOSchedulingClass=idle`
 and `CPUWeight=10`. Python runs with `-B`: the release is read-only to the
 units, and `-I` ignores `PYTHONDONTWRITEBYTECODE`. `stop` disables and stops
-all three and preserves recordings.
+all three and preserves recordings. Without root, `start` and `stop` print the
+exact `systemctl` commands.
 
-`MemoryMax=1G`, from measurements. The scanner: about 30 MB of interpreter,
-a 16 MiB block-map cap (empty on ext4), a 2 MiB write buffer, and a working
-set the first Ubuntu walk measured at 60.7 MB peak for 613,000 entries
-(about 50 bytes an entry beyond the interpreter; a clean 13.6 M-entry Mac
-walk used 462 MB, 34 bytes an entry). 1 GB covers about 19 M entries. The
-collector: 137 MB measured on 2 vCPUs with 280 processes; its unsaved
-buffer stops at 64 MiB, and Linux passes carry far fewer fields than the
-Mac's 2,000-process passes. An OOM kill stops the unit with result
-`oom-kill`: the scanner's run record then reads `interrupted`, and the
-collector restarts with its unsaved span shown as a gap.
-Without root, `start` and `stop` print the exact `systemctl` commands.
+`MemoryMax=1G`, from measurements. A unit's memory counts two different
+things:
+
+- **Process memory**, which only an OOM kill can free. The scanner uses about
+  30 MB of interpreter, a block-map cap of 16 MiB (empty on ext4) and a
+  2 MiB write buffer. A files-grain walk of 613,000 entries peaked at
+  60.7 MB resident, so the working set is about 50 bytes an entry. For
+  5 M entries that is about 280 MB; 1 GB covers about 19 M. Each scan's
+  result JSON now reports its own peak as `peak_rss_bytes`.
+- **The kernel's dentry and inode caches** that a walk fills, charged to the
+  unit and reclaimed when it reaches the limit. A folders-grain unit run of
+  221,000 entries peaked at 323 MB in total. That is about 1.3 KB an entry
+  of cache (a dentry is about 200 bytes and an ext4 inode about 1.1 KB)
+  beyond the process. This part needs no headroom.
+
+The collector measured 137 MB on 2 vCPUs with 280 processes; its unsaved
+buffer stops at 64 MiB. An OOM kill stops the unit with result `oom-kill`.
+The scanner's run record then reads `interrupted`, and the collector
+restarts with its unsaved span shown as a gap.
 
 ## Big Mac first-user trial
 

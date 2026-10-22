@@ -133,7 +133,11 @@ def run_scan(data_dir, *, full=False, grain='files', roots=None, exclusions=(), 
                 path.unlink()
             run_status = ('partial' if published else 'root_unreadable') if root_failed else 'complete'
             store.progress(processed, run_status)
-            return {'status': run_status if root_failed else 'observed', 'volumes': results, 'entries': processed}
+            # The process's own peak, as the run record keeps it. A unit's cgroup peak is larger:
+            # it also counts the kernel's reclaimable dentry and inode caches the walk fills.
+            peak = store.db.execute('SELECT peak_rss_bytes FROM runs WHERE id=?', (store.run,)).fetchone()[0]
+            return {'status': run_status if root_failed else 'observed', 'volumes': results, 'entries': processed,
+                    'peak_rss_bytes': peak}
         except (BudgetExceeded, sqlite3.Error) as exc:
             try:
                 store.mark_failed('budget_blocked' if isinstance(exc, BudgetExceeded) else 'write_failed')

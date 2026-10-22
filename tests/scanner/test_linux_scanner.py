@@ -63,6 +63,7 @@ class LinuxScannerTests(unittest.TestCase):
     def test_nightly_walk_skips_system_areas_and_bind_mounts_but_not_btrfs_subvolumes(self):
         result = self.scan()
         self.assertEqual(result['status'], 'observed')
+        self.assertGreater(result['peak_rss_bytes'], 0)  # visible without journalctl
         volume = result['volumes'][0]['volume_id']
         self.assertRegex(volume, r'\A[0-9a-f]{16}\Z')  # the salted id the capacity source uses
         rows = MapQuery(self.data / 'scanner.sqlite').query('children', volume_id=volume)['rows']

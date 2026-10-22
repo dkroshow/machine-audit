@@ -99,21 +99,21 @@ def placement(candidate: dict) -> list[str]:
             'sudo systemctl daemon-reload']
 
 
-def install(config: Config, *, json_output=False) -> int:
+def install(config: Config, *, json_output=False, yes=False) -> int:
     try:
         candidate = plan(config)
         units = unit_files(candidate)
     except (ValueError, RuntimeError, OSError) as exc:
         print(json.dumps({'status': 'not_ready', 'reason': str(exc) if isinstance(exc, (ValueError, RuntimeError)) else type(exc).__name__}))
         return 2
-    if json_output or not sys.stdin.isatty():
+    if json_output or (not sys.stdin.isatty() and not yes):
         print(json.dumps(dict(candidate, place_units=placement(candidate)), indent=2))
         return 0
     print('Install this source revision for the service user ' + candidate['user'] + '.')
     print(f"Application: {candidate['root']}\nRecordings: {config.root}")
     print('Creates a CLI and three systemd unit files here. Root places them; nothing starts.')
     from .onboarding import _yes_no
-    if not _yes_no('Install these files?', True):
+    if not yes and not _yes_no('Install these files?', True):
         return 1
     try:
         root, cli = Path(candidate['root']), Path(candidate['cli'])

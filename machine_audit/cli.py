@@ -27,6 +27,14 @@ def parser():
     for command in ("setup","doctor","install"):
         sub=commands.add_parser(command)
         sub.add_argument("--json",action="store_true")
+        if command=="setup":
+            # Unattended setup: answers as flags instead of terminal questions.
+            sub.add_argument("--non-interactive",action="store_true")
+            sub.add_argument("--helper",choices=("yes","no"),default="no")
+            sub.add_argument("--hosts",default="",help="comma-separated dashboard host names")
+            sub.add_argument("--exclude",action="append",default=[],help="absolute folder path the scanner never enters")
+        if command=="install":
+            sub.add_argument("--yes",action="store_true",help="install without the confirmation question")
     scan=commands.add_parser("scan")
     scan.add_argument("--root")
     for command in ("now","catalog","status","series","who","coverage","around","storage"):
@@ -105,7 +113,12 @@ def main(argv=None):
     config.validate()
     if args.command in {"setup","doctor","install"}:
         module=importlib.import_module("machine_audit.installation" if args.command=="install" else "machine_audit.onboarding")
-        result=getattr(module,args.command)(config,json_output=args.json)
+        options={}
+        if args.command=="setup" and args.non_interactive:
+            options["answers"]={"helper":args.helper=="yes","hosts":[h.strip().lower() for h in args.hosts.split(",") if h.strip()],"exclusions":args.exclude}
+        if args.command=="install":
+            options["yes"]=args.yes
+        result=getattr(module,args.command)(config,json_output=args.json,**options)
         return result if isinstance(result,int) else 0
     if args.command in {"start", "stop", "permissions"}:
         from .installation import control, check_access

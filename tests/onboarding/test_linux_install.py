@@ -7,9 +7,11 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from machine_audit.cli import main
 from machine_audit.config import Config
-from machine_audit.installation_linux import COLLECTOR, SCANNER, TIMER, control, unit_files
-from machine_audit.onboarding import setup
+from machine_audit.installation_linux import COLLECTOR, SCANNER, TIMER, control, install, unit_files
+from machine_audit.onboarding import doctor, map_timer, setup
+import subprocess
 from test_onboarding import REQUIRED_FREE, free_bytes
 
 CANDIDATE = {'python': '/usr/bin/python3.12', 'release': '/var/lib/monitor/.local/lib/machine-audit/releases/abc123',
@@ -51,6 +53,49 @@ class LinuxInstallTests(unittest.TestCase):
             saved = Config.load(config.path)
             self.assertEqual((saved.enabled, saved.source_options['scanner_grain']), ({'scanner': True}, 'folders'))
             self.assertNotIn('scan_protected_requested', saved.source_options)
+
+    def test_unattended_setup_takes_its_answers_as_flags_and_asks_nothing(self):
+        # First Ubuntu install: setup needed a terminal, which a nologin service user cannot open.
+        with tempfile.TemporaryDirectory() as parent:
+            path = Path(parent) / 'private' / 'config.json'
+            argv = ['--config', str(path), 'setup', '--non-interactive', '--helper', 'yes',
+                    '--hosts', 'dash.example.org', '--exclude', '/srv/private', '--exclude', '/home']
+            with patch('sys.platform', 'linux'), patch('sys.stdin.isatty', return_value=False), \
+                 patch('builtins.input', side_effect=AssertionError('asked')), redirect_stdout(io.StringIO()), free_bytes(REQUIRED_FREE):
+                self.assertEqual(main(argv), 0)
+                saved = Config.load(path)
+                self.assertEqual((saved.source_options['helper_requested'], saved.allowed_hosts, saved.scanner_exclusions,
+                                  saved.source_options['scanner_grain']), (True, ['dash.example.org'], ['/srv/private', '/home'], 'folders'))
+                path.unlink()
+                self.assertEqual(main(argv[:-1] + ['relative/path']), 2)  # refused, nothing saved
+                self.assertFalse(path.exists())
+
+    def test_install_yes_writes_the_installation_without_a_terminal(self):
+        with tempfile.TemporaryDirectory() as parent:
+            config = Config(data_dir=str(Path(parent) / 'data'))
+            config.save()
+            root = Path(parent) / 'app'
+            candidate = dict(CANDIDATE, release=str(root / 'releases' / 'abc123'), root=str(root), config=str(config.path),
+                             data=str(config.root), revision='abc123', source=parent, cli=str(Path(parent) / 'bin' / 'machine-audit'),
+                             units={name: str(root / 'units' / name) for name in (COLLECTOR, SCANNER, TIMER)})
+            with patch('machine_audit.installation_linux.plan', return_value=candidate), \
+                 patch('machine_audit.installation_linux._snapshot', side_effect=lambda c: Path(c['release']).mkdir(parents=True)), \
+                 patch('sys.stdin.isatty', return_value=False), patch('machine_audit.onboarding._yes_no', side_effect=AssertionError('asked')), \
+                 redirect_stdout(io.StringIO()):
+                self.assertEqual(install(config, yes=True), 0)
+            self.assertEqual(sorted(p.name for p in (root / 'units').iterdir()), sorted((COLLECTOR, SCANNER, TIMER)))
+            self.assertTrue((root / 'current.json').is_file() and Path(candidate['cli']).is_file())
+
+    def test_doctor_reads_the_timer_without_privilege_and_refuses_root(self):
+        shown = 'LoadState=loaded\nActiveState=active\nNextElapseUSecRealtime=Wed 2026-10-22 04:00:00 UTC\n'
+        with patch('machine_audit.onboarding.subprocess.run', return_value=subprocess.CompletedProcess([], 0, shown, '')):
+            self.assertEqual(map_timer(), {'state': 'active', 'next': 'Wed 2026-10-22 04:00:00 UTC'})
+        with patch('machine_audit.onboarding.subprocess.run', return_value=subprocess.CompletedProcess([], 0, 'LoadState=not-found\n', '')):
+            self.assertEqual(map_timer()['state'], 'not_installed')
+        output = io.StringIO()
+        with patch('sys.platform', 'linux'), patch('machine_audit.onboarding.os.geteuid', return_value=0), redirect_stdout(output):
+            self.assertEqual(doctor(Config()), 2)  # root's config would be the wrong one
+        self.assertIn('sudo -u <service user> -H', output.getvalue())
 
 
 if __name__ == '__main__':

@@ -7,6 +7,7 @@ import os
 import platform
 from pathlib import Path
 import stat
+import subprocess
 import sys
 
 from .budget import free_space
@@ -76,8 +77,11 @@ def inspect(config: Config) -> dict:
         actions.append("Use Python 3.12 or newer.")
     if directory in {"unsafe", "not_private"}:
         actions.append("Choose a private data directory owned by this user.")
-    if not running:
-        actions.append("Install and start the collector, then run machine-audit doctor again.")
+    installed = bool(config.source_options.get("install_revision"))
+    if not installed:
+        actions.append("Not installed yet: run machine-audit install, then start it.")
+    elif not running:
+        actions.append("Installed but not running: start it with machine-audit start, then run machine-audit doctor again.")
     if not config.enabled.get("scanner", False):
         actions.append("The filesystem map is off: machine-audit scan is not enabled. Run machine-audit setup to turn it on.")
     for name, permission in permissions.items():
@@ -109,6 +113,8 @@ def inspect(config: Config) -> dict:
     return {
         "schema_version": 1,
         "ready": runtime_ok and directory == "private" and running and not actions,
+        "installed": installed,
+        "map_timer": None if sys.platform == 'darwin' else map_timer(),
         "runtime": {"ok": runtime_ok, "python": platform.python_version(), "os": platform.system()},
         "data_directory": directory,
         "collector": connection,
@@ -124,6 +130,19 @@ def inspect(config: Config) -> dict:
     }
 
 
+def map_timer() -> dict:
+    """The Linux scan timer's state and next run, read without privilege."""
+    try:
+        result = subprocess.run(['systemctl', 'show', '-p', 'LoadState,ActiveState,NextElapseUSecRealtime',
+                                 'machine-audit-scan.timer'], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return {'state': 'unknown', 'next': None}
+    values = dict(line.partition('=')[::2] for line in result.stdout.splitlines())
+    if result.returncode or values.get('LoadState') != 'loaded':
+        return {'state': 'not_installed', 'next': None}
+    return {'state': values.get('ActiveState', 'unknown'), 'next': values.get('NextElapseUSecRealtime') or None}
+
+
 def _print_report(report: dict) -> None:
     print(f"Python {report['runtime']['python']}: {'ready' if report['runtime']['ok'] else 'upgrade needed'}")
     print(f"Collector: {report['collector']}; data directory: {report['data_directory']}")
@@ -136,11 +155,18 @@ def _print_report(report: dict) -> None:
         print(f"{title}: {permission['status']} ({wanted})")
         if name == 'scanner' and permission['observed_ns']:
             print('  Last scanner check only; individual denied folders remain visible in the map.')
+    if report.get("map_timer"):
+        timer = report["map_timer"]
+        print(f"Map timer: {timer['state']}" + (f", next run {timer['next']}" if timer["next"] else ""))
     for action in report["next_actions"]:
         print(f"Next: {action}")
 
 
 def doctor(config: Config, *, json_output: bool = False) -> int:
+    if sys.platform != 'darwin' and os.geteuid() == 0:
+        print("doctor reads the service user's files: run it as that user, "
+              "sudo -u <service user> -H <its home>/.local/bin/machine-audit doctor")
+        return 2
     report = inspect(config)
     if json_output:
         print(json.dumps(report, indent=2))
@@ -161,14 +187,15 @@ def _yes_no(prompt: str, default: bool) -> bool:
         print("Enter yes or no.")
 
 
-def setup(config: Config, *, json_output: bool = False) -> int:
-    """Save choices only after confirmation. Installing is a separate explicit action."""
+def setup(config: Config, *, json_output: bool = False, answers: dict | None = None) -> int:
+    """Save choices only after confirmation, or from flag answers (helper, hosts, exclusions)
+    given for an unattended install. Installing is a separate explicit action."""
     mac = sys.platform == 'darwin'
-    if json_output or not sys.stdin.isatty():
+    if answers is None and (json_output or not sys.stdin.isatty()):
         result = {"status": "decisions_needed", "saved": False,
                   "decisions": (["protected_disk_areas", "optional_helper", "exclusive_gpu_reader", "dashboard_hosts"] if mac
                                 else ["optional_helper", "dashboard_hosts"]),
-                  "next_action": "Run machine-audit setup in a terminal to choose access and confirm settings."}
+                  "next_action": "Run machine-audit setup in a terminal, or with --non-interactive and its answers as flags."}
         print(json.dumps(result, indent=2) if json_output else result["next_action"])
         return 2
     print("Machine-audit setup")
@@ -176,7 +203,12 @@ def setup(config: Config, *, json_output: bool = False) -> int:
     print("Storage limit: 10 GB; warning from 5 GB. Monitoring cost stays visible.")
     proposed = deepcopy(config)
     try:
-        if mac:
+        if answers is not None:
+            # Mac-only choices keep their saved values (none requested by default).
+            proposed.source_options["helper_requested"] = answers["helper"]
+            proposed.allowed_hosts = answers["hosts"]
+            proposed.scanner_exclusions = answers["exclusions"]
+        elif mac:
             proposed.source_options["scan_protected_requested"] = _yes_no(
                 "Include protected disk areas? Requires Full Disk Access for the scanner.",
                 bool(config.source_options.get("scan_protected_requested", False)))
@@ -187,15 +219,17 @@ def setup(config: Config, *, json_output: bool = False) -> int:
             proposed.source_options["helper_requested"] = _yes_no(
                 "Record interest in other users' process disk I/O and package power for later? The optional helper is not shipped yet.",
                 bool(config.source_options.get("helper_requested", False)))
+        if not mac:
             # Folders and large files only; the first Ubuntu walk stored 56 MB of names at every-file grain.
             proposed.source_options.setdefault("scanner_grain", "folders")
         proposed.enabled['scanner'] = True
-        if mac:
+        if mac and answers is None:
             proposed.enabled['gpu'] = _yes_no(
                 "Read GPU statistics? Other GPU recorders must be paused before starting.",
                 bool(config.enabled.get('gpu', False)))
-        answer = input("Hostnames you will reach the dashboard through (comma-separated, blank for this machine only): ")
-        proposed.allowed_hosts = [h.strip().lower() for h in answer.split(",") if h.strip()]
+        if answers is None:
+            answer = input("Hostnames you will reach the dashboard through (comma-separated, blank for this machine only): ")
+            proposed.allowed_hosts = [h.strip().lower() for h in answer.split(",") if h.strip()]
         proposed.validate()
         space = free_space(proposed.root)
         if space["free_bytes"] < space["required_free_bytes"]:
@@ -206,14 +240,16 @@ def setup(config: Config, *, json_output: bool = False) -> int:
         print(f"Private recordings: {proposed.root}")
         print("Access choices are requests. The running scanner must confirm permission; the helper is not shipped yet, so its choice is recorded for later."
               if mac else "The helper is not shipped yet, so its choice is recorded for later. The scanner maps what this user may read.")
-        if not _yes_no("Save these choices?", True):
+        if answers is None and not _yes_no("Save these choices?", True):
             print("Cancelled; no settings changed.")
             return 1
     except (EOFError, KeyboardInterrupt):
         print("\nCancelled; no settings changed.")
         return 1
     except ValueError:
-        print("Invalid settings. Use host or host:port names without a scheme or path; nothing was saved.")
+        print("Invalid settings. Use host or host:port names without a scheme or path; nothing was saved."
+              if answers is None else "Invalid settings: hosts need host or host:port names without a scheme or path, "
+              "and exclusions distinct absolute paths. Nothing was saved.")
         return 2
     proposed.save()
     # The caller may continue with the same validated configuration instance.
