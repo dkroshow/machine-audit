@@ -144,7 +144,8 @@ identities in series, including overlapping per-instance memory scopes.
 `model.is_series` defines eligibility for pending records, stored indexes and
 queries. A `process` scope is workload evidence even when a failed read has
 only a `pid:` identity; so are the Linux `unit` and `unit_detail` scopes, and only
-`unit` fields (CPU time, `memory.current`, `io.stat`) rank in `who`. These failures remain in raw records, coverage counts
+`unit` fields (CPU time, `memory.current`, `io.stat`) rank in `who`, each unit
+as its own row; programs never group unit fields. These failures remain in raw records, coverage counts
 and `who`; they are excluded from host/device series. Component `self` remains
 eligible regardless of its process identity or scope.
 

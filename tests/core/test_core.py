@@ -43,6 +43,16 @@ class CoreTests(unittest.TestCase):
         self.store.close()
         self.tmp.cleanup()
 
+    def test_hour_only_scope_writes_no_minute_summaries(self):
+        # Per-scope summary resolution: Linux unit limits (scope unit_detail) were 10% of the first
+        # Ubuntu run's summary payload while changing rarely.
+        c=Clock(10*S,10*S,10*S)
+        reading=Reading("linux.unit_limits","memory",c,c,(Field("unit.memory.max",1,"bytes",entity="cgroup:abc:1",scope="unit_detail"),
+                                                          Field("memory.free",2,"bytes")))
+        self.store.append([Record(reading,"boot","run",1,c.wall_ns,c)])
+        rows=set(self.store.db.execute("SELECT resolution,entity FROM summaries"))
+        self.assertEqual(rows,{("hour","cgroup:abc:1"),("minute","host"),("hour","host")})
+
     def test_raw_counter_reset_and_pid_reuse_do_not_become_usage(self):
         a=process_identity(7,1,"boot");b=process_identity(7,2,"boot")
         rows=points([record(0,10,1,entity=a),record(10,15,2,entity=a),record(20,2,3,entity=a),record(30,100,4,entity=b)])

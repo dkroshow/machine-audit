@@ -97,6 +97,13 @@ weighted mean needs its weights or time integral. Observed states retain reading
 and notifications; durations are estimates. Events retain identity, reason and
 bounded context separately from summary counts.
 
+**Per-scope summary resolution.** A scope may keep hour summaries only, when
+no minute-grain answer reads it and its values change slowly. Raw readings
+still answer recent intervals, and pruning removes them as for any other
+scope. The rule lives in one set in `store.py`. Its first user is the Linux
+`unit_detail` scope: unit limits, memory breakdowns, pressure, throttling and
+process counts. Mac scopes all keep minute and hour summaries.
+
 Per-process rollups, per process instance and per signal, at minute and hourly
 grain, serve the [query design](query-design.md)'s process table and spike
 questions over long spans. Beyond the summary family above they keep the

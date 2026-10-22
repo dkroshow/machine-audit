@@ -14,6 +14,9 @@ from .model import Record, field_component, is_series
 
 MINUTE = 60_000_000_000
 HOUR = 60 * MINUTE
+# Per-scope summary resolution (storage-approach.md): these scopes keep hour summaries only.
+# Raw readings still answer recent intervals.
+HOUR_ONLY_SCOPES = frozenset({"unit_detail"})
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs(run_id TEXT PRIMARY KEY, boot_id TEXT NOT NULL, started_ns INTEGER NOT NULL, stopped_ns INTEGER, last_sequence INTEGER NOT NULL DEFAULT 0, last_saved_ns INTEGER);
 CREATE TABLE IF NOT EXISTS readings(run_id TEXT NOT NULL, sequence INTEGER NOT NULL, wall_ns INTEGER NOT NULL, source TEXT NOT NULL, component TEXT NOT NULL, payload BLOB NOT NULL, PRIMARY KEY(run_id,sequence));
@@ -127,7 +130,8 @@ class Store:
             summaries = defaultdict(list)
             hours=defaultdict(list)
             for bucket,row in rollups(derived,MINUTE):
-                summaries[("minute",bucket,row["source"],row["component"],row["entity"])].append(row)
+                if row["scope"] not in HOUR_ONLY_SCOPES:
+                    summaries[("minute",bucket,row["source"],row["component"],row["entity"])].append(row)
                 hours[(bucket//HOUR*HOUR,row["source"],row["component"],row["entity"],row["signal"],row["unit"],row["scope"],row["kind"],row["scale"])].append(row)
             for key,rows in hours.items():
                 bucket,source,component,entity,*_=key

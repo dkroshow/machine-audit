@@ -162,6 +162,9 @@ class LinuxSourceTests(unittest.TestCase):
         self.assertIn('unit.cpu.stat.usage_usec', signals)
         # First Linux re-run: a process.threads gauge filled 38 of the top 40 CPU rows.
         self.assertTrue(all(r['additive'] for r in rows), signals)
+        # A unit ranks as itself; programs group processes only, so no unit is counted twice.
+        units = [r for r in rows if r['scope'] == 'unit']
+        self.assertTrue(units and all(r['entity'].startswith('cgroup:') for r in units))
         self.assertFalse(signals & {'unit.cpu.weight', 'unit.cpu.max.quota', 'unit.processes', 'unit.cpu.pressure.some',
                                     'unit.cpu.stat.nr_periods'})
 

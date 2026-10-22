@@ -44,8 +44,10 @@ One 10 s pass, `linux.workloads`, reads units and their processes together.
 - Entity: `cgroup:` + HMAC(salt, path)[:16] + `:` + directory inode, so a
   restarted unit starts a new counter baseline. Units are never host series.
   Only consumption (CPU time, `memory.current`, `io.stat`) has scope `unit`
-  and ranks in `who`; limits, breakdowns, pressure and process counts have
-  scope `unit_detail`.
+  and ranks in `who` as itself; programs never group unit fields, so a unit is
+  never counted twice, and instances of a templated unit rank separately.
+  Limits, breakdowns, pressure and process counts have scope `unit_detail`,
+  which keeps hour summaries only (storage-approach.md).
 - Label: the leaf name; a templated unit uses its template name
   (`getty@tty1.service` → `getty.service`), because instances can carry
   private names. Mount, automount and swap units are labelled `mount`,
@@ -79,6 +81,26 @@ totals now come from the aggregate line every second and per-CPU states
 every 10 s, so a 32-thread host writes about 42 CPU fields a second instead
 of 320; `cpu.capacity` is `cpu.logical`, the online CPU count (on the Mac it
 equals the per-CPU count). `/proc/meminfo` keeps 22 keys.
+
+Summary rows: the store writes one minute row per source, component and
+entity seen, so a unit costs a row in each component it spans. The first
+Ubuntu run (57 units, 83 program labels, 72 sampled processes) wrote 689
+minute rows a minute: units about 188, programs 184, processes 125, unit
+limits 115, everything else 77. Two changes cut that:
+
+| Rows a minute | Target A measured | Target A now | Target B estimate |
+| --- | ---: | ---: | ---: |
+| Units (cgroup rows) | 188 | 188 | 297 (× 90/57 units) |
+| Programs | 184 | 62 (process labels only) | 98 (× 1.6) |
+| Processes | 125 | 125 | 200 (× 1.6) |
+| Unit limits | 115 | 0 (hour rows only) | 0 |
+| Host, devices, network, self | 77 | 77 | 157 (+32 per-CPU, +48 sensors, disks, interfaces) |
+| Total | 689 | 452 | about 750 |
+
+Unit programs were about 55 of 83 labels, so 184 × 55/83 ≈ 122 rows went.
+`unit_detail` also leaves the remaining minute rows' payload. The Target B
+scale factors are its 90 units and 450 processes against Target A's 57 and
+280; to be checked against a measured run.
 
 ## Devices and network
 

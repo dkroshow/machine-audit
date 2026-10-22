@@ -131,7 +131,8 @@ def points(records: list[Record], previous: dict[str, Record] | None = None) -> 
         # Summing each pass first preserves simultaneous peaks and union elapsed time.
         groups = defaultdict(list)
         for p in pass_points:
-            if p["additive"] and p["label"] is not None and p["component"]!="self":
+            # Programs group instances by label; a Linux unit is already one workload.
+            if p["additive"] and p["label"] is not None and p["component"]!="self" and p["scope"] not in ("unit","unit_detail"):
                 groups[(p["signal"], p["label"], p["unit"], p["kind"], p["scope"],p["scale"])].append(p)
         for (signal, label, unit, kind, scope,scale), members in groups.items():
             valid = [p for p in members if p["status"] in GOOD]
