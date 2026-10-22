@@ -74,6 +74,8 @@ confirmed reset semantics. Mark busy-percentage reset behavior unknown until tes
 Linux GPU reads can also have side effects: the checked amdgpu paths in v6.8 wake
 a suspended GPU; the pinned newer source refuses those reads instead. Verify the
 actual driver/kernel behavior and preserve refusal status.
+The Linux adapter reads amdgpu by default because its sysfs reads reset no
+counters, and it skips a GPU whose runtime status is suspended.
 
 ## Interval answers and validation
 

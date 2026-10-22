@@ -92,12 +92,15 @@ measure growth on the target before trimming anything.
   (`network.probe_method` = `tcp_connect`); probe byte counts are then
   unobserved. Router identity is the salted hash of its ARP hardware address.
 - The resolver is `systemd-resolved stub` when `resolv.conf` names
-  127.0.0.53.
+  127.0.0.53. Probe, resolver and portal targets are the Mac's; they become
+  configurable if the first user asks.
 - Sensors: entity is a salted hash of the hwmon device path and channel;
   label is chip plus channel label (`k10temp Tctl`, `nvme Composite`).
   Temperatures are millidegrees, stored as °C. Power stays in microwatts:
   `uW` joined `UNITS` because hwmon `power*` files report microwatts.
-- GPU: amdgpu cards only, entity a salted hash of the PCI slot. A card whose
+- GPU: amdgpu cards only, read by default because sysfs reads reset no
+  counters (the Mac gates its GPU for that reason). Entity: a salted hash of
+  the PCI slot. A card whose
   `power/runtime_status` is `suspended` is not read, nor are its hwmon
   sensors (`unobserved`), because the read wakes it on kernel 6.8.
 
