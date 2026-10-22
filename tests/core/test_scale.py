@@ -187,12 +187,14 @@ class ScaleTests(unittest.TestCase):
         # pass is kept until the next one; a new pass replaces it, and the first brief after
         # it derives only the fields brief ranks.
         ingest(procs[2],32*10**9)
-        began=time.thread_time();brief=query.now(brief=True)
-        self.assertLess(time.thread_time()-began,0.3)
+        began=time.thread_time();brief=query.now(brief=True);brief_cpu=time.thread_time()-began
         self.assertEqual([r['value'] for r in brief['components']['memory']['host']],[32*10**9])
         fresh=Query(self.store,collector)
+        began=time.thread_time();full=fresh.now(limit=600);full_cpu=time.thread_time()-began
+        # Relative to the same box: an absolute bound failed on a slower 2-vCPU host.
+        self.assertLess(brief_cpu,0.6*full_cpu)
         self.assertEqual(brief,fresh.now(brief=True))
-        self.assertEqual(query.now(limit=600),fresh.now(limit=600))
+        self.assertEqual(query.now(limit=600),full)
 
     def test_2000_process_minutes_keep_top_consumers_and_15_minute_rows_keep_all(self):
         # Big Mac grew 11.3 MB/min, half of it per-instance minute rows. Minute rows keep each
