@@ -34,6 +34,22 @@ for readings and summaries under the 10 GB cap. This conservative headroom is
 an implementation limit awaiting trial acceptance, not a promised history span.
 See the measured [recording costs](development.md#review-regressions-and-scale-measurements).
 
+Startup and flush both retry admission after pruning, without a fixed number
+of history windows. Pruning uses at most 4,096 primary rows and 4,096 related
+coverage rows per transaction, halving the batch when necessary. It reserves
+64 fixed pages, 16 pages per removed row for table/index work, the payload's
+overflow pages, and eight pages per incremental-vacuum step (at most 4,096).
+Up to eight new database pages allow retention metadata to be recorded.
+The shared reservation covers the existing database plus this bounded WAL,
+possible database growth and WAL shared memory; it does not require a second
+copy of the entire database to delete old data. `max_page_count` enforces
+the admitted database-length limit. Each committed prune batch checkpoints
+before the next admission. Retention records expose the affected time windows,
+including partially removed windows; raw data without saved coverage is kept.
+This bounded pruning path lets recovery remove raw readings, then minute
+summaries, then hourly summaries, retaining incident history longest, even
+when the ordinary whole-database write reservation no longer fits.
+
 Alerts appear in the dashboard and agent output, with status events;
 external notification delivery is outside the current scope.
 

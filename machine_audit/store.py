@@ -17,6 +17,8 @@ HOUR = 60 * MINUTE
 # Per-scope summary resolution (storage-approach.md): these scopes keep hour summaries only.
 # Raw readings still answer recent intervals.
 HOUR_ONLY_SCOPES = frozenset({"unit_detail"})
+PRUNE_BATCH = 4096
+PRUNE_ROW_PAGES = 16
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs(run_id TEXT PRIMARY KEY, boot_id TEXT NOT NULL, started_ns INTEGER NOT NULL, stopped_ns INTEGER, last_sequence INTEGER NOT NULL DEFAULT 0, last_saved_ns INTEGER);
 CREATE TABLE IF NOT EXISTS readings(run_id TEXT NOT NULL, sequence INTEGER NOT NULL, wall_ns INTEGER NOT NULL, source TEXT NOT NULL, component TEXT NOT NULL, payload BLOB NOT NULL, PRIMARY KEY(run_id,sequence));
@@ -100,8 +102,14 @@ class Store:
             db.close()
 
     def start_run(self, run_id, boot_id, started_ns):
-        with self._mutex, self.budget.sqlite_write(self.db,self.path):
-            self.db.execute("INSERT INTO runs(run_id,boot_id,started_ns) VALUES(?,?,?)", (run_id, boot_id, started_ns))
+        with self._mutex:
+            while True:
+                try:
+                    with self.budget.sqlite_write(self.db,self.path):
+                        self.db.execute("INSERT INTO runs(run_id,boot_id,started_ns) VALUES(?,?,?)", (run_id, boot_id, started_ns))
+                    return
+                except (sqlite3.OperationalError,BudgetExceeded) as exc:
+                    if not self._capacity_error(exc) or not self.prune_oldest():raise
 
     def stop_run(self, run_id, stopped_ns):
         with self._mutex, self.budget.sqlite_write(self.db,self.path):
@@ -139,13 +147,16 @@ class Store:
                 bucket,source,component,entity,*_=key
                 summaries[("hour",bucket,source,component,entity)].append(merge_summaries(rows) if len(rows)>1 else rows[0])
             self.maintain()
-            for attempt in range(8):
+            while True:
                 try:
                     self._write(records,raw,summaries,commit_lock,on_commit)
                     return
                 except (sqlite3.OperationalError,BudgetExceeded) as exc:
-                    full=getattr(exc,"sqlite_errorcode",None)==sqlite3.SQLITE_FULL or str(exc) in {"managed_storage_limit","sqlite_checkpoint_headroom"}
-                    if not full or attempt==7 or not self.prune_oldest():raise
+                    if not self._capacity_error(exc) or not self.prune_oldest():raise
+
+    @staticmethod
+    def _capacity_error(exc):
+        return getattr(exc,"sqlite_errorcode",None)==sqlite3.SQLITE_FULL or str(exc) in {"managed_storage_limit","sqlite_checkpoint_headroom"}
 
     def _write(self,records,raw,summaries,commit_lock,on_commit):
         with self.budget.sqlite_write(self.db,self.path):
@@ -211,14 +222,13 @@ class Store:
         # database a second time from an already halved usable target.
         other = self.budget.usage()["bytes"] - own_bytes
         target = other + max(0, (self.budget.limit_bytes-other)//2)*.85
-        attempts = 0
-        while self.budget.usage()["bytes"] + required_bytes > target and attempts < 128:
-            attempts += 1
+        while self.budget.usage()["bytes"] + required_bytes > target:
             if not self.prune_oldest():
                 break
 
     def prune_oldest(self):
         with self._mutex:
+            summary_heads=[]
             row = self.db.execute("SELECT MIN(wall_ns) FROM readings").fetchone()
             if row[0] is not None:
                 kind, start = "raw", row[0]
@@ -229,41 +239,79 @@ class Store:
                 if missing:
                     return False
             else:
-                row = self.db.execute("SELECT MIN(bucket_ns) FROM summaries WHERE resolution='minute'").fetchone()
-                if row[0] is not None:
-                    kind, start, end = "minute", row[0], row[0]+MINUTE
+                summary_heads=self._summary_heads('minute')
+                if summary_heads:
+                    start=min(t for _,t in summary_heads)
+                    kind, end = "minute", start+MINUTE
                     table, condition, args = "summaries", "resolution='minute' AND bucket_ns < ?", (end,)
                 else:
-                    row=self.db.execute("SELECT MIN(bucket_ns) FROM summaries WHERE resolution='hour'").fetchone()
-                    if row[0] is not None:
-                        kind,start,end="hour",row[0],row[0]+HOUR
+                    summary_heads=self._summary_heads('hour')
+                    if summary_heads:
+                        start=min(t for _,t in summary_heads)
+                        kind,end="hour",start+HOUR
                         table,condition,args="summaries","resolution='hour' AND bucket_ns < ?",(end,)
                     else:
                         row=self.db.execute("SELECT MIN(wall_ns) FROM incidents").fetchone()
                         if row[0] is None:return False
                         kind,start,end="incident",row[0],(row[0]//MINUTE+1)*MINUTE
                         table,condition,args="incidents","wall_ns < ?",(end,)
-            with self.budget.sqlite_write(self.db,self.path,0):
-                self.db.execute("BEGIN IMMEDIATE")
+            if summary_heads:
+                rows=[]
+                for component,first in summary_heads:
+                    if first<end:
+                        rows.extend(self.db.execute('''SELECT rowid,length(payload) FROM summaries
+                            WHERE resolution=? AND component=? AND bucket_ns<? LIMIT ?''',
+                            (kind,component,end,PRUNE_BATCH-len(rows))).fetchall())
+                    if len(rows)==PRUNE_BATCH:break
+            else:
+                rows=self.db.execute(f"SELECT rowid,length(payload) FROM {table} WHERE {condition} LIMIT ?",(*args,PRUNE_BATCH)).fetchall()
+            page=self.db.execute('PRAGMA page_size').fetchone()[0]
+            while rows:
+                payload_pages=sum((size+page-1)//page for _,size in rows)
+                coverage=[]
+                if kind in ('minute','hour'):
+                    predicate="resolution='minute' AND end_ns<?" if kind=='minute' else 'end_ns<?'
+                    coverage=self.db.execute(f'SELECT rowid,length(payload) FROM coverage WHERE {predicate} LIMIT ?',
+                                             (end,len(rows))).fetchall()
+                coverage_pages=sum((size+page-1)//page for _,size in coverage)
+                vacuum_steps=min(PRUNE_BATCH,payload_pages+len(rows))
+                # Bounded delete/index work, overflow pages, then bounded page moves.
+                frames=64+(len(rows)+len(coverage))*PRUNE_ROW_PAGES+payload_pages+coverage_pages+8*vacuum_steps
                 try:
-                    if table=="readings":
-                        self.db.execute("DELETE FROM reading_components WHERE (run_id,sequence) IN (SELECT run_id,sequence FROM readings WHERE wall_ns<?)",args)
-                    self.db.execute(f"DELETE FROM {table} WHERE {condition}",args)
-                    if kind=="minute":
-                        self.db.execute("DELETE FROM coverage WHERE resolution='minute' AND end_ns<?",(end,))
-                    elif kind=="hour":
-                        self.db.execute("DELETE FROM coverage WHERE end_ns<?",(end,))
-                    previous=self.db.execute("SELECT rowid FROM retention WHERE kind=? AND end_ns=? AND reason='storage_budget'",(kind,start)).fetchone()
-                    if previous:self.db.execute("UPDATE retention SET end_ns=? WHERE rowid=?",(end,previous[0]))
-                    else:self.db.execute("INSERT INTO retention VALUES(?,?,?,?)",(kind,start,end,"storage_budget"))
-                    # One transaction keeps each dirty page to one WAL frame.
-                    for _ in range(min(4096,self.db.execute("PRAGMA freelist_count").fetchone()[0])):
-                        self.db.execute("PRAGMA incremental_vacuum(1)")
-                    self.db.execute("COMMIT")
-                except BaseException:
-                    if self.db.in_transaction:self.db.execute("ROLLBACK")
-                    raise
-            return True
+                    with self.budget.sqlite_write(self.db,self.path,0,max_growth_bytes=8*page,dirty_pages=frames):
+                        self.db.execute("BEGIN IMMEDIATE")
+                        try:
+                            ids=[row[0] for row in rows]
+                            placeholders=','.join('?' for _ in ids)
+                            if table=="readings":
+                                self.db.execute(f"DELETE FROM reading_components WHERE (run_id,sequence) IN (SELECT run_id,sequence FROM readings WHERE rowid IN ({placeholders}))",ids)
+                            self.db.execute(f"DELETE FROM {table} WHERE rowid IN ({placeholders})",ids)
+                            self.db.executemany('DELETE FROM coverage WHERE rowid=?',((row[0],) for row in coverage))
+                            previous=self.db.execute("SELECT rowid FROM retention WHERE kind=? AND start_ns<=? AND end_ns>=? AND reason='storage_budget'",(kind,start,start)).fetchone()
+                            if previous:self.db.execute("UPDATE retention SET end_ns=max(end_ns,?) WHERE rowid=?",(end,previous[0]))
+                            else:self.db.execute("INSERT INTO retention VALUES(?,?,?,?)",(kind,start,end,"storage_budget"))
+                            for _ in range(min(vacuum_steps,self.db.execute("PRAGMA freelist_count").fetchone()[0])):
+                                self.db.execute("PRAGMA incremental_vacuum(1)")
+                            self.db.execute("COMMIT")
+                        except BaseException:
+                            if self.db.in_transaction:self.db.execute("ROLLBACK")
+                            raise
+                    return True
+                except (sqlite3.OperationalError,BudgetExceeded) as exc:
+                    if not self._capacity_error(exc) or len(rows)==1:raise
+                    rows=rows[:max(1,len(rows)//2)]
+            return False
+
+    def _summary_heads(self,resolution):
+        # summaries_time orders component before time. Seek each component's
+        # first row instead of rescanning all summaries for every prune batch.
+        result=[];component=''
+        while True:
+            row=self.db.execute('''SELECT component,bucket_ns FROM summaries
+                WHERE resolution=? AND component>? ORDER BY component,bucket_ns LIMIT 1''',
+                (resolution,component)).fetchone()
+            if row is None:return result
+            component=row[0];result.append(row)
 
     def export_chunk(self, path: str | Path, *, device_id: str, run_id: str,
                      after_sequence=0, limit=1000, max_bytes=8*1024**2,

@@ -189,7 +189,7 @@ class Budget:
 
     @contextmanager
     def sqlite_write(self, connection, path: str | Path, growth_bytes: int = 16*1024**2,
-                     *, max_growth_bytes: int | None = None):
+                     *, max_growth_bytes: int | None = None, dirty_pages: int | None = None):
         """Bound one SQLite writer's DB + WAL + checkpoint peak.
 
         SQLite cannot spill transaction pages. With a cleared WAL and a fixed
@@ -202,7 +202,8 @@ class Budget:
         """
         path = Path(path)
         if (path.parent.resolve() != self.root.resolve() or growth_bytes < 0 or
-            (max_growth_bytes is not None and max_growth_bytes<0)):
+            (max_growth_bytes is not None and max_growth_bytes<0) or
+            (dirty_pages is not None and dirty_pages<1)):
             raise ValueError("invalid SQLite reservation")
         if connection.in_transaction:
             raise ValueError("SQLite admission requires no active transaction")
@@ -228,10 +229,11 @@ class Budget:
             def peak(other,own):
                 # SHM grows in 32 KiB chunks: each chunk indexes 4062 WAL frames.
                 def bound(pages):
-                    return pages*page + 32 + pages*(page+24) + ((pages+4061)//4062+1)*32768
+                    frames=pages if dirty_pages is None else min(pages,dirty_pages)
+                    return pages*page + 32 + frames*(page+24) + ((frames+4061)//4062+1)*32768
                 # Payload size does not bound B-tree/index growth. Admit all
                 # pages that the proven DB + one-frame-per-page WAL bound fits.
-                cap = (self.limit_bytes-other)//(2*page+32)
+                cap = (self.limit_bytes-other)//(2*page+32) if dirty_pages is None else existing+(max_growth_bytes or 0)//page
                 if max_growth_bytes is not None:
                     cap=min(cap,existing+(max_growth_bytes+page-1)//page)
                 while cap >= existing and other+bound(cap)>self.limit_bytes:
