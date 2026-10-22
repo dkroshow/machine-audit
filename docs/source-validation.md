@@ -333,3 +333,38 @@ entry points emit the result and return nonzero on failure. A process killed
 outside Python still cannot finalize its own run; the next start marks it
 interrupted. Exit code 1 and bytes written alone cannot identify the exception
 in a historical run that predates these reason codes.
+
+### Replay decisions and filesystem races
+
+The run row and scanner result now retain `volume_id`, `action`, `trigger` and
+`stage` for the current or last volume. Stages distinguish discovery, replay,
+preparation, walking, sharing, aggregation and publication. Result volume rows
+also retain their action and trigger. Nullable columns extend existing format-2
+run history without replacing any map or inventing past diagnostic evidence.
+Older scanner writers with a positional 12-column run insert cannot write this
+extended table; rollback must retain the explicit-column insert. Existing
+read-only consumers remain compatible.
+
+Full triggers distinguish a missing full map, missing bookmark, repeated event
+non-progress, the weekly deadline, an eligible explicit request, event UUID
+mismatch and the specific kernel-drop/wrap/root-change flag. A recursive event
+at the volume root, or a deferred whole-root update, uses the full walker and
+full staging path. Recursive child
+events remain incremental subtree updates. The `partial_stream_needs_full_map`
+gap does not schedule a full scan; it waits for an independently required full.
+There is no fixed ten-hour FSEvents expiration rule in this implementation.
+
+A selected directory replaced by a file before it opens records
+`root_not_directory`. An unreadable replay root keeps that volume's previous
+map, points, hierarchy and bookmark, while other volumes may finish. Missing or
+cyclic map ancestry still blocks publication, because publishing it would make
+the totals wrong. Such invariants now carry specific source-owned codes, for
+example `missing_directory_ancestor_ScanError`, instead of only the broad
+`invalid_scan_state` category. Arbitrary exception messages remain private.
+
+Disposable regressions reproduce the old directory-replacement failure and
+the old incremental writer used for a recursive volume-root event. They also
+verify diagnostic-column migration, saved action/trigger/stage on failure,
+specific invariant codes, and the fact that a partial-stream gap does not
+force an hourly full. These tests cannot identify an old live exception or
+event flag whose diagnostic evidence was never recorded.

@@ -1,6 +1,7 @@
 """Publication must depend on changed rows, not unrelated database size."""
 from contextlib import contextmanager
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 
@@ -8,7 +9,7 @@ from machine_audit.budget import Budget
 from machine_audit.scanner.accounting import Blocks
 from machine_audit.scanner.events import next_action
 from machine_audit.scanner.native import Volume
-from machine_audit.scanner.store import MapStore, MapQuery
+from machine_audit.scanner.store import MapStore, MapQuery, SCHEMA
 from machine_audit.scanner.walker import Node
 
 
@@ -28,6 +29,23 @@ class PublicationBudgetTests(unittest.TestCase):
 
     def node(self, store, size):
         store.directory(Node('1', None, 'Root', 'directory', size, size, 'observed', None, 0))
+
+    def test_run_diagnostics_migrate_without_changing_prior_run_evidence(self):
+        legacy = SCHEMA.replace(',\n volume_id TEXT,action TEXT,trigger TEXT,stage TEXT', '')
+        original = ('old',1,2,2,123,'start','complete',10,20,30,40,'scheduled')
+        with sqlite3.connect(self.path) as db:
+            db.executescript(legacy)
+            db.execute('PRAGMA user_version=2')
+            db.execute('INSERT INTO runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',original)
+        store = MapStore(self.path, Budget(self.root, free_margin_bytes=0))
+        self.addCleanup(store.close)
+        row = tuple(store.db.execute("SELECT * FROM runs WHERE id='old'").fetchone())
+        self.assertEqual(row[:12],original)
+        self.assertEqual(row[12:],(None,None,None,None))
+        store.start('scheduled')
+        store.phase('walk',volume_id='v',action='full',trigger='event_kernel_drop')
+        self.assertEqual(tuple(store.db.execute('SELECT volume_id,action,trigger,stage FROM runs WHERE id=?',
+                                              (store.run,)).fetchone()),('v','full','event_kernel_drop','walk'))
 
     def test_existing_large_store_opens_and_publishes_small_update_with_counted_wal(self):
         store = MapStore(self.path, Budget(self.root, free_margin_bytes=0))

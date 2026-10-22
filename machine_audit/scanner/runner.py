@@ -12,7 +12,8 @@ from machine_audit.budget import Budget, BudgetExceeded
 from machine_audit.sources.native import Darwin
 from machine_audit.sources.iokit import IOKit
 from .native import MacFilesystem
-from .events import FSEvents, next_action
+from .events import FSEvents, next_decision
+from .errors import ScanError
 from .policy import Policy
 from .accounting import Blocks
 from .store import MapStore
@@ -80,6 +81,7 @@ def relist(store,walker,policy,volume,now,changes):
     # The deepest event under an already selected ancestor needs no second walk.
     paths=sorted(roots_to_update,key=len)
     chosen=[]
+    complete=True
     for path in paths:
         if any(path==p or (p in recursive_roots and path.startswith(p+'/')) for p in chosen):
             continue
@@ -87,9 +89,10 @@ def relist(store,walker,policy,volume,now,changes):
         previous=roots_to_update[path]
         recursive=path in recursive_roots
         if recursive:store.clear_subtree(previous['id'])
-        walker.walk(path,previous['parent'],previous['kind']=='private',recursive=recursive)
-        if previous['id'] in walker.listed:
+        if walker.walk(path,previous['parent'],previous['kind']=='private',recursive=recursive):
             with store.write(rows=1):store.db.execute('DELETE FROM dirty WHERE volume=? AND id=?',(volume.id,previous['id']))
+        else:complete=False
+    return complete
 
 
 def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roots=None, access=None, exclusions=(), force=False):
@@ -122,6 +125,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
             store.written_bytes=lambda:native.process(os.getpid()).diskio_byteswritten
             store.process_start=str(native.process(os.getpid()).proc_start_abstime)
             store.start('requested_full' if full else 'scheduled')
+            store.phase('discover')
             volumes=list(fs.volumes())
             if roots:
                 selected=[v for v in volumes if v.mount in roots]
@@ -129,15 +133,18 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     raise ValueError('only_discovered_volume_roots_are_allowed')
                 volumes=selected
             for volume in volumes:
+                store.phase('decide',volume_id=volume.id,action='pending',trigger='pending')
                 old=store.db.execute('SELECT * FROM volumes WHERE id=?',(volume.id,)).fetchone()
                 if old and old['generation'] and not old['lean'] and not full_disk_access:
                     # Missing proof is not grant loss. Preserve the last committed
                     # map and its history; no lean replacement is constructed.
                     status='access_unverified'
+                    store.phase('complete',action='skip',trigger=status)
                     with store.write(rows=1):store.db.execute('UPDATE volumes SET status=? WHERE id=?',(status,volume.id))
                     results.append({'volume_id':volume.id,'status':status})
                     continue
                 if volume.external and not full_disk_access:
+                    store.phase('complete',action='skip',trigger='external_access_not_granted')
                     store.observe_unscanned(volume,'needs_full_disk_access')
                     results.append({'volume_id':volume.id,'status':'not_enabled','reason':'external_volume_requires_full_disk_access'})
                     continue
@@ -148,23 +155,40 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                 has_root=old and store.db.execute('''SELECT 1 FROM nodes
                     WHERE generation=? AND volume=? AND parent IS NULL LIMIT 1''',
                     (old['generation'],old['key'])).fetchone()
-                action=next_action(now_ns=now,full_ns=old['full_ns'] if has_root else None,
+                action,trigger=next_decision(now_ns=now,full_ns=old['full_ns'] if has_root else None,
                     update_ns=old['observed_ns'] if old else None,bookmark=old['bookmark'] if old else None,
                     no_progress=old['no_progress'] if old else 0,requested_full=full)
                 if action=='wait':
-                    results.append({'volume_id':volume.id,'status':'current'})
+                    store.phase('complete',action=action,trigger=trigger)
+                    results.append({'volume_id':volume.id,'status':'current','action':action,'trigger':trigger})
                     continue
+                store.phase('events',action=action,trigger=trigger)
                 event_uuid=events.uuid(volume.device)
-                if old and old['event_uuid']!=event_uuid:action='full'
+                if old and old['event_uuid']!=event_uuid:action,trigger='full','event_uuid_mismatch'
                 replay=None
                 if action=='update':
                     replay=events.replay(volume.device,old['bookmark'])
                     if replay.lost:
-                        action='full'
+                        action,trigger='full',replay.loss_reason or 'events_lost'
+                    elif any(recursive and not os.path.normpath('/'+relative.lstrip('/')).strip('/')
+                             for relative,recursive in replay.paths.items()):
+                        # Replaying a recursive volume root is a full walk. Use
+                        # the full staging/aggregation path, not subtree resets.
+                        action,trigger='full','event_root_must_scan'
+                    elif any(replay.paths.values()):trigger='event_subtree_must_scan'
+                    elif store.db.execute('SELECT 1 FROM dirty WHERE volume=? AND due_ns<=? LIMIT 1',
+                                          (volume.id,now)).fetchone():trigger='deferred_folder_due'
+                    if action=='update' and store.db.execute('''SELECT 1 FROM nodes n INDEXED BY node_parent
+                        JOIN dirty d ON d.volume=? AND d.id=source_id(n.id)
+                        WHERE n.generation=? AND n.volume=? AND n.parent IS NULL AND d.due_ns<=? LIMIT 1''',
+                        (volume.id,old['generation'],old['key'],now)).fetchone():
+                        action,trigger='full','deferred_root_due'
                 bookmark=events.current_id() if action=='full' else replay.up_to or replay.last_good or old['bookmark']
+                store.phase('prepare',action=action,trigger=trigger)
                 store.prepare(volume,full=action=='full',lean=not full_disk_access)
                 blocks=Blocks()
                 walker=Walker(volume,policy,store,blocks,fs,grain)
+                store.phase('walk')
                 if action=='full':
                     walker.walk()
                     # A full walk starts with one root; descendants are queued
@@ -173,20 +197,27 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                         root_failed=True
                         processed+=walker.entries
                         store.buffer.clear();store.buffer_bytes=0
-                        results.append({'volume_id':volume.id,'status':'root_unreadable','action':action,
+                        results.append({'volume_id':volume.id,'status':'root_unreadable','action':action,'trigger':trigger,
                                         'entries':walker.entries,'gaps':sorted(walker.gaps)})
                         continue
                 else:
-                    relist(store,walker,policy,volume,now,
+                    complete=relist(store,walker,policy,volume,now,
                            ((os.path.normpath(os.path.join(volume.mount,relative.lstrip('/'))),recursive)
                             for relative,recursive in replay.paths.items()))
+                    if not complete:
+                        root_failed=True
+                        processed+=walker.entries
+                        store.buffer.clear();store.buffer_bytes=0
+                        results.append({'volume_id':volume.id,'status':'update_unreadable','action':action,
+                                        'trigger':trigger,'entries':walker.entries,'gaps':sorted(walker.gaps)})
+                        continue
                 store.finish_volume(volume,blocks,walker.gaps,full=action=='full',lean=not full_disk_access,
-                    bookmark=bookmark,event_uuid=event_uuid,complete=walker.sharing_complete and not (replay and replay.interrupted),
+                    bookmark=bookmark,event_uuid=event_uuid,complete=walker.sharing_complete and (action=='full' or not replay.interrupted),
                     event_progress=None if not replay or not replay.paths else bookmark!=old['bookmark'])
                 published+=1
                 processed+=walker.entries
                 store.progress(processed)
-                results.append({'volume_id':volume.id,'status':'observed','action':action,'entries':walker.entries,
+                results.append({'volume_id':volume.id,'status':'observed','action':action,'trigger':trigger,'entries':walker.entries,
                                 'gaps':sorted(walker.gaps)})
             current={v.id for v in volumes}
             missing=[row[0] for row in store.db.execute('SELECT id FROM volumes') if row[0] not in current]
@@ -194,14 +225,15 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                 with store.write(rows=len(missing)):
                     store.db.executemany('UPDATE volumes SET mounted=0 WHERE id=?',((identity,) for identity in missing))
             run_status=('partial' if published else 'root_unreadable') if root_failed else 'complete'
+            store.phase('complete')
             store.progress(processed,run_status)
-            return {'status':run_status if root_failed else 'observed','volumes':results,'entries':processed}
+            return {'status':run_status if root_failed else 'observed','volumes':results,'entries':processed,**store.run_context}
         except Exception as exc:
             if isinstance(exc,BudgetExceeded):status=reason='budget_blocked'
             elif isinstance(exc,sqlite3.Error):status=reason='write_failed'
             else:
                 status='scan_failed'
-                reason='os_error' if isinstance(exc,OSError) else 'invalid_scan_state' if isinstance(exc,ValueError) else 'unexpected_error'
+                reason=exc.code if isinstance(exc,ScanError) else 'os_error' if isinstance(exc,OSError) else 'invalid_scan_state' if isinstance(exc,ValueError) else 'unexpected_error'
             exception_type=type(exc).__name__
             reason=f'{reason}_{exception_type}'
             # Never print exception text: native/file errors can contain paths.
@@ -217,6 +249,6 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
             except Exception:
                 pass
             return {'status':status,'reason':reason,'exception_type':exception_type,
-                    'failure_recorded':recorded,'entries':store.entries}
+                    'failure_recorded':recorded,'entries':store.entries,'volumes':results,**store.run_context}
         finally:
             store.close()

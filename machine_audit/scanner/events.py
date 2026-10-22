@@ -16,10 +16,13 @@ class Replay:
     lost: bool = False
     interrupted: bool = False
     text_bytes: int = 0
+    loss_reason: str | None = None
 
     def add(self, path, flags, event_id, max_paths=100_000, max_bytes=16*1024**2):
         if flags & (KERNEL_DROP | WRAPPED | ROOT_CHANGED):
             self.lost = True
+            self.loss_reason = ('event_kernel_drop' if flags & KERNEL_DROP else
+                                'event_ids_wrapped' if flags & WRAPPED else 'event_root_changed')
             return False
         if flags & USER_DROP:
             self.interrupted = True
@@ -37,17 +40,23 @@ class Replay:
         return True
 
 
-def next_action(*, now_ns, full_ns, update_ns, bookmark, no_progress, events_lost=False, requested_full=False):
+def next_decision(*, now_ns, full_ns, update_ns, bookmark, no_progress, events_lost=False, requested_full=False):
     day = 86400 * 10**9
-    if full_ns is None or bookmark is None or events_lost or no_progress >= 3:
-        return 'full'
+    if full_ns is None:return 'full','missing_full_map'
+    if bookmark is None:return 'full','missing_bookmark'
+    if events_lost:return 'full','events_lost'
+    if no_progress >= 3:return 'full','no_event_progress'
     if now_ns - full_ns >= 7 * day:
-        return 'full'
+        return 'full','weekly_full'
     if requested_full and now_ns - full_ns >= day:
-        return 'full'
+        return 'full','requested_full'
     if update_ns is None or now_ns - update_ns >= 3600 * 10**9:
-        return 'update'
-    return 'wait'
+        return 'update','hourly_update'
+    return 'wait','update_not_due'
+
+
+def next_action(**kwargs):
+    return next_decision(**kwargs)[0]
 
 
 class FSEvents:

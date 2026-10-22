@@ -56,8 +56,10 @@ class DarwinDirectoryOpenTests(unittest.TestCase):
         self.assertEqual(walker.listed, set())
         self.assertIn('directory_unreadable', walker.gaps)
         walker.sink.begin_directory.assert_not_called()
-        with self.assertRaisesRegex(ValueError, 'scan_root_must_be_directory'):
-            self.walker().walk(str(alias))
+        walker = self.walker()
+        self.assertFalse(walker.walk(str(alias)))
+        self.assertIn('root_not_directory', walker.gaps)
+        walker.sink.begin_directory.assert_not_called()
 
     def test_opened_inode_must_match_the_preopen_stat(self):
         other = self.base / 'other'
@@ -179,6 +181,83 @@ class RootPublicationTests(unittest.TestCase):
                 after = self.published()
                 self.assertEqual(after[1:6], before[1:6])
                 self.assertEqual(after[6]['rows'], before[6]['rows'])
+
+    def test_specific_invariant_and_chosen_action_survive_a_failed_run(self):
+        def fail_aggregate(store, affected):
+            store.path_for('absent synthetic identity')
+        with patch.object(MapStore, '_aggregate_full', fail_aggregate), \
+             patch('machine_audit.scanner.runner.time.time_ns', return_value=86500*10**9):
+            result, status = self.scan([self.volume])
+        self.assertEqual(status, 'missing_directory_ancestor_ScanError')
+        expected = ('v', 'full', 'requested_full', 'aggregate')
+        self.assertEqual(tuple(result[key] for key in ('volume_id','action','trigger','stage')), expected)
+        with sqlite3.connect(self.data/'scanner.sqlite') as db:
+            row = db.execute('SELECT volume_id,action,trigger,stage FROM runs ORDER BY started_ns DESC LIMIT 1').fetchone()
+        self.assertEqual(row, expected)
+        self.assertNotIn('absent synthetic identity', repr(result))
+
+    def test_root_must_scan_uses_full_writer_and_records_its_trigger(self):
+        events = SimpleNamespace(uuid=lambda device:'events', current_id=lambda:30,
+                                 replay=lambda device,since:Replay(paths={'/':True}, up_to=30))
+        original = Walker.walk
+        modes = []
+        def walk(walker, *args, **kwargs):
+            modes.append(walker.sink.base_gen)
+            return original(walker,*args,**kwargs)
+        with patch.object(Walker,'walk',walk), \
+             patch('machine_audit.scanner.runner.time.time_ns', return_value=3700*10**9):
+            result, status = self.scan([self.volume], events=events)
+        self.assertEqual(modes, [None], 'root replay used incremental subtree/reset writes')
+        self.assertEqual((result['action'],result['trigger']), ('full','event_root_must_scan'))
+        self.assertEqual(status, 'complete')
+        with sqlite3.connect(self.data/'scanner.sqlite') as db:
+            self.assertEqual(db.execute('SELECT action,trigger FROM runs').fetchone(), ('full','event_root_must_scan'))
+
+    def test_partial_stream_gap_does_not_request_another_full_map(self):
+        with sqlite3.connect(self.data/'scanner.sqlite') as db:
+            db.execute('UPDATE volumes SET gaps=?',('["partial_stream_needs_full_map"]',))
+        events = SimpleNamespace(uuid=lambda device:'events', current_id=lambda:30,
+                                 replay=lambda device,since:Replay(up_to=30))
+        with patch('machine_audit.scanner.runner.time.time_ns', return_value=3700*10**9):
+            result, status = self.scan([self.volume], events=events)
+        self.assertEqual((result['action'],result['trigger'],result['entries']),('update','hourly_update',0))
+        self.assertEqual(status,'complete')
+        with sqlite3.connect(self.data/'scanner.sqlite') as db:
+            self.assertEqual(db.execute('SELECT full_ns FROM volumes').fetchone()[0],100*10**9)
+
+    def test_deferred_volume_root_uses_full_writer(self):
+        with sqlite3.connect(self.data/'scanner.sqlite') as db:
+            db.execute('INSERT INTO dirty VALUES(?,?,?)',('v','1',0))
+        events = SimpleNamespace(uuid=lambda device:'events', current_id=lambda:30,
+                                 replay=lambda device,since:Replay(up_to=30))
+        with patch('machine_audit.scanner.runner.time.time_ns', return_value=3700*10**9):
+            result, status = self.scan([self.volume],events=events)
+        self.assertEqual((result['action'],result['trigger']),('full','deferred_root_due'))
+        self.assertEqual(status,'complete')
+
+    def test_directory_replaced_after_event_resolution_is_a_volume_gap(self):
+        self.scan([self.volume])  # Publish a real tiny map with real inode identities.
+        before = self.published()
+        with sqlite3.connect(self.data/'scanner.sqlite') as db:
+            now = db.execute('SELECT observed_ns FROM volumes').fetchone()[0]+3600*10**9
+        events = SimpleNamespace(uuid=lambda device:'events', current_id=lambda:30,
+                                 replay=lambda device,since:Replay(paths={'/child':False}, up_to=30))
+        original = Walker.walk
+        child = self.tree/'child'
+        def replace_before_walk(walker, root=None, *args, **kwargs):
+            if root==str(child):
+                child.rmdir()  # Disposable empty test directory only.
+                child.write_bytes(b'replacement')
+            return original(walker,root,*args,**kwargs)
+        other = self.base/'other';other.mkdir()
+        with patch.object(Walker,'walk',replace_before_walk), \
+             patch('machine_audit.scanner.runner.time.time_ns', return_value=now):
+            result, status = self.scan([self.volume,replace(self.volume,id='other',mount=str(other))], events=events)
+        self.assertEqual(status, 'partial')
+        self.assertEqual(result['volumes'][0]['status'], 'update_unreadable')
+        self.assertIn('root_not_directory', result['volumes'][0]['gaps'])
+        self.assertEqual(result['volumes'][1]['status'], 'observed')
+        self.assertEqual(self.published(), before)
 
     def test_failed_volume_does_not_prevent_another_empty_root_publication(self):
         before = self.published()

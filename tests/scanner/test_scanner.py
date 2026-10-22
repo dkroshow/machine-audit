@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch,Mock
 from machine_audit.budget import Budget, BudgetExceeded
 from machine_audit.scanner.accounting import Blocks, Stream, reconcile
-from machine_audit.scanner.events import Replay, next_action, USER_DROP, KERNEL_DROP, HISTORY_DONE
+from machine_audit.scanner.events import Replay, next_action, next_decision, USER_DROP, KERNEL_DROP, WRAPPED, ROOT_CHANGED, HISTORY_DONE
 from machine_audit.scanner.native import Volume
 from machine_audit.scanner.policy import Decision, Policy
 from machine_audit.scanner.store import MapStore, MapQuery
@@ -75,7 +75,19 @@ class ScannerTests(unittest.TestCase):
         self.assertFalse(r.add('root',USER_DROP,11))
         self.assertEqual(r.last_good,10);self.assertFalse(r.lost)
         lost=Replay();lost.add('',KERNEL_DROP,1);self.assertTrue(lost.lost)
+        for flag,reason in ((KERNEL_DROP,'event_kernel_drop'),(WRAPPED,'event_ids_wrapped'),(ROOT_CHANGED,'event_root_changed')):
+            replay=Replay();replay.add('',flag,1)
+            self.assertEqual(replay.loss_reason,reason)
         self.assertEqual(next_action(now_ns=100,full_ns=1,update_ns=1,bookmark=10,no_progress=3),'full')
+
+    def test_full_scheduling_reasons_distinguish_missing_history_age_and_request(self):
+        baseline=dict(now_ns=1,full_ns=1,update_ns=1,bookmark=10,no_progress=0)
+        day=86400*10**9
+        for overrides,expected in (({'full_ns':None},'missing_full_map'),({'bookmark':None},'missing_bookmark'),
+                                   ({'events_lost':True},'events_lost'),({'no_progress':3},'no_event_progress'),
+                                   ({'now_ns':1+7*day},'weekly_full'),
+                                   ({'now_ns':1+day,'requested_full':True},'requested_full')):
+            self.assertEqual(next_decision(**(baseline|overrides)),('full',expected))
 
     def test_synthetic_walk_hardlinks_reconcile_and_budget_failure_preserves_map(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
@@ -159,6 +171,7 @@ class ScannerTests(unittest.TestCase):
             store.finish_volume(v,Blocks(),[],full=True,lean=False)
             generation=store.generation;store.close()
             native=Mock();native.process.return_value.proc_start_abstime=1
+            native.process.return_value.diskio_byteswritten=0
             fs=Mock();fs.volumes.return_value=[v]
             with patch('machine_audit.scanner.runner.Darwin',return_value=native),patch('machine_audit.scanner.runner.MacFilesystem',return_value=fs),patch('machine_audit.scanner.runner.IOKit'),patch('machine_audit.scanner.runner.FSEvents'),patch('machine_audit.scanner.runner.os.nice'):
                 run_scan(temp,full_disk_access=True)  # requested True without observation grants nothing

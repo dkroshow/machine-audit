@@ -122,8 +122,14 @@ def run_scan(data_dir, *, full=False, grain='files', roots=None, exclusions=(), 
                 else:
                     folders = (store.known_directory(i) for i in sorted(changed.get(volume.id, ())))
                     # A folder replaced since the watch began is left to its parent and the nightly walk.
-                    relist(store, walker, policy, volume, now,
-                           ((f['path'], False) for f in folders if f and f['path'] and same_folder(f['path'], f['id'])))
+                    if not relist(store, walker, policy, volume, now,
+                                  ((f['path'], False) for f in folders if f and f['path'] and same_folder(f['path'], f['id']))):
+                        root_failed=True
+                        processed+=walker.entries
+                        store.buffer.clear();store.buffer_bytes=0
+                        results.append({'volume_id':volume.id,'status':'update_unreadable','action':action,
+                                        'entries':walker.entries,'gaps':sorted(walker.gaps)})
+                        continue
                 store.finish_volume(volume, blocks, walker.gaps, full=action == 'full', lean=False,
                                     complete=walker.sharing_complete, physical=False)
                 published += 1

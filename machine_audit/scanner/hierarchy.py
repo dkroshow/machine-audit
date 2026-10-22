@@ -6,6 +6,7 @@ No historical placement is inferred from today's mutable map.
 from __future__ import annotations
 import hashlib
 import json
+from .errors import ScanError
 
 
 def save_hierarchy(db, generation, volume, observed_ns, *, volume_key):
@@ -21,7 +22,7 @@ def save_hierarchy(db, generation, volume, observed_ns, *, volume_key):
         visited = {identity}
         while parent is not None and parent not in tracked:
             if parent in visited:
-                raise ValueError('hierarchy_cycle')
+                raise ScanError('hierarchy_cycle')
             visited.add(parent)
             if parent not in parent_cache:
                 found = db.execute('SELECT source_id(parent) AS parent FROM nodes WHERE generation=? AND volume=? AND id=inode_key(?)',
@@ -54,13 +55,13 @@ def save_hierarchy(db, generation, volume, observed_ns, *, volume_key):
                 finished.add(identity)
                 continue
             if identity in visiting or identity in finished:
-                raise ValueError('hierarchy_cycle')
+                raise ScanError('hierarchy_cycle')
             visiting.add(identity)
             starts[identity] = rank+1
             stack.append((identity,True))
             stack.extend((child,False) for child in children.get(identity,[]))
         if len(finished) != len(tracked):
-            raise ValueError('hierarchy_cycle')
+            raise ScanError('hierarchy_cycle')
     # Record every actual observation, reusing unchanged hierarchy rows. This
     # also pins size evidence when a requested interval has not finished yet.
     db.execute('INSERT INTO hierarchy_epochs VALUES(?,?,?)',(volume,observed_ns,version))

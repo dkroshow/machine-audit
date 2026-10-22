@@ -1,5 +1,7 @@
 """Lossless compact keys; non-inode identities occupy a separate SQL type."""
 
+from .errors import ScanError
+
 UINT64 = 1 << 64
 
 
@@ -26,4 +28,4 @@ def source_id(value):
         return str(value if value >= 0 else value + UINT64)
     if isinstance(value, str) and value.startswith('fixture:'):
         return value[8:]
-    raise ValueError('invalid_stored_inode_key')
+    raise ScanError('invalid_stored_inode_key')

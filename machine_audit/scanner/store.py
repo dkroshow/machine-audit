@@ -20,6 +20,7 @@ from machine_audit.budget import Budget, BudgetExceeded
 from .accounting import reconcile
 from .encoding import inode_key, source_id
 from .hierarchy import save_hierarchy
+from .errors import ScanError
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS map_meta(key TEXT PRIMARY KEY,value INTEGER NOT NULL) WITHOUT ROWID;
@@ -74,7 +75,8 @@ CREATE TABLE IF NOT EXISTS denied(volume TEXT PRIMARY KEY,observed_ns INTEGER NO
 CREATE TABLE IF NOT EXISTS runs(
  id TEXT PRIMARY KEY,started_ns INTEGER NOT NULL,updated_ns INTEGER NOT NULL,ended_ns INTEGER,
  pid INTEGER NOT NULL,pid_start TEXT,status TEXT NOT NULL,entries INTEGER NOT NULL DEFAULT 0,cpu_ns INTEGER NOT NULL,
- peak_rss_bytes INTEGER NOT NULL,written_bytes INTEGER,kind TEXT NOT NULL) WITHOUT ROWID;
+ peak_rss_bytes INTEGER NOT NULL,written_bytes INTEGER,kind TEXT NOT NULL,
+ volume_id TEXT,action TEXT,trigger TEXT,stage TEXT) WITHOUT ROWID;
 '''
 MAP_TABLES=('nodes','files','holders','charges','listings')
 STAGE_TABLES=('removed','reset_dirs','removed_charges')
@@ -121,12 +123,21 @@ class MapStore:
                     for statement in SCHEMA.split(';'):
                         if statement.strip():self.db.execute(statement)
                     self.db.execute('PRAGMA user_version=2')
+            # Nullable diagnostic columns extend format 2 without rewriting map
+            # rows or changing old observations. Each ALTER is metadata only.
+            columns={r['name'] for r in self.db.execute('PRAGMA table_info(runs)')}
+            missing_columns={'volume_id','action','trigger','stage'}-columns
+            if missing_columns:
+                with self.write(rows=len(missing_columns)):
+                    for column in sorted(missing_columns):
+                        self.db.execute(f'ALTER TABLE runs ADD COLUMN {column} TEXT')
         except BaseException:
             if self.db is not None:self.db.close()
             raise
         self.buffer=[];self.buffer_bytes=0;self.pending_resets=set()
         self.generation=self.volume=self.vid=self.base_gen=self.run=None
         self.changed=set();self.last_progress=0.0;self.entries=0
+        self.run_context=dict(volume_id=None,action=None,trigger=None,stage=None)
 
     @contextmanager
     def write(self,growth=None,*,rows=None,payload_bytes=0):
@@ -150,24 +161,33 @@ class MapStore:
         self.run=uuid.uuid4().hex;now=time.time_ns()
         with self.write(rows=self.db.execute("SELECT count(*) FROM runs WHERE status='running'").fetchone()[0]+1):
             self.db.execute("UPDATE runs SET status='interrupted' WHERE status='running'")
-            self.db.execute('INSERT INTO runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+            self.db.execute('''INSERT INTO runs(id,started_ns,updated_ns,ended_ns,pid,pid_start,status,
+                entries,cpu_ns,peak_rss_bytes,written_bytes,kind) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
                 (self.run,now,now,None,os.getpid(),getattr(self,'process_start',None),'running',0,time.process_time_ns(),0,None,kind))
         return self.run
 
-    def progress(self,entries=None,status='running'):
+    def phase(self,stage,*,volume_id=None,action=None,trigger=None):
+        self.run_context.update(stage=stage)
+        for key,value in (('volume_id',volume_id),('action',action),('trigger',trigger)):
+            if value is not None:self.run_context[key]=value
+        self.progress(force=True)
+
+    def progress(self,entries=None,status='running',*,force=False):
         if not self.run:return
         if entries is not None:self.entries=max(self.entries,entries)
         now=time.monotonic()
-        if status=='running' and now-self.last_progress<5:return
+        if status=='running' and not force and now-self.last_progress<5:return
         self.last_progress=now
         r=resource.getrusage(resource.RUSAGE_SELF)
         try:written=self.written_bytes() if hasattr(self,'written_bytes') else None
         except OSError:written=None
-        with self.write(rows=1):
-            self.db.execute('UPDATE runs SET updated_ns=?,entries=?,cpu_ns=?,peak_rss_bytes=?,written_bytes=?,status=?,ended_ns=? WHERE id=?',
+        context=tuple(self.run_context[key] for key in ('volume_id','action','trigger','stage'))
+        with self.write(rows=1,payload_bytes=sum(len(v.encode()) for v in context if v is not None)):
+            self.db.execute('''UPDATE runs SET updated_ns=?,entries=?,cpu_ns=?,peak_rss_bytes=?,written_bytes=?,status=?,ended_ns=?,
+                volume_id=?,action=?,trigger=?,stage=? WHERE id=?''',
                 (time.time_ns(),self.entries,time.process_time_ns(),int(r.ru_maxrss*(1 if sys.platform=='darwin' else 1024)),
                  written,status,
-                 None if status=='running' else time.time_ns(),self.run))
+                 None if status=='running' else time.time_ns(),*context,self.run))
 
     def prepare(self,volume,full=True,lean=True):
         self.flush();self.prune_generations(full)
@@ -283,13 +303,13 @@ class MapStore:
     def path_for(self,identity):
         parts=[];seen=set()
         for _ in range(MAX_ANCESTRY):
-            if identity in seen:raise ValueError('cyclic_directory_ancestry')
+            if identity in seen:raise ScanError('cyclic_directory_ancestry')
             seen.add(identity);node=self._node(identity)
-            if node is None:raise ValueError('missing_directory_ancestor')
+            if node is None:raise ScanError('missing_directory_ancestor')
             if node['parent'] is None:return os.path.join(self.mount,*reversed(parts))
             if node['label'] is None:return None
             parts.append(node['label']);identity=node['parent']
-        raise ValueError('directory_ancestry_limit')
+        raise ScanError('directory_ancestry_limit')
 
     def known_directory(self,identity):
         self.flush();node=self._node(inode_key(identity))
@@ -304,7 +324,7 @@ class MapStore:
         if len(roots)!=1:return None
         identity=roots[0]['id'];relative=os.path.relpath(path,self.mount)
         parts=[] if relative=='.' else relative.split(os.sep)
-        if len(parts)>MAX_ANCESTRY:raise ValueError('directory_ancestry_limit')
+        if len(parts)>MAX_ANCESTRY:raise ScanError('directory_ancestry_limit')
         for name in parts:
             rows=list(self._rows('nodes','parent=? AND label=?',(identity,name)))
             if len(rows)!=1:return None
@@ -337,7 +357,7 @@ class MapStore:
         pending=[identity];seen=set()
         while pending:
             current=pending.pop()
-            if current in seen:raise ValueError('cyclic_directory_ancestry')
+            if current in seen:raise ScanError('cyclic_directory_ancestry')
             seen.add(current)
             pending.extend(row['id'] for row in self._rows('nodes','parent=?',(current,)))
         return seen
@@ -459,7 +479,7 @@ class MapStore:
                 listed[index[identity]],uses[index[identity]]=self._own(node,homes)
         parent_index=array('q');remaining=array('I',[0])*len(keys)
         for parent in parents:
-            if parent is not None and parent not in index:raise ValueError('missing_directory_ancestor')
+            if parent is not None and parent not in index:raise ScanError('missing_directory_ancestor')
             position=index[parent] if parent is not None else -1
             parent_index.append(position)
             if position>=0:remaining[position]+=1
@@ -471,7 +491,7 @@ class MapStore:
                 listed[parent]+=listed[child];uses[parent]+=uses[child]
                 remaining[parent]-=1
                 if not remaining[parent]:ready.append(parent)
-        if visited!=len(keys):raise ValueError('cyclic_directory_ancestry')
+        if visited!=len(keys):raise ScanError('cyclic_directory_ancestry')
         self.progress()
         for first in range(0,len(keys),8192):
             with self.write(rows=min(8192,len(keys)-first)):
@@ -489,19 +509,19 @@ class MapStore:
                 seen=set()
                 for _ in range(MAX_ANCESTRY):
                     if seed is None:break
-                    if seed in seen:raise ValueError('cyclic_directory_ancestry')
+                    if seed in seen:raise ScanError('cyclic_directory_ancestry')
                     seen.add(seed);work.add(seed);node=self._node(seed)
                     if node is None:break
                     seed=node['parent']
-                else:raise ValueError('directory_ancestry_limit')
+                else:raise ScanError('directory_ancestry_limit')
         depths={}
         def depth(key):
             chain=[];seen=set();current=key
             while current is not None and current not in depths:
-                if current in seen:raise ValueError('cyclic_directory_ancestry')
-                if len(chain)>=MAX_ANCESTRY:raise ValueError('directory_ancestry_limit')
+                if current in seen:raise ScanError('cyclic_directory_ancestry')
+                if len(chain)>=MAX_ANCESTRY:raise ScanError('directory_ancestry_limit')
                 seen.add(current);chain.append(current);node=self._node(current)
-                if node is None and current!=key:raise ValueError('missing_directory_ancestor')
+                if node is None and current!=key:raise ScanError('missing_directory_ancestor')
                 current=node['parent'] if node else None
             value=depths.get(current,-1)
             for item in reversed(chain):value+=1;depths[item]=value
@@ -550,7 +570,9 @@ class MapStore:
 
     def finish_volume(self,volume,blocks,gaps,*,full,lean,bookmark=None,event_uuid=None,complete=True,physical=True,event_progress=None):
         self.flush();old=self.db.execute('SELECT * FROM volumes WHERE id=?',(self.volume,)).fetchone()
+        self.phase('sharing')
         affected,sharing_complete=self._sharing(blocks,full)
+        self.phase('aggregate')
         if full:
             self._aggregate_full(affected)
         else:self._aggregate(affected)
@@ -591,6 +613,7 @@ class MapStore:
         if self.base_gen is not None:
             rows+=sum(self._row_size(table,'generation=?',(self.generation,))[0] for table in STAGE_TABLES)
         no_progress=0 if full or event_progress is True else old['no_progress']+1 if event_progress is False else old['no_progress']
+        self.phase('publication')
         with self.write(rows=rows,payload_bytes=payload):
             for sql,args,_,_ in plan:self.db.execute(sql,args)
             published=self.base_gen if self.base_gen is not None else self.generation

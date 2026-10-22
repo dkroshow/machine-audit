@@ -63,9 +63,11 @@ class Walker:
             rootstat = os.stat(root, follow_symlinks=False)
         except OSError:
             self.gaps.add('root_unreadable')
-            return
+            return False
         if not stat.S_ISDIR(rootstat.st_mode):
-            raise ValueError('scan_root_must_be_directory')
+            self.gaps.add('root_not_directory')
+            return False
+        root_listed=False
         stack = [(root, parent_id, inherited_private,recursive)]
         while stack:
             path, parent, hidden, descend_all = stack.pop()
@@ -159,6 +161,7 @@ class Walker:
                                              own_listed, own_uses, outcome, path if names else None, st.st_mtime_ns))
                     self.sink.listed(identity,direct_count)
                     self.listed.add(identity)
+                    if path==root:root_listed=True
                     # An hourly update re-lists one changed folder. New folders
                     # still need their initial recursive map; unchanged descendants
                     # retain their existing sizes without a filesystem walk.
@@ -184,3 +187,4 @@ class Walker:
                                          'directory', 0, 0, 'denied', None if hidden else path, st.st_mtime_ns))
             except OSError:
                 self.gaps.add('directory_unreadable')
+        return root_listed
