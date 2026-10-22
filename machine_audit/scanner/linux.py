@@ -2,6 +2,7 @@
 re-lists of the hot folders the collector's watcher saw change. Names and paths stay in
 the scanner store; the dirty file between the two holds volume and inode numbers only."""
 from __future__ import annotations
+import json
 import os
 from pathlib import Path
 import pwd
@@ -68,6 +69,11 @@ def run_scan(data_dir, *, full=False, grain='files', roots=None, exclusions=(), 
                 old = store.db.execute('SELECT * FROM volumes WHERE id=?', (volume.id,)).fetchone()
                 has_root = old and store.db.execute('SELECT 1 FROM nodes WHERE generation=? AND volume=? AND parent IS NULL LIMIT 1',
                                                     (old['generation'], old['key'])).fetchone()
+                if has_root and old['status'] == 'unavailable' and not old['valid']:
+                    # Published before Linux maps were observed without a residual; same facts, no re-walk.
+                    gaps = sorted(set(json.loads(old['gaps'])) | {'physical_residual_not_computed'})
+                    with store.write():
+                        store.db.execute("UPDATE volumes SET status='observed',valid=1,gaps=? WHERE id=?", (json.dumps(gaps), volume.id))
                 now = time.time_ns()
                 age = now - old['full_ns'] if has_root else None
                 # Full when there is no map, at night or on request once a day, or when nights were missed.

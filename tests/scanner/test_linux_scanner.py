@@ -3,6 +3,7 @@ formats them (proc(5)); inotify events are packed as inotify(7) lays them out.""
 import os
 from pathlib import Path
 import re
+import sqlite3
 import struct
 import tempfile
 import time
@@ -76,6 +77,16 @@ class LinuxScannerTests(unittest.TestCase):
         self.assertEqual((row['status'], row['valid'], row['uses'], row['not_attributed']), ('observed', True, row['listed'], None))
         self.assertIn('physical_residual_not_computed', row['gaps'])
         self.assertEqual(self.scan()['volumes'][0]['status'], 'current')  # the same night, nothing changed
+
+    def test_a_map_published_before_the_fix_reads_observed_at_the_next_run_without_a_walk(self):
+        volume = self.scan()['volumes'][0]['volume_id']
+        db = sqlite3.connect(self.data / 'scanner.sqlite')
+        with db:
+            db.execute("UPDATE volumes SET status='unavailable',valid=0,gaps='[]'")  # what the earlier build stored
+        db.close()
+        self.assertEqual(self.scan()['volumes'][0]['status'], 'current')
+        row = MapQuery(self.data / 'scanner.sqlite').query('volumes', volume_id=volume)['rows'][0]
+        self.assertEqual((row['status'], row['valid'], row['gaps']), ('observed', True, ['physical_residual_not_computed']))
 
     def test_hourly_runs_walk_in_full_only_at_night_once_a_day(self):
         self.scan()
