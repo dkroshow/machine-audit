@@ -284,7 +284,9 @@ Ordinary events whose path no longer exists now shallow-list the nearest
 known directory. New child directories still receive an initial recursive
 walk; `MUST_SCAN` retains recursive semantics. Private directories can be
 resolved by inode through the walker's no-follow directory open, without
-persisting event paths or exposing their contents. A shallow parent listing
+persisting event paths or exposing their contents. Every ancestor's path policy
+is checked before that open, including protected directories absent from the map.
+A shallow parent listing
 cannot remove a child's previously observed privacy boundary.
 
 Disposable-directory regressions reproduce the old amplification: an ordinary

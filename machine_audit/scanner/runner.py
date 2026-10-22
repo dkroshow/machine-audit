@@ -44,6 +44,13 @@ def relist(store,walker,policy,volume,now,changes):
         # Changes inside excluded folders or this store must not re-walk their parent.
         if policy.decide(shown_path(volume,path)).reason in ('excluded','own_store'):
             continue
+        # A descendant can look ordinary while an ancestor requires access.
+        # Check the complete path policy before any inode-resolution open.
+        ancestor=path
+        while policy.decide(shown_path(volume,ancestor)).descend:
+            if ancestor==volume.mount:break
+            ancestor=os.path.dirname(ancestor)
+        else:continue
         # Resolve the nearest mapped directory without exporting event paths.
         found=None
         while path.startswith(volume.mount):

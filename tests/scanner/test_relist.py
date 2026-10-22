@@ -2,6 +2,7 @@
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from machine_audit.budget import Budget
 from machine_audit.scanner.accounting import Blocks
@@ -49,6 +50,13 @@ class RelistTests(unittest.TestCase):
         for i in range(30):(self.tree/'parent'/'kept'/str(i)).write_bytes(b'kept')
         self.baseline()
         self.assertEqual(self.update(self.tree/'parent',True).entries,31)
+
+    def test_denied_ancestor_is_checked_before_resolving_an_event_inode(self):
+        (self.tree/'Desktop').mkdir()
+        self.policy=Policy(home=str(self.tree),homes=[str(self.tree)])
+        self.baseline()
+        with patch.object(Walker,'directory_identity',side_effect=AssertionError('protected open')):
+            self.assertEqual(self.update(self.tree/'Desktop'/'event').entries,0)
 
     def test_private_event_updates_only_its_known_private_directory(self):
         private=self.tree/'browser';(private/'inner').mkdir(parents=True)
