@@ -9,6 +9,7 @@ from pathlib import Path
 import stat
 import sys
 
+from .budget import free_space
 from .config import Config
 
 
@@ -112,6 +113,7 @@ def inspect(config: Config) -> dict:
         "startup": startup,
         "port": port,
         "permissions": permissions,
+        "storage": free_space(config.root),
         "dashboard": {"access": "tailscale" if config.tailscale_host else "local", "configured": config.tailscale_host is not None},
         "budget": runtime.get("budget"),
         "next_actions": actions,
@@ -121,6 +123,7 @@ def inspect(config: Config) -> dict:
 def _print_report(report: dict) -> None:
     print(f"Python {report['runtime']['python']}: {'ready' if report['runtime']['ok'] else 'upgrade needed'}")
     print(f"Collector: {report['collector']}; data directory: {report['data_directory']}")
+    print(f"Free space: {report['storage']['free_bytes']:,} bytes; recordings need {report['storage']['required_free_bytes']:,}")
     for name, title in (("scanner", "Protected disk areas"), ("helper", "System process and power detail")):
         permission = report["permissions"][name]
         wanted = "requested" if permission["requested"] else "optional, not requested"
@@ -179,6 +182,11 @@ def setup(config: Config, *, json_output: bool = False) -> int:
         answer = input(f"Tailscale hostname [{current_host or 'local dashboard only'}]; '-' for local only: ").strip()
         proposed.tailscale_host = None if answer == "-" else (answer or current_host or None)
         proposed.validate()
+        space = free_space(proposed.root)
+        if space["free_bytes"] < space["required_free_bytes"]:
+            print(f"Not enough free space for recordings: {space['required_free_bytes']:,} bytes required on the "
+                  f"data directory's filesystem, {space['free_bytes']:,} available. Nothing was saved.")
+            return 2
         print(f"Dashboard: {proposed.tailscale_host or 'this machine only'}")
         print(f"Private recordings: {proposed.root}")
         print("Access choices are requests. The running scanner must confirm permission; the helper is not shipped yet, so its choice is recorded for later.")

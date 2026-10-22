@@ -48,7 +48,8 @@ class ScaleTests(unittest.TestCase):
     def setUp(self):
         root=Path(__file__).parent/'.tmp';root.mkdir(exist_ok=True)
         self.tmp=tempfile.TemporaryDirectory(dir=root)
-        self.store=Store(Path(self.tmp.name)/'readings.sqlite',Budget(self.tmp.name,free_margin_bytes=0))
+        # 1 GB covers the 200 MB full-day fixture without needing the default cap free.
+        self.store=Store(Path(self.tmp.name)/'readings.sqlite',Budget(self.tmp.name,limit_bytes=1_000_000_000,free_margin_bytes=0))
 
     def tearDown(self):
         self.store.close();self.tmp.cleanup()

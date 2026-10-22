@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 import machine_audit
+from machine_audit.budget import Budget
 from machine_audit.config import Config
 from machine_audit.model import Clock, Field, Reading, Record
 from machine_audit.scanner.accounting import Blocks
@@ -32,7 +33,9 @@ class SavedStorageCliTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.config = Config(data_dir=str(self.root))
         self.config.save()
-        readings = Store(self.config.store_path)
+        # A small cap keeps the fixture independent of the checkout's free space.
+        budget = Budget(self.root, limit_bytes=64 * 1024**2, free_margin_bytes=0)
+        readings = Store(self.config.store_path, budget)
         for sequence, value in enumerate((0, 7), 1):
             clock = Clock(sequence * NS, sequence * NS, sequence * NS)
             reading = Reading('synthetic.cpu', 'cpu', clock, clock,
@@ -40,7 +43,7 @@ class SavedStorageCliTests(unittest.TestCase):
             readings.append([Record(reading, 'boot', 'run', sequence,
                                     clock.wall_ns, clock)])
         readings.close()
-        scanner = MapStore(self.root / 'scanner.sqlite')
+        scanner = MapStore(self.root / 'scanner.sqlite', budget)
         try:
             for volume_id, label in (('volume-a', 'A decoy'), ('volume-b', 'B target')):
                 volume = Volume(volume_id, label, str(self.root), 'hfs', 1,
