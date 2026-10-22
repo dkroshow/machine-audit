@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS runs(
  id TEXT PRIMARY KEY,started_ns INTEGER NOT NULL,updated_ns INTEGER NOT NULL,ended_ns INTEGER,
  pid INTEGER NOT NULL,pid_start TEXT,status TEXT NOT NULL,entries INTEGER NOT NULL DEFAULT 0,cpu_ns INTEGER NOT NULL,
  peak_rss_bytes INTEGER NOT NULL,written_bytes INTEGER,kind TEXT NOT NULL,
- volume_id TEXT,action TEXT,trigger TEXT,stage TEXT) WITHOUT ROWID;
+ volume_id TEXT,action TEXT,trigger TEXT,stage TEXT,volumes TEXT) WITHOUT ROWID;
 '''
 MAP_TABLES=('nodes','files','holders','charges','listings')
 STAGE_TABLES=('removed','reset_dirs','removed_charges')
@@ -126,7 +126,7 @@ class MapStore:
             # Nullable diagnostic columns extend format 2 without rewriting map
             # rows or changing old observations. Each ALTER is metadata only.
             columns={r['name'] for r in self.db.execute('PRAGMA table_info(runs)')}
-            missing_columns={'volume_id','action','trigger','stage'}-columns
+            missing_columns={'volume_id','action','trigger','stage','volumes'}-columns
             if missing_columns:
                 with self.write(rows=len(missing_columns)):
                     for column in sorted(missing_columns):
@@ -191,6 +191,14 @@ class MapStore:
                 (time.time_ns(),self.entries,time.process_time_ns(),int(r.ru_maxrss*(1 if sys.platform=='darwin' else 1024)),
                  written,status,
                  None if status=='running' else time.time_ns(),*context,self.run))
+
+    def record_volumes(self,results):
+        """Each volume's outcome codes for this run (status, action, trigger, gaps,
+        reason, entries): the scheduled scanner keeps no output, so the run row is
+        the only place a per-volume failure can be read back."""
+        data=json.dumps(results,separators=(',',':'))
+        with self.write(rows=1,payload_bytes=len(data)):
+            self.db.execute('UPDATE runs SET volumes=? WHERE id=?',(data,self.run))
 
     def prepare(self,volume,full=True,lean=True):
         self.flush();self.prune_generations(full)

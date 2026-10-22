@@ -390,6 +390,10 @@ map, adds the `directory_unreadable` gap and is deferred an hour; it is never
 cleared first, since anything staged beneath a cleared, unwalked directory
 would have no ancestor. Access checks still run first;
 published map times, points and hierarchy change only on successful publication.
+Each run row also keeps `runs.volumes`: the per-volume outcome codes of that
+run (volume id, status, action, trigger, entries, gap codes, reason), since the
+scheduled scanner keeps no output and the row is the only place a per-volume
+failure can be read back. It holds codes and counts only.
 Unreadable root attempts now save their safe reason in `volumes.status`, while
 invariant exceptions already save their specific code there. A partial run at
 stage `complete` means a root/relist was unreadable, not an uncaught invariant.

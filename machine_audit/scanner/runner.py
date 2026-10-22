@@ -258,6 +258,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     store.db.executemany('UPDATE volumes SET mounted=0 WHERE id=?',((identity,) for identity in missing))
             run_status=('partial' if published else 'root_unreadable') if root_failed else 'complete'
             store.phase('complete')
+            store.record_volumes(results)
             store.progress(processed,run_status)
             return {'status':run_status if root_failed else 'observed','volumes':results,'entries':processed,**store.run_context}
         except Exception as exc:
@@ -273,6 +274,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
             # A separate failure to persist the reason is visible in the JSON.
             recorded=False
             try:
+                store.record_volumes(results)
                 store.mark_failed(reason)
             except Exception:
                 pass

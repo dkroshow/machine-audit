@@ -2,6 +2,7 @@
 import os
 from dataclasses import replace
 from pathlib import Path
+import json
 import sqlite3
 import sys
 import tempfile
@@ -331,6 +332,11 @@ class RootPublicationTests(unittest.TestCase):
         self.assertIn('root_not_directory', result['volumes'][0]['gaps'])
         self.assertEqual(result['volumes'][1]['status'], 'observed')
         self.assertEqual(self.published(), before)
+        # The scheduled scanner keeps no output: the run row holds each volume's codes.
+        with sqlite3.connect(self.data/'scanner.sqlite') as db:
+            recorded = json.loads(db.execute('SELECT volumes FROM runs ORDER BY started_ns DESC LIMIT 1').fetchone()[0])
+        self.assertEqual([(v['status'], v['volume_id']) for v in recorded], [('update_unreadable', 'v'), ('observed', 'other')])
+        self.assertIn('root_not_directory', recorded[0]['gaps'])
 
     def test_failed_volume_does_not_prevent_another_empty_root_publication(self):
         before = self.published()

@@ -31,7 +31,7 @@ class PublicationBudgetTests(unittest.TestCase):
         store.directory(Node('1', None, 'Root', 'directory', size, size, 'observed', None, 0))
 
     def test_run_diagnostics_migrate_without_changing_prior_run_evidence(self):
-        legacy = SCHEMA.replace(',\n volume_id TEXT,action TEXT,trigger TEXT,stage TEXT', '').replace(',full_attempt_ns INTEGER','')
+        legacy = SCHEMA.replace(',\n volume_id TEXT,action TEXT,trigger TEXT,stage TEXT,volumes TEXT', '').replace(',full_attempt_ns INTEGER','')
         original = ('old',1,2,2,123,'start','complete',10,20,30,40,'scheduled')
         with sqlite3.connect(self.path) as db:
             db.executescript(legacy)
@@ -42,7 +42,7 @@ class PublicationBudgetTests(unittest.TestCase):
         self.addCleanup(store.close)
         row = tuple(store.db.execute("SELECT * FROM runs WHERE id='old'").fetchone())
         self.assertEqual(row[:12],original)
-        self.assertEqual(row[12:],(None,None,None,None))
+        self.assertEqual(row[12:],(None,None,None,None,None))
         self.assertEqual(tuple(store.db.execute('SELECT full_ns,full_attempt_ns FROM volumes').fetchone()),(17,None))
         store.start('scheduled')
         store.phase('walk',volume_id='v',action='full',trigger='event_kernel_drop')
