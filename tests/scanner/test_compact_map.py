@@ -100,6 +100,43 @@ class CompactMapTests(unittest.TestCase):
         children=MapQuery(self.store.path).query('children',volume_id='v')['rows']
         self.assertEqual({row['id']:row['uses'] for row in children},{'a':8,'b':8})
 
+    def test_holder_lookups_use_specific_indexes_and_keep_shared_totals(self):
+        # The volume-wide primary-key scan made each stream/file lookup
+        # revisit every holder after the first real full walk.
+        self.store.prepare(self.volume)
+        self.node('root',None);self.node('a','root',4*GB);self.node('b','root',8*GB)
+        self.store.holder(1,'a',1,4*GB,None,False)
+        self.store.holder(1,'b',1,4*GB,None,False)  # Same file in two directories.
+        self.store.holder(2,'b',2,4*GB,2*GB,True)
+        self.store.flush()
+
+        def check_lookups(branches):
+            for column,index in (('stream','holder_stream'),('file_id','holder_file')):
+                statements=[]
+                self.store.db.set_trace_callback(statements.append)
+                try:rows=list(self.store._rows('holders',column+'=?',(inode_key(1),)))
+                finally:self.store.db.set_trace_callback(None)
+                self.assertEqual({(source_id(r['dir']),source_id(r['file_id'])) for r in rows},
+                                 {('a','1'),('b','1')})
+                plan=[r['detail'] for r in self.store.db.execute('EXPLAIN QUERY PLAN '+statements[0])]
+                with self.subTest(branches=branches,column=column):
+                    self.assertEqual(sum('USING INDEX '+index+' ' in detail for detail in plan),branches,plan)
+
+        check_lookups(1)
+        blocks=Blocks()
+        blocks.add(Stream(1,'a',4*GB,None,False),[(0,4*GB)])
+        blocks.add(Stream(2,'b',4*GB,2*GB,True),[(2*GB,4*GB)])
+        self.store.finish_volume(self.volume,blocks,[],full=True,lean=True)
+        first=MapQuery(self.store.path).query()['rows'][0]
+        self.assertEqual((first['listed'],first['uses']),(8*GB,6*GB))
+        self.store.prepare(self.volume,full=False)
+        self.store.begin_directory('a');self.node('a','root',4*GB)
+        self.store.holder(1,'a',1,4*GB,None,False);self.store.flush()
+        check_lookups(2)
+        self.store.finish_volume(self.volume,Blocks(),[],full=False,lean=True)
+        second=MapQuery(self.store.path).query()['rows'][0]
+        self.assertEqual((second['listed'],second['uses']),(8*GB,6*GB))
+
     def test_baseline_growth_preserves_small_change_without_global_claim(self):
         for at,extra in ((1_000_000_000,0),(2_000_000_000,50_000_000)):
             self.store.prepare(self.volume)

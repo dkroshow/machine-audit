@@ -215,7 +215,11 @@ class MapStore:
         """Only the scanner sees staged rows. Public queries read published rows."""
         identity={'nodes':'id','files':'parent','holders':'dir','charges':'stream','listings':'id'}[table]
         removed='removed_charges' if table=='charges' else 'removed'
-        staged=f'SELECT * FROM {table} WHERE generation=? AND volume=? AND {where}'
+        # SQLite otherwise prefers the volume-wide primary-key prefix for
+        # these SELECT * lookups, scanning every holder per stream or file.
+        index={'stream=?':'holder_stream','file_id=?':'holder_file'}.get(where) if table=='holders' else None
+        hint=f' INDEXED BY {index}' if index else ''
+        staged=f'SELECT * FROM {table}{hint} WHERE generation=? AND volume=? AND {where}'
         params=[self.generation,self.vid,*args]
         if table in ('nodes','listings'):
             staged+=f' AND {identity} NOT IN (SELECT id FROM removed WHERE generation=? AND volume=?)'
@@ -229,7 +233,7 @@ class MapStore:
             hidden=f'''NOT EXISTS(SELECT 1 FROM {table} s WHERE s.generation=? AND s.volume=? AND s.{identity}=b.{identity})
                        AND NOT EXISTS(SELECT 1 FROM {removed} s WHERE s.generation=? AND s.volume=? AND s.id=b.{identity})'''
             extra=[self.generation,self.vid,self.generation,self.vid]
-        return self.db.execute(staged+f' UNION ALL SELECT * FROM {table} b WHERE generation=? AND volume=? AND {where} AND '+hidden,
+        return self.db.execute(staged+f' UNION ALL SELECT * FROM {table} b{hint} WHERE generation=? AND volume=? AND {where} AND '+hidden,
                                params+[self.base_gen,self.vid,*args,*extra])
 
     def _node(self,identity):
