@@ -114,10 +114,10 @@ class MapStore:
         self.changed=set();self.last_progress=0.0;self.entries=0
 
     @contextmanager
-    def write(self,growth=None):
-        # Ask for the admissible range, not a payload multiplier. Budget still
-        # clamps DB/WAL/SHM under its conservative cross-process hard bound.
-        with self.budget.sqlite_write(self.db,self.path,max_growth_bytes=growth):
+    def write(self,growth=None,*,rows=None,payload_bytes=0):
+        # Counted batches use their row/payload contract. Uncounted publication
+        # retains the conservative whole-DB bound until its writes are bounded.
+        with self.budget.sqlite_write(self.db,self.path,max_growth_bytes=growth,rows=rows,payload_bytes=payload_bytes):
             self.db.execute('BEGIN IMMEDIATE')
             try:
                 yield
@@ -128,7 +128,7 @@ class MapStore:
 
     def start(self,kind):
         self.run=uuid.uuid4().hex;now=time.time_ns()
-        with self.write():
+        with self.write(rows=self.db.execute("SELECT count(*) FROM runs WHERE status='running'").fetchone()[0]+1):
             self.db.execute("UPDATE runs SET status='interrupted' WHERE status='running'")
             self.db.execute('INSERT INTO runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
                 (self.run,now,now,None,os.getpid(),getattr(self,'process_start',None),'running',0,time.process_time_ns(),0,None,kind))
@@ -141,7 +141,7 @@ class MapStore:
         if status=='running' and now-self.last_progress<5:return
         self.last_progress=now
         r=resource.getrusage(resource.RUSAGE_SELF)
-        with self.write():
+        with self.write(rows=1):
             self.db.execute('UPDATE runs SET updated_ns=?,entries=?,cpu_ns=?,peak_rss_bytes=?,written_bytes=?,status=?,ended_ns=? WHERE id=?',
                 (time.time_ns(),self.entries,time.process_time_ns(),int(r.ru_maxrss*(1 if sys.platform=='darwin' else 1024)),
                  self.written_bytes() if hasattr(self,'written_bytes') else None,status,
@@ -149,7 +149,7 @@ class MapStore:
 
     def prepare(self,volume,full=True,lean=True):
         self.flush();self.prune_generations(full)
-        with self.write():
+        with self.write(rows=3):
             self.db.execute('INSERT OR IGNORE INTO volumes(id,label,mount,status,lean) VALUES(?,?,?,?,?)',
                             (volume.id,volume.label,volume.mount,'building',int(lean)))
             old=self.db.execute('SELECT * FROM volumes WHERE id=?',(volume.id,)).fetchone()
@@ -170,16 +170,16 @@ class MapStore:
                 # Cache spilling stays disabled. Bound deletions per commit,
                 # retaining the generation record so interrupted cleanup resumes.
                 while True:
-                    with self.write():
+                    with self.write(rows=4096):
                         removed=self.db.execute(f'''DELETE FROM {table} WHERE ({key}) IN
                             (SELECT {key} FROM {table} WHERE generation=? ORDER BY {key} LIMIT 4096)''',
                             (generation,)).rowcount
                     if removed<4096:break
-            with self.write():
+            with self.write(rows=1):
                 self.db.execute('DELETE FROM generations WHERE id=?',(generation,))
 
     def observe_unscanned(self,volume,reason,lean=True):
-        with self.write():
+        with self.write(rows=1):
             self.db.execute('''INSERT INTO volumes(id,label,mount,status,lean,capacity,free,available,volume_used,mounted,gaps)
                 VALUES(?,?,?,?,?,?,?,?,?,1,?) ON CONFLICT(id) DO UPDATE SET mounted=1,capacity=excluded.capacity,
                 free=excluded.free,available=excluded.available,volume_used=excluded.volume_used,status=excluded.status,gaps=excluded.gaps''',
@@ -194,7 +194,7 @@ class MapStore:
         if not self.buffer:return
         groups=defaultdict(list)
         for query,args in self.buffer:groups[query].append(args)
-        with self.write():
+        with self.write(rows=len(self.buffer),payload_bytes=self.buffer_bytes):
             for query,rows in groups.items():self.db.executemany(query,rows)
         self.buffer.clear();self.buffer_bytes=0
 
@@ -203,7 +203,7 @@ class MapStore:
                     (self.generation,self.vid,inode_key(identity),time.time_ns(),count))
 
     def defer(self,identity,due_ns):
-        with self.write():self.db.execute('INSERT OR REPLACE INTO dirty VALUES(?,?,?)',(self.volume,identity,due_ns))
+        with self.write(rows=1):self.db.execute('INSERT OR REPLACE INTO dirty VALUES(?,?,?)',(self.volume,identity,due_ns))
 
     def directory(self,node):
         identity=inode_key(node.id)
@@ -351,7 +351,7 @@ class MapStore:
             if full:
                 # Only this unpublished generation changes. Bound each write;
                 # no transaction or reservation spans the stream lookup loop.
-                with self.write(growth=16*1024**2):
+                with self.write(growth=16*1024**2,rows=len(pending)):
                     self.db.executemany('INSERT OR REPLACE INTO charges VALUES(?,?,?,?,?,?,?,?)',pending)
                 self.progress()
             else:
@@ -427,7 +427,7 @@ class MapStore:
         if visited!=len(keys):raise ValueError('cyclic_directory_ancestry')
         self.progress()
         for first in range(0,len(keys),8192):
-            with self.write():
+            with self.write(rows=min(8192,len(keys)-first)):
                 self.db.executemany('UPDATE nodes SET listed=?,uses=? WHERE generation=? AND volume=? AND id=?',
                     ((listed[i],uses[i],self.generation,self.vid,keys[i]) for i in range(first,min(first+8192,len(keys)))))
             self.progress()
@@ -557,7 +557,7 @@ class MapStore:
 
     def mark_failed(self,status):
         self.buffer.clear();self.buffer_bytes=0
-        with self.write():self.db.execute('UPDATE volumes SET status=? WHERE id=?',(status,self.volume))
+        with self.write(rows=1):self.db.execute('UPDATE volumes SET status=? WHERE id=?',(status,self.volume))
         self.progress(status=status)
 
     def close(self):self.db.close()

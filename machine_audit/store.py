@@ -103,16 +103,17 @@ class Store:
 
     def start_run(self, run_id, boot_id, started_ns):
         with self._mutex:
+            self.maintain()
             while True:
                 try:
-                    with self.budget.sqlite_write(self.db,self.path):
+                    with self.budget.sqlite_write(self.db,self.path,rows=1):
                         self.db.execute("INSERT INTO runs(run_id,boot_id,started_ns) VALUES(?,?,?)", (run_id, boot_id, started_ns))
                     return
                 except (sqlite3.OperationalError,BudgetExceeded) as exc:
                     if not self._capacity_error(exc) or not self.prune_oldest():raise
 
     def stop_run(self, run_id, stopped_ns):
-        with self._mutex, self.budget.sqlite_write(self.db,self.path):
+        with self._mutex, self.budget.sqlite_write(self.db,self.path,rows=1):
             self.db.execute("UPDATE runs SET stopped_ns=? WHERE run_id=?", (stopped_ns,run_id))
 
     def _previous(self, records):
@@ -159,7 +160,27 @@ class Store:
         return getattr(exc,"sqlite_errorcode",None)==sqlite3.SQLITE_FULL or str(exc) in {"managed_storage_limit","sqlite_checkpoint_headroom"}
 
     def _write(self,records,raw,summaries,commit_lock,on_commit):
-        with self.budget.sqlite_write(self.db,self.path):
+        first,last=records[0],records[-1]
+        prepared=[];replaced_payload=0
+        for (resolution,bucket,source,component,entity),rows in summaries.items():
+            lower=first.sequence
+            old=self.db.execute("SELECT sequence_min,payload FROM summaries WHERE run_id=? AND resolution=? AND bucket_ns=? AND source=? AND component=? AND entity=?",(first.run_id,resolution,bucket,source,component,entity)).fetchone()
+            if old:replaced_payload+=len(old[1])
+            def key(row):return tuple(row[k] for k in ("signal","unit","kind","scope","scale"))
+            merged={key(row):row for row in unpack_summaries(old[1])} if old else {}
+            for row in rows:
+                k=key(row)
+                merged[k]=merge_summaries([merged[k],row]) if k in merged else row
+            if old:lower=min(lower,old[0])
+            prepared.append((first.run_id,lower,last.sequence,resolution,bucket,source,component,entity,pack_summaries(list(merged.values()))))
+        components=sum(len({r.reading.component,*(field_component(f,r.reading.component) for f in r.reading.fields)}) for r in records)
+        catalog={(row["source"],row["signal"],row["component"],row["kind"],row["unit"],row["scope"],row["scale"]) for rows in summaries.values() for row in rows}
+        count=2+len(records)+3*components+len(prepared)+len(catalog)+len({r.reading.source for r in records})+sum(any(f.kind=='event' for f in r.reading.fields) for r in records)
+        for source in {r.reading.source for r in records}:
+            old=self.db.execute('SELECT length(payload) FROM baselines WHERE source=?',(source,)).fetchone()
+            if old:replaced_payload+=old[0]
+        payload=3*sum(len(p) for _,p in raw)+sum(len(row[-1]) for row in prepared)+replaced_payload
+        with self.budget.sqlite_write(self.db,self.path,rows=count,payload_bytes=payload):
             self.db.execute("BEGIN IMMEDIATE")
             try:
                 first, last = records[0], records[-1]
@@ -170,17 +191,7 @@ class Store:
                     raise ValueError("sequence already committed")
                 self.db.executemany("INSERT INTO readings VALUES(?,?,?,?,?,?)",[(r.run_id,r.sequence,r.reading.end.wall_ns,r.reading.source,r.reading.component,p) for r,p in raw])
                 self.db.executemany("INSERT INTO reading_components VALUES(?,?,?,?)",[(r.run_id,r.sequence,c,int(not r.reading.fields or any(field_component(f,r.reading.component)==c and is_series(c,f.entity,f.scope) for f in r.reading.fields))) for r,_ in raw for c in {r.reading.component,*(field_component(f,r.reading.component) for f in r.reading.fields)}])
-                for (resolution,bucket,source,component,entity),rows in summaries.items():
-                    lower=first.sequence
-                    old=self.db.execute("SELECT sequence_min,payload FROM summaries WHERE run_id=? AND resolution=? AND bucket_ns=? AND source=? AND component=? AND entity=?",(first.run_id,resolution,bucket,source,component,entity)).fetchone()
-                    def key(row):return tuple(row[k] for k in ("signal","unit","kind","scope","scale"))
-                    merged={key(row):row for row in unpack_summaries(old[1])} if old else {}
-                    for row in rows:
-                        k=key(row)
-                        merged[k]=merge_summaries([merged[k],row]) if k in merged else row
-                    if old:lower=min(lower,old[0])
-                    self.db.execute("INSERT INTO summaries(run_id,sequence_min,sequence_max,resolution,bucket_ns,source,component,entity,payload) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,resolution,bucket_ns,source,component,entity) DO UPDATE SET sequence_min=excluded.sequence_min,sequence_max=excluded.sequence_max,payload=excluded.payload",(first.run_id,lower,last.sequence,resolution,bucket,source,component,entity,pack_summaries(list(merged.values()))))
-                catalog={(row["source"],row["signal"],row["component"],row["kind"],row["unit"],row["scope"],row["scale"]) for rows in summaries.values() for row in rows}
+                self.db.executemany("INSERT INTO summaries(run_id,sequence_min,sequence_max,resolution,bucket_ns,source,component,entity,payload) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,resolution,bucket_ns,source,component,entity) DO UPDATE SET sequence_min=excluded.sequence_min,sequence_max=excluded.sequence_max,payload=excluded.payload",prepared)
                 self.db.executemany("INSERT OR REPLACE INTO signal_catalog VALUES(?,?,?,?,?,?,?)",sorted(catalog))
                 latest = {}
                 coverage = defaultdict(list)
@@ -217,11 +228,7 @@ class Store:
         Work starts well before the cap; if reserve cannot fit, fail without
         removing a file or discarding the collector's pending batch.
         """
-        own_bytes = self.path.stat().st_size
-        # Retain the conservative full-WAL headroom, without subtracting the
-        # database a second time from an already halved usable target.
-        other = self.budget.usage()["bytes"] - own_bytes
-        target = other + max(0, (self.budget.limit_bytes-other)//2)*.85
+        target = self.budget.limit_bytes*.90
         while self.budget.usage()["bytes"] + required_bytes > target:
             if not self.prune_oldest():
                 break
@@ -252,7 +259,7 @@ class Store:
                         table,condition,args="summaries","resolution='hour' AND bucket_ns < ?",(end,)
                     else:
                         row=self.db.execute("SELECT MIN(wall_ns) FROM incidents").fetchone()
-                        if row[0] is None:return False
+                        if row[0] is None:return self._reclaim_free_pages()
                         kind,start,end="incident",row[0],(row[0]//MINUTE+1)*MINUTE
                         table,condition,args="incidents","wall_ns < ?",(end,)
             if summary_heads:
@@ -301,6 +308,25 @@ class Store:
                     if not self._capacity_error(exc) or len(rows)==1:raise
                     rows=rows[:max(1,len(rows)//2)]
             return False
+
+    def _reclaim_free_pages(self):
+        steps=min(PRUNE_BATCH,self.db.execute('PRAGMA freelist_count').fetchone()[0])
+        before=self.db.execute('PRAGMA page_count').fetchone()[0]
+        while steps:
+            try:
+                with self.budget.sqlite_write(self.db,self.path,max_growth_bytes=0,dirty_pages=64+8*steps):
+                    self.db.execute('BEGIN IMMEDIATE')
+                    try:
+                        for _ in range(steps):self.db.execute('PRAGMA incremental_vacuum(1)')
+                        self.db.execute('COMMIT')
+                    except BaseException:
+                        if self.db.in_transaction:self.db.execute('ROLLBACK')
+                        raise
+                return self.db.execute('PRAGMA page_count').fetchone()[0]<before
+            except (sqlite3.OperationalError,BudgetExceeded) as exc:
+                if not self._capacity_error(exc) or steps==1:raise
+                steps=max(1,steps//2)
+        return False
 
     def _summary_heads(self,resolution):
         # summaries_time orders component before time. Seek each component's

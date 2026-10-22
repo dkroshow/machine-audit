@@ -27,12 +27,32 @@ coverage and which history was removed. Exact cutoffs and reclaim amounts follow
 measured storage growth; this order does not promise indefinite retention.
 Pruning applies to Machine-audit's own records, not other files on the device.
 
-The current implementation reserves space for a database and its possible
-journal during writes. Its readings-store pruning target is about 42.5% of the
-cap left after other managed files: a 2 GB scanner map pair leaves about 3.4 GB
-for readings and summaries under the 10 GB cap. This conservative headroom is
-an implementation limit awaiting trial acceptance, not a promised history span.
+Counted writes reserve their transaction's growth and journal pages, rather
+than another copy of the entire database. The readings store starts proactive
+pruning at 90% of the combined cap; admission can prune earlier when the pending
+transaction needs more room. Neither number promises a particular history span.
 See the measured [recording costs](development.md#review-regressions-and-scale-measurements).
+
+For page size `p`, a transaction declaring `R` row mutations and `P` payload
+bytes reserves `F = 64 + 16R + ceil(P / (p - 64))` dirty-or-new pages. The
+64-page fixed allowance covers metadata; 16 pages per mutation cover table and
+index changes; payload pages cover overflow. Callers count every repeated write,
+including component indexes, summaries, catalog, baseline, coverage and events.
+The writer reserves its existing database once, at most `F*p` growth, a WAL of
+`32 + min(F, admitted database pages)*(p+24)` bytes, and the corresponding
+32 KiB shared-memory index chunks. Other managed files and active reservations
+are added once. Admission reduces possible database growth to fit available
+headroom and sets SQLite `max_page_count` accordingly. Cache spilling remains
+off; each transaction checkpoints before the next admission.
+
+Collector flushes supply actual row and packed-payload counts. Scanner buffered
+inserts are bounded at 8,192 operations or 2 MiB of arguments, charge writes at
+4,096 rows, aggregate updates at 8,192 rows and obsolete-generation deletes at
+4,096 rows. Regressions measure their WAL frames against the declared allowance.
+This factor is a product transaction contract, not a general SQLite guarantee.
+Schema work and scanner publication whose writes are not yet counted retain
+the conservative whole-database fallback; they must not claim these small
+reservations. Arbitrary SQL is not admitted through the counted-write API.
 
 Startup and flush both retry admission after pruning, without a fixed number
 of history windows. Pruning uses at most 4,096 primary rows and 4,096 related

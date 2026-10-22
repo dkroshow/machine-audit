@@ -42,6 +42,9 @@ class BudgetRecoveryTests(unittest.TestCase):
                 self.assertEqual([r[0] for r in db.execute('SELECT kind FROM retention ORDER BY rowid')],['raw','minute','hour','incident'])
                 self.assertEqual(len(budget.samples),4)
                 for frames,bound in budget.samples:self.assertLessEqual(frames,bound)
+                for _ in range(16):
+                    if not store.prune_oldest():break
+                else:self.fail('bounded vacuum did not finish reclaiming deleted history')
                 self.assertFalse(store.prune_oldest())
             finally:store.close()
 
@@ -57,6 +60,7 @@ class BudgetRecoveryTests(unittest.TestCase):
                                  (Field('memory.used',1,'bytes'),)),
                           'boot','old',1,1,clock)
             store.append([record])
+            store.db.execute('PRAGMA max_page_count=50000')  # Synthetic fixture construction.
             rng=random.Random(7)
             payload=pack_summaries([{'signal':'synthetic','sample':rng.randbytes(4096).hex()}])
             store.db.execute('BEGIN')
@@ -66,8 +70,8 @@ class BudgetRecoveryTests(unittest.TestCase):
             store.db.execute('COMMIT');store.db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
             hours=store.db.execute("SELECT count(*) FROM summaries WHERE resolution='hour'").fetchone()[0]
             store.close()
-            (root/'scanner.sqlite').write_bytes(bytes(10*1024**2))
             budget.limit_bytes=40*1024**2
+            (root/'scanner.sqlite').write_bytes(bytes(budget.limit_bytes-budget.usage()['bytes']-1024**2))
             self.assertLess(budget.usage()['bytes'],budget.limit_bytes)
             store=Store(path,budget)
             try:

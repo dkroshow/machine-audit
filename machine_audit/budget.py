@@ -14,6 +14,8 @@ import uuid
 GB = 1_000_000_000
 LIMIT_BYTES = 10 * GB
 FREE_MARGIN_BYTES = 64 * 1024**2
+ROW_PAGES = 16
+FIXED_WRITE_PAGES = 64
 
 
 class BudgetExceeded(RuntimeError):
@@ -189,12 +191,14 @@ class Budget:
 
     @contextmanager
     def sqlite_write(self, connection, path: str | Path, growth_bytes: int = 16*1024**2,
-                     *, max_growth_bytes: int | None = None, dirty_pages: int | None = None):
+                     *, max_growth_bytes: int | None = None, dirty_pages: int | None = None,
+                     rows: int | None = None, payload_bytes: int = 0):
         """Bound one SQLite writer's DB + WAL + checkpoint peak.
 
-        SQLite cannot spill transaction pages. With a cleared WAL and a fixed
-        page count, each dirty page contributes at most one WAL frame. Reserve
-        the entire possible DB and WAL, including checkpoint overlap. A pinned
+        SQLite cannot spill transaction pages. With a cleared WAL each dirty
+        page contributes at most one frame. Counted product transactions use
+        their declared row/payload bound; uncounted calls reserve the whole DB.
+        The page count bounds growth, including checkpoint overlap. A pinned
         reader prevents WAL truncation and therefore refuses this write.
         Before checkpointing, public page counts bound its remaining DB growth;
         the owning WAL is not charged twice once its pages are already copied.
@@ -203,7 +207,8 @@ class Budget:
         path = Path(path)
         if (path.parent.resolve() != self.root.resolve() or growth_bytes < 0 or
             (max_growth_bytes is not None and max_growth_bytes<0) or
-            (dirty_pages is not None and dirty_pages<1)):
+            (dirty_pages is not None and dirty_pages<1) or
+            (rows is not None and (rows<0 or dirty_pages is not None)) or payload_bytes<0):
             raise ValueError("invalid SQLite reservation")
         if connection.in_transaction:
             raise ValueError("SQLite admission requires no active transaction")
@@ -223,6 +228,8 @@ class Budget:
             self._admit(claim,lambda other,own:own,check_free=False)
             page = connection.execute("PRAGMA page_size").fetchone()[0]
             existing = connection.execute("PRAGMA page_count").fetchone()[0]
+            if rows is not None:
+                dirty_pages=FIXED_WRITE_PAGES+ROW_PAGES*rows+(payload_bytes+page-65)//(page-64)
             connection.execute("PRAGMA cache_spill=OFF")
             connection.execute("PRAGMA wal_autocheckpoint=0")
             admission={}
@@ -231,16 +238,23 @@ class Budget:
                 def bound(pages):
                     frames=pages if dirty_pages is None else min(pages,dirty_pages)
                     return pages*page + 32 + frames*(page+24) + ((frames+4061)//4062+1)*32768
-                # Payload size does not bound B-tree/index growth. Admit all
-                # pages that the proven DB + one-frame-per-page WAL bound fits.
-                cap = (self.limit_bytes-other)//(2*page+32) if dirty_pages is None else existing+(max_growth_bytes or 0)//page
+                # Counted transactions reserve their own pages. Legacy callers
+                # retain the whole-DB fallback until their rows are bounded.
+                cap = (self.limit_bytes-other)//page
+                if dirty_pages is not None:
+                    cap=min(cap,existing+dirty_pages)
                 if max_growth_bytes is not None:
                     cap=min(cap,existing+(max_growth_bytes+page-1)//page)
-                while cap >= existing and other+bound(cap)>self.limit_bytes:
-                    cap-=1
-                if cap < existing:
+                if cap < existing or other+bound(existing)>self.limit_bytes:
                     raise BudgetExceeded("sqlite_checkpoint_headroom")
-                admission.update(max_pages=cap,peak_bytes=other+bound(cap),page_size=page)
+                low=existing
+                while low<cap:
+                    middle=(low+cap+1)//2
+                    if other+bound(middle)<=self.limit_bytes:low=middle
+                    else:cap=middle-1
+                cap=low
+                admission.update(max_pages=cap,peak_bytes=other+bound(cap),page_size=page,
+                                 dirty_pages=dirty_pages,starting_pages=existing)
                 return bound(cap)
             self._admit(claim,peak)
             connection.execute(f"PRAGMA max_page_count={admission['max_pages']}")
