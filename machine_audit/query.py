@@ -8,7 +8,7 @@ import threading
 import math
 import heapq
 from dataclasses import replace
-from .derive import points, rollups, summarize, merge_summaries, GOOD
+from .derive import points, rollups, summarize, merge_summaries, GOOD, BUSY
 from .store import MINUTE, HOUR, unpack_summaries
 from .model import Record, field_component, is_process_evidence, is_series
 
@@ -472,7 +472,7 @@ class Query:
         if not signal:return records
         wanted={signal}
         if signal in {"process.cpu","self.cpu"}:
-            prefix=signal.split(".")[0];wanted.update((prefix+".user_time",prefix+".system_time","cpu.busy","cpu.user","cpu.system","cpu.nice"))
+            prefix=signal.split(".")[0];wanted.update((prefix+".user_time",prefix+".system_time","cpu.busy")+BUSY)
         return [replace(r,reading=replace(r.reading,fields=tuple(f for f in r.reading.fields if f.name in wanted))) for r in records]
 
     @staticmethod

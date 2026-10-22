@@ -27,17 +27,28 @@ class FanSource(ReadSource):
         super().__init__('macos.fans','heat',5,smc.fans,clock)
 
 
+def config_identity(config):
+    return hashlib.sha256(json.dumps({'enabled':config.enabled,'source_options':config.source_options},sort_keys=True).encode()).hexdigest()
+
+
 def boot_id():
     if sys.platform != 'darwin':
-        raise NotImplementedError('linux_sources_not_implemented')
+        from .linux import boot_id
+        return boot_id()
     from .native import Darwin
     return hashlib.sha256(Darwin().bytes('kern.boottime')).hexdigest()[:32]
 
 
 def create_sources(config,budget,operations=None,scanner=None):
     if sys.platform != 'darwin':
-        return [GapSource('platform.'+c,c,60,'linux_sources_not_implemented','unavailable')
-                for c in ('cpu','memory','gpu','storage','network','power','heat','self')]
+        from .linux import sources as linux
+        sources=linux(config,budget,operations,scanner)
+    else:
+        sources=_macos(config,budget,operations,scanner)
+    return [s if config.enabled.get(s.name,True) else GapSource(s.name,s.component,s.cadence_s,'source_disabled') for s in sources]
+
+
+def _macos(config,budget,operations,scanner):
     from .native import Darwin
     from .iokit import IOKit
     from .devices import Devices
@@ -47,7 +58,7 @@ def create_sources(config,budget,operations=None,scanner=None):
     from machine_audit.scanner.native import MacFilesystem
     native,io=Darwin(),IOKit()
     mac=MacOS(native)
-    mac.config_identity=hashlib.sha256(json.dumps({'enabled':config.enabled,'source_options':config.source_options},sort_keys=True).encode()).hexdigest()
+    mac.config_identity=config_identity(config)
     mac.install_revision=config.source_options.get('install_revision')
     device,smc=Devices(io,mac.clock),SMC(io,native)
     network=Network(native,io,mac.clock,config.identity_salt())
@@ -91,4 +102,4 @@ def create_sources(config,budget,operations=None,scanner=None):
     else:
         sources.extend([GapSource('macos.gpu','gpu',5,'exclusive_gpu_reader_required'),
                         GapSource('macos.gpu_clients','gpu',10,'exclusive_gpu_reader_required')])
-    return [s if config.enabled.get(s.name,True) else GapSource(s.name,s.component,s.cadence_s,'source_disabled') for s in sources]
+    return sources

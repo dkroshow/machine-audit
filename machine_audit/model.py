@@ -240,8 +240,9 @@ def field_component(field: Field, default: str) -> str:
 
 
 def is_process_evidence(entity: str, scope: str) -> bool:
-    """Failed PID reads retain process scope even without a process identity."""
-    return scope == "process" or entity.startswith(("process:", "program:"))
+    """Failed PID reads retain process scope even without a process identity.
+    Linux unit cgroups are workload groups, ranked like programs, not host series."""
+    return scope in ("process", "unit") or entity.startswith(("process:", "program:"))
 
 
 def is_series(component: str, entity: str, scope: str) -> bool:

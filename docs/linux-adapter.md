@@ -1,15 +1,17 @@
 # Linux adapter plan
 
-Status: plan. Targets: Ubuntu 24.04 (kernel 6.8, Python 3.12,
-systemd 255) and 26.04 (kernel 7.0, Python 3.14, systemd 259). Validation runs
-on those machines; fixtures prove parsing only.
+Status: slice 1 built (CPU, memory, units, self); slices 2–4 planned.
+Targets: Ubuntu 24.04 (kernel 6.8, Python 3.12, systemd 255) and 26.04 (kernel
+7.0, Python 3.14, systemd 259). Validation runs on those machines; fixtures
+prove parsing only.
 
 ## Layout
 
 - `sources/__init__.py` switches on `sys.platform`; Linux imports
   `sources/linux/`. The Mac path stays unchanged.
-- `linux/host.py`: clock (`time_ns`, `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME`),
-  boot id (`/proc/sys/kernel/random/boot_id`), CPU, memory, process pass.
+- `linux/host.py`: boot id (`/proc/sys/kernel/random/boot_id`), CPU, memory,
+  and the workload pass. `Clock.now()` already reads `CLOCK_MONOTONIC` and
+  `CLOCK_BOOTTIME` on Linux, so it is the native clock.
 - `linux/cgroups.py`: unit attribution. `linux/devices.py`: disks, volumes,
   hwmon heat and power, amdgpu. `linux/network.py`: counters and probes.
 - `self_cost.py` stays shared, with a Linux field map.
@@ -28,10 +30,33 @@ on those machines; fixtures prove parsing only.
 | GPU | amdgpu `gpu_busy_percent`, `mem_info_vram_*`, `mem_info_gtt_*` (5 s), skipped while runtime-suspended |
 | Self | own `/proc/<pid>/stat`, `statm`, `io`; scanner run records |
 
-Unit entity: `cgroup:` + HMAC(salt, path)[:16]; label: the admitted leaf
-name. Units are the first `.service`/`.scope` below slices, a non-overlapping
-level; host minus units is the shown remainder. Per-PID fields only for each
-unit's top consumers and our own processes.
+## Workloads
+
+One 10 s pass, `linux.workloads`, reads units and their processes together.
+
+- A unit is the first non-slice cgroup below the slices: one non-overlapping
+  level. Host minus units is the remainder (root cgroup, kernel work).
+- Entity: `cgroup:` + HMAC(salt, path)[:16] + `:` + directory inode, so a
+  restarted unit starts a new counter baseline. Scope `unit` ranks units in
+  `who` like programs, never as host series.
+- Label: the leaf name; a templated unit uses its template name
+  (`getty@tty1.service` → `getty.service`), because instances can carry
+  private names. Labels naming a person or the host become `redacted`.
+- Kept keys: `cpu.stat` usage and throttling, `memory.current`,
+  `memory.swap.current`, the `memory.stat` usage and movement keys listed in
+  `cgroups.py`, `memory.events`, CPU and memory PSI totals. Keys a newer
+  kernel adds are ignored until reviewed; a file a controller lacks is absent.
+- Per unit, per-PID fields cover the 3 largest CPU users since the last pass,
+  the largest resident set, and our own processes. A process entering that
+  set starts with a baseline window; its CPU in that window stays in the unit
+  total. `unit.processes` and `unit.processes_sampled` give coverage.
+- Process labels come from `comm` (the field in `/proc/<pid>/stat`). Linux
+  `self.memory` is the resident set, not the Mac footprint.
+
+Host CPU busy time is user+nice+system+irq+softirq per `cpu-view.md`; iowait,
+steal and guest (already inside user) are kept but not added. `/proc/meminfo`
+`kB` values are stored as bytes (exact ×1024). PSI totals are microsecond
+counters whose rate reads as percent of time stalled.
 
 ## Gaps
 
@@ -43,9 +68,10 @@ capacity test.
 
 ## Fixtures
 
-`tests/sources/linux/<case>/` holds `proc/`, `sys/` and cgroup trees with
-synthetic text in the kernel's formats, including 7.0's extra keys. Captured,
-scrubbed files replace them when the first user's bundle arrives.
+A bundle is one text file of named sections, each `==> /proc/stat <==`
+followed by that file's text. Tests write the sections under a temporary root
+and point the sources at it. `tests/sources/linux/synthetic.txt` is synthetic
+until the first user's captured, scrubbed bundles replace it.
 
 ## Slices
 

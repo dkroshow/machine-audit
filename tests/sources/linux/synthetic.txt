@@ -1,0 +1,665 @@
+Synthetic Linux bundle in the shapes proc(5) and the cgroup v2 documentation give.
+Replace with captured, scrubbed bundles. Each section is a file under the source root.
+
+==> /proc/sys/kernel/random/boot_id <==
+3f2a7c1e-9b4d-4e8a-a1c2-5d6e7f8091ab
+
+==> /proc/stat <==
+cpu  4705 356 584 3699176 2011 0 128 0 0 0
+cpu0 2342 170 300 1849500 1000 0 100 0 0 0
+cpu1 2363 186 284 1849676 1011 0 28 0 0 0
+intr 114930548 113199788 3 0 5 263 0 4 0 1 0
+ctxt 1990473
+btime 1062191376
+processes 2915
+procs_running 3
+procs_blocked 1
+softirq 183433 0 21755 12 39 0 0 0 0 0 0
+
+==> /proc/loadavg <==
+0.52 0.48 0.40 3/412 12345
+
+==> /proc/pressure/cpu <==
+some avg10=1.25 avg60=0.80 avg300=0.40 total=123456
+full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+
+==> /proc/pressure/memory <==
+some avg10=0.10 avg60=0.05 avg300=0.01 total=2500
+full avg10=0.05 avg60=0.02 avg300=0.00 total=1200
+
+==> /proc/meminfo <==
+SyntheticFutureKey:      7 kB
+MemAvailable:    6111608 kB
+MemTotal:        8140988 kB
+MemFree:          912244 kB
+Buffers:           88640 kB
+Cached:          5032160 kB
+SwapCached:            0 kB
+Active(anon):    1205312 kB
+Inactive(anon):   10240 kB
+Active(file):    2400000 kB
+SwapTotal:       2097148 kB
+SwapFree:        2097148 kB
+Shmem:             20480 kB
+HugePages_Total:       0
+HugePages_Free:        0
+Hugepagesize:       2048 kB
+
+==> /proc/vmstat <==
+nr_synthetic_future 5
+pgfault 902211
+nr_free_pages 228061
+pgpgin 1048576
+pgmajfault 3121
+pgpgout 524288
+pswpin 0
+pswpout 0
+oom_kill 1
+pgscan_kswapd 100
+pgscan_direct 0
+pgsteal_kswapd 90
+pgsteal_direct 0
+workingset_refault_anon 4
+workingset_refault_file 77
+allocstall_normal 0
+allocstall_movable 2
+
+==> /proc/1/stat <==
+1 (systemd) S 1 1 1 0 -1 4194560 1200 0 3 0 300 200 0 0 20 0 1 0 1 17000000 3000 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+
+==> /proc/1/status <==
+Name:	systemd
+Umask:	0022
+State:	S (sleeping)
+Tgid:	0
+Uid:	0	0	0	0
+VmRSS:	   12000 kB
+RssAnon:	    1024 kB
+VmSwap:	       0 kB
+Threads:	1
+
+==> /proc/1/io <==
+rchar: 99
+wchar: 88
+syscr: 7
+syscw: 6
+read_bytes: 4096
+write_bytes: 8192
+cancelled_write_bytes: 0
+
+==> /proc/801/stat <==
+801 (sshd) S 1 801 801 0 -1 4194560 1200 0 3 0 40 20 0 0 20 0 1 0 900 17000000 1500 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+
+==> /proc/801/status <==
+Name:	sshd
+Umask:	0022
+State:	S (sleeping)
+Tgid:	0
+Uid:	0	0	0	0
+VmRSS:	    6000 kB
+RssAnon:	    1024 kB
+VmSwap:	       0 kB
+Threads:	1
+
+==> /proc/801/io <==
+rchar: 99
+wchar: 88
+syscr: 7
+syscw: 6
+read_bytes: 3280896
+write_bytes: 6561792
+cancelled_write_bytes: 0
+
+==> /proc/900/stat <==
+900 (agetty) S 1 900 900 0 -1 4194560 1200 0 3 0 1 1 0 0 20 0 1 0 950 17000000 300 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+
+==> /proc/900/status <==
+Name:	agetty
+Umask:	0022
+State:	S (sleeping)
+Tgid:	0
+Uid:	0	0	0	0
+VmRSS:	    1200 kB
+RssAnon:	    1024 kB
+VmSwap:	       0 kB
+Threads:	1
+
+==> /proc/900/io <==
+rchar: 99
+wchar: 88
+syscr: 7
+syscw: 6
+read_bytes: 3686400
+write_bytes: 7372800
+cancelled_write_bytes: 0
+
+==> /proc/1500/stat <==
+1500 ((sd-pam)) S 1 1500 1500 0 -1 4194560 1200 0 3 0 2 2 0 0 20 0 1 0 3100 17000000 600 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+
+==> /proc/1500/status <==
+Name:	(sd-pam)
+Umask:	0022
+State:	S (sleeping)
+Tgid:	0
+Uid:	0	0	0	0
+VmRSS:	    2400 kB
+RssAnon:	    1024 kB
+VmSwap:	     128 kB
+Threads:	1
+
+==> /proc/1500/io <==
+rchar: 99
+wchar: 88
+syscr: 7
+syscw: 6
+read_bytes: 6144000
+write_bytes: 12288000
+cancelled_write_bytes: 0
+
+==> /proc/4242/stat <==
+4242 (python3) S 1 4242 4242 0 -1 4194560 1200 0 3 0 50 10 0 0 20 0 1 0 5000 17000000 9000 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+
+==> /proc/4242/status <==
+Name:	python3
+Umask:	0022
+State:	S (sleeping)
+Tgid:	0
+Uid:	0	0	0	0
+VmRSS:	   36000 kB
+RssAnon:	    1024 kB
+VmSwap:	       0 kB
+Threads:	1
+
+==> /proc/4242/io <==
+rchar: 99
+wchar: 88
+syscr: 7
+syscw: 6
+read_bytes: 17375232
+write_bytes: 34750464
+cancelled_write_bytes: 0
+
+==> /proc/5001/stat <==
+5001 (worker) S 1 5001 5001 0 -1 4194560 1200 0 3 0 600 300 0 0 20 0 1 0 6001 17000000 1000 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+
+==> /proc/5001/status <==
+Name:	worker
+Umask:	0022
+State:	S (sleeping)
+Tgid:	0
+Uid:	0	0	0	0
+VmRSS:	    4000 kB
+RssAnon:	    1024 kB
+VmSwap:	       0 kB
+Threads:	1
+
+==> /proc/5001/io <==
+rchar: 99
+wchar: 88
+syscr: 7
+syscw: 6
+read_bytes: 20484096
+write_bytes: 40968192
+cancelled_write_bytes: 0
+
+==> /proc/5002/stat <==
+5002 (worker) S 1 5002 5002 0 -1 4194560 1200 0 3 0 500 300 0 0 20 0 1 0 6002 17000000 1000 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+
+==> /proc/5002/status <==
+Name:	worker
+Umask:	0022
+State:	S (sleeping)
+Tgid:	0
+Uid:	0	0	0	0
+VmRSS:	    4000 kB
+RssAnon:	    1024 kB
+VmSwap:	       0 kB
+Threads:	1
+
+==> /proc/5002/io <==
+rchar: 99
+wchar: 88
+syscr: 7
+syscw: 6
+read_bytes: 20488192
+write_bytes: 40976384
+cancelled_write_bytes: 0
+
+==> /proc/5003/stat <==
+5003 (worker) S 1 5003 5003 0 -1 4194560 1200 0 3 0 400 300 0 0 20 0 1 0 6003 17000000 1000 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+
+==> /proc/5003/status <==
+Name:	worker
+Umask:	0022
+State:	S (sleeping)
+Tgid:	0
+Uid:	0	0	0	0
+VmRSS:	    4000 kB
+RssAnon:	    1024 kB
+VmSwap:	       0 kB
+Threads:	1
+
+==> /proc/5003/io <==
+rchar: 99
+wchar: 88
+syscr: 7
+syscw: 6
+read_bytes: 20492288
+write_bytes: 40984576
+cancelled_write_bytes: 0
+
+==> /proc/5004/stat <==
+5004 (worker) S 1 5004 5004 0 -1 4194560 1200 0 3 0 5 5 0 0 20 0 1 0 6004 17000000 1000 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+
+==> /proc/5004/status <==
+Name:	worker
+Umask:	0022
+State:	S (sleeping)
+Tgid:	0
+Uid:	0	0	0	0
+VmRSS:	    4000 kB
+RssAnon:	    1024 kB
+VmSwap:	       0 kB
+Threads:	1
+
+==> /proc/5004/io <==
+rchar: 99
+wchar: 88
+syscr: 7
+syscw: 6
+read_bytes: 20496384
+write_bytes: 40992768
+cancelled_write_bytes: 0
+
+==> /proc/5005/stat <==
+5005 (worker) S 1 5005 5005 0 -1 4194560 1200 0 3 0 3 2 0 0 20 0 1 0 6005 17000000 1000 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+
+==> /proc/5005/status <==
+Name:	worker
+Umask:	0022
+State:	S (sleeping)
+Tgid:	0
+Uid:	0	0	0	0
+VmRSS:	    4000 kB
+RssAnon:	    1024 kB
+VmSwap:	       0 kB
+Threads:	1
+
+==> /proc/5005/io <==
+rchar: 99
+wchar: 88
+syscr: 7
+syscw: 6
+read_bytes: 20500480
+write_bytes: 41000960
+cancelled_write_bytes: 0
+
+==> /proc/5006/stat <==
+5006 (cache) S 1 5006 5006 0 -1 4194560 1200 0 3 0 1 0 0 0 20 0 1 0 6006 17000000 50000 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+
+==> /proc/5006/status <==
+Name:	cache
+Umask:	0022
+State:	S (sleeping)
+Tgid:	0
+Uid:	0	0	0	0
+VmRSS:	  200000 kB
+RssAnon:	    1024 kB
+VmSwap:	       0 kB
+Threads:	1
+
+==> /proc/5006/io <==
+rchar: 99
+wchar: 88
+syscr: 7
+syscw: 6
+read_bytes: 20504576
+write_bytes: 41009152
+cancelled_write_bytes: 0
+
+==> /proc/5007/stat <==
+5007 (python3) S 1 5007 5007 0 -1 4194560 1200 0 3 0 1 0 0 0 20 0 1 0 6007 17000000 2000 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+
+==> /proc/5007/status <==
+Name:	python3
+Umask:	0022
+State:	S (sleeping)
+Tgid:	0
+Uid:	0	0	0	0
+VmRSS:	    8000 kB
+RssAnon:	    1024 kB
+VmSwap:	       0 kB
+Threads:	1
+
+==> /proc/5007/io <==
+rchar: 99
+wchar: 88
+syscr: 7
+syscw: 6
+read_bytes: 20508672
+write_bytes: 41017344
+cancelled_write_bytes: 0
+
+==> /proc/self/stat <==
+4242 (python3) S 1 4242 4242 0 -1 4194560 1200 0 3 0 50 10 0 0 20 0 1 0 5000 17000000 9000 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+
+==> /sys/fs/cgroup/cgroup.controllers <==
+cpuset cpu io memory hugetlb pids rdma misc dmem
+
+==> /sys/fs/cgroup/system.slice/cpu.stat <==
+usage_usec 999999
+user_usec 600000
+system_usec 399999
+
+==> /sys/fs/cgroup/init.scope/cgroup.procs <==
+1
+
+==> /sys/fs/cgroup/init.scope/cpu.stat <==
+usage_usec 5000000
+user_usec 3333333
+system_usec 1666667
+core_sched.force_idle_usec 0
+nr_periods 0
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+
+==> /sys/fs/cgroup/init.scope/memory.current <==
+12288000
+
+==> /sys/fs/cgroup/init.scope/memory.swap.current <==
+0
+
+==> /sys/fs/cgroup/init.scope/memory.stat <==
+synthetic_future_key 1
+file 6144000
+anon 3072000
+kernel 65536
+kernel_stack 16384
+pagetables 8192
+shmem 0
+file_mapped 4096
+file_dirty 0
+file_writeback 0
+swapcached 0
+slab_reclaimable 2048
+slab_unreclaimable 1024
+sock 0
+pgfault 5000
+pgmajfault 12
+workingset_refault_anon 0
+workingset_refault_file 3
+pgscan 10
+pgsteal 9
+
+==> /sys/fs/cgroup/init.scope/memory.events <==
+low 0
+high 0
+max 0
+oom 0
+oom_kill 0
+oom_group_kill 0
+
+==> /sys/fs/cgroup/init.scope/cpu.pressure <==
+some avg10=0.00 avg60=0.00 avg300=0.00 total=4000
+full avg10=0.00 avg60=0.00 avg300=0.00 total=1000
+
+==> /sys/fs/cgroup/init.scope/memory.pressure <==
+some avg10=0.00 avg60=0.00 avg300=0.00 total=300
+full avg10=0.00 avg60=0.00 avg300=0.00 total=100
+
+==> /sys/fs/cgroup/system.slice/ssh.service/cgroup.procs <==
+801
+
+==> /sys/fs/cgroup/system.slice/ssh.service/cpu.stat <==
+usage_usec 600000
+user_usec 400000
+system_usec 200000
+core_sched.force_idle_usec 0
+nr_periods 0
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+
+==> /sys/fs/cgroup/system.slice/ssh.service/memory.current <==
+6144000
+
+==> /sys/fs/cgroup/system.slice/ssh.service/memory.swap.current <==
+0
+
+==> /sys/fs/cgroup/system.slice/ssh.service/memory.stat <==
+synthetic_future_key 1
+file 3072000
+anon 1536000
+kernel 65536
+kernel_stack 16384
+pagetables 8192
+shmem 0
+file_mapped 4096
+file_dirty 0
+file_writeback 0
+swapcached 0
+slab_reclaimable 2048
+slab_unreclaimable 1024
+sock 0
+pgfault 5000
+pgmajfault 12
+workingset_refault_anon 0
+workingset_refault_file 3
+pgscan 10
+pgsteal 9
+
+==> /sys/fs/cgroup/system.slice/ssh.service/memory.events <==
+low 0
+high 0
+max 0
+oom 0
+oom_kill 0
+oom_group_kill 0
+
+==> /sys/fs/cgroup/system.slice/ssh.service/cpu.pressure <==
+some avg10=0.00 avg60=0.00 avg300=0.00 total=4000
+full avg10=0.00 avg60=0.00 avg300=0.00 total=1000
+
+==> /sys/fs/cgroup/system.slice/ssh.service/memory.pressure <==
+some avg10=0.00 avg60=0.00 avg300=0.00 total=300
+full avg10=0.00 avg60=0.00 avg300=0.00 total=100
+
+==> /sys/fs/cgroup/system.slice/system-getty.slice/getty@tty1.service/cgroup.procs <==
+900
+
+==> /sys/fs/cgroup/system.slice/system-getty.slice/getty@tty1.service/cpu.stat <==
+usage_usec 20000
+user_usec 13333
+system_usec 6667
+core_sched.force_idle_usec 0
+nr_periods 0
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+
+==> /sys/fs/cgroup/system.slice/machine-audit.service/cgroup.procs <==
+4242
+
+==> /sys/fs/cgroup/system.slice/machine-audit.service/cpu.stat <==
+usage_usec 600000
+user_usec 400000
+system_usec 200000
+core_sched.force_idle_usec 0
+nr_periods 0
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+
+==> /sys/fs/cgroup/system.slice/machine-audit.service/memory.current <==
+36864000
+
+==> /sys/fs/cgroup/system.slice/machine-audit.service/memory.swap.current <==
+0
+
+==> /sys/fs/cgroup/system.slice/machine-audit.service/memory.stat <==
+synthetic_future_key 1
+file 18432000
+anon 9216000
+kernel 65536
+kernel_stack 16384
+pagetables 8192
+shmem 0
+file_mapped 4096
+file_dirty 0
+file_writeback 0
+swapcached 0
+slab_reclaimable 2048
+slab_unreclaimable 1024
+sock 0
+pgfault 5000
+pgmajfault 12
+workingset_refault_anon 0
+workingset_refault_file 3
+pgscan 10
+pgsteal 9
+
+==> /sys/fs/cgroup/system.slice/machine-audit.service/memory.events <==
+low 0
+high 0
+max 0
+oom 0
+oom_kill 0
+oom_group_kill 0
+
+==> /sys/fs/cgroup/system.slice/machine-audit.service/cpu.pressure <==
+some avg10=0.00 avg60=0.00 avg300=0.00 total=4000
+full avg10=0.00 avg60=0.00 avg300=0.00 total=1000
+
+==> /sys/fs/cgroup/system.slice/machine-audit.service/memory.pressure <==
+some avg10=0.00 avg60=0.00 avg300=0.00 total=300
+full avg10=0.00 avg60=0.00 avg300=0.00 total=100
+
+==> /sys/fs/cgroup/system.slice/worker.service/cgroup.procs <==
+5001
+5002
+5003
+5004
+5005
+5006
+5007
+
+==> /sys/fs/cgroup/system.slice/worker.service/cpu.stat <==
+usage_usec 25000000
+user_usec 16666666
+system_usec 8333334
+core_sched.force_idle_usec 0
+nr_periods 0
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+
+==> /sys/fs/cgroup/system.slice/worker.service/memory.current <==
+251658240
+
+==> /sys/fs/cgroup/system.slice/worker.service/memory.swap.current <==
+0
+
+==> /sys/fs/cgroup/system.slice/worker.service/memory.stat <==
+synthetic_future_key 1
+file 125829120
+anon 62914560
+kernel 65536
+kernel_stack 16384
+pagetables 8192
+shmem 0
+file_mapped 4096
+file_dirty 0
+file_writeback 0
+swapcached 0
+slab_reclaimable 2048
+slab_unreclaimable 1024
+sock 0
+pgfault 5000
+pgmajfault 12
+workingset_refault_anon 0
+workingset_refault_file 3
+pgscan 10
+pgsteal 9
+
+==> /sys/fs/cgroup/system.slice/worker.service/memory.events <==
+low 0
+high 0
+max 0
+oom 0
+oom_kill 0
+oom_group_kill 0
+
+==> /sys/fs/cgroup/system.slice/worker.service/cpu.pressure <==
+some avg10=0.00 avg60=0.00 avg300=0.00 total=4000
+full avg10=0.00 avg60=0.00 avg300=0.00 total=1000
+
+==> /sys/fs/cgroup/system.slice/worker.service/memory.pressure <==
+some avg10=0.00 avg60=0.00 avg300=0.00 total=300
+full avg10=0.00 avg60=0.00 avg300=0.00 total=100
+
+==> /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/cgroup.procs <==
+
+
+==> /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/cpu.stat <==
+usage_usec 40000
+user_usec 26666
+system_usec 13334
+core_sched.force_idle_usec 0
+nr_periods 0
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+
+==> /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/memory.current <==
+2457600
+
+==> /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/memory.swap.current <==
+0
+
+==> /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/memory.stat <==
+synthetic_future_key 1
+file 1228800
+anon 614400
+kernel 65536
+kernel_stack 16384
+pagetables 8192
+shmem 0
+file_mapped 4096
+file_dirty 0
+file_writeback 0
+swapcached 0
+slab_reclaimable 2048
+slab_unreclaimable 1024
+sock 0
+pgfault 5000
+pgmajfault 12
+workingset_refault_anon 0
+workingset_refault_file 3
+pgscan 10
+pgsteal 9
+
+==> /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/memory.events <==
+low 0
+high 0
+max 0
+oom 0
+oom_kill 0
+oom_group_kill 0
+
+==> /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/cpu.pressure <==
+some avg10=0.00 avg60=0.00 avg300=0.00 total=4000
+full avg10=0.00 avg60=0.00 avg300=0.00 total=1000
+
+==> /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/memory.pressure <==
+some avg10=0.00 avg60=0.00 avg300=0.00 total=300
+full avg10=0.00 avg60=0.00 avg300=0.00 total=100
+
+==> /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/cgroup.procs <==
+1500
