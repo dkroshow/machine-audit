@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {readToken,makeApi,chartRuns,rowValue,format,seriesGroups} from '../model.mjs';
+import {readToken,makeApi,chartRuns,rowValue,format,seriesGroups,ranksInWho} from '../model.mjs';
 
 test('fragment bootstrap removes the secret before navigation and API uses a header',async()=>{
   const location={hash:'#token=synthetic%2Bsecret',pathname:'/',search:''};
@@ -39,4 +39,12 @@ test('different source scopes stay separate and small measured rates stay nonzer
   const row={signal:'power.watts',entity:'host',scope:'system',unit:'W',start_ns:0,end_ns:1};
   assert.equal(seriesGroups([{...row,source:'smc'},{...row,source:'helper'}]).length,2);
   assert.notEqual(format(0.0002,'CPUs'),'0 CPUs');
+});
+
+test('who ranks Linux unit consumption but not unit detail',()=>{
+  // Review of the Linux adapter: unit signals never reached the Rank-by list.
+  assert.ok(ranksInWho({signal:'unit.cpu.stat.usage_usec',scope:'unit'}));
+  assert.ok(!ranksInWho({signal:'unit.cpu.weight',scope:'unit_detail'}));
+  assert.ok(ranksInWho({signal:'process.cpu',scope:'process'}));
+  assert.ok(!ranksInWho({signal:'cpu.busy',scope:'host'}));
 });

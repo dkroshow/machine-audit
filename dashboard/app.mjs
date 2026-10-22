@@ -1,4 +1,4 @@
-import {views,label,time,format,readToken,makeApi,seriesGroups,rowValue,rowUnit,statusText} from './model.mjs';
+import {views,label,time,format,readToken,makeApi,seriesGroups,rowValue,rowUnit,statusText,ranksInWho} from './model.mjs';
 import {el,card,empty,metric,signalsView,liveView,whoView,coverageView,statusView,intervalEvidence} from './render.mjs';
 import {storageView} from './storage.mjs';
 const $=id=>document.getElementById(id);
@@ -59,7 +59,7 @@ async function overview(params,abort) {
   root.append(grid);return root;
 }
 async function workloadSection(component,params,abort) {
-  const wanted=(state.catalog.signals ?? []).filter(s=>s.component===component && (/process|client|workload/.test(s.scope ?? '') || s.signal?.startsWith('process.')));
+  const wanted=(state.catalog.signals ?? []).filter(s=>s.component===component && ranksInWho(s));
   const names=[...new Set(wanted.map(s=>s.signal))];
   if(!names.length)return card('Programs and affected workloads',empty('No workload fields are available for this component. No per-program remainder is inferred.'));
   const preferred={cpu:'process.cpu',memory:'process.phys_footprint',storage:'process.diskio_byteswritten',gpu:'gpu.client_time'}[component];
