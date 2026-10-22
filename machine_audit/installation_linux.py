@@ -94,12 +94,35 @@ WantedBy=timers.target
     }
 
 
+KEEP_RELEASES = 3  # previous releases kept beside the current one; older ones move to retired/
+
+
+def retire(root: Path, cli: Path, revision: str) -> None:
+    """Set the installed markers aside under the old revision's name; nothing is deleted."""
+    moves = [(root / 'current.json', root / f'previous-{revision}.json'), (root / 'units', root / f'units.{revision}'),
+             (cli, cli.with_name(f'{cli.name}.{revision}'))]
+    if any(new.exists() or new.is_symlink() for _, new in moves):
+        raise ValueError('retired_markers_already_exist')
+    for old, new in moves:
+        if old.exists() or old.is_symlink():
+            os.rename(old, new)
+
+
+def retire_releases(root: Path, current: str) -> None:
+    previous = sorted((p for p in (root / 'releases').iterdir() if p.name != current),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+    for release in previous[KEEP_RELEASES:]:
+        (root / 'retired').mkdir(mode=0o700, exist_ok=True)
+        if not (root / 'retired' / release.name).exists():
+            os.rename(release, root / 'retired' / release.name)
+
+
 def placement(candidate: dict) -> list[str]:
     return ['sudo install -m 0644 ' + ' '.join(candidate['units'].values()) + ' /etc/systemd/system/',
             'sudo systemctl daemon-reload']
 
 
-def install(config: Config, *, json_output=False, yes=False) -> int:
+def install(config: Config, *, json_output=False, yes=False, upgrade=False) -> int:
     try:
         candidate = plan(config)
         units = unit_files(candidate)
@@ -109,6 +132,17 @@ def install(config: Config, *, json_output=False, yes=False) -> int:
     if json_output or (not sys.stdin.isatty() and not yes):
         print(json.dumps(dict(candidate, place_units=placement(candidate)), indent=2))
         return 0
+    root, cli = Path(candidate['root']), Path(candidate['cli'])
+    previous = None
+    if upgrade:
+        if not (root / 'current.json').is_file():
+            print(json.dumps({'status': 'not_ready', 'reason': 'nothing_to_upgrade'}))
+            return 2
+        previous = json.loads((root / 'current.json').read_text())['revision']
+        if previous == candidate['revision']:
+            print(json.dumps({'status': 'not_ready', 'reason': 'revision_already_installed'}))
+            return 2
+        print(f'Upgrade from {previous}: its markers are renamed with that suffix, never deleted.')
     print('Install this source revision for the service user ' + candidate['user'] + '.')
     print(f"Application: {candidate['root']}\nRecordings: {config.root}")
     print('Creates a CLI and three systemd unit files here. Root places them; nothing starts.')
@@ -116,16 +150,17 @@ def install(config: Config, *, json_output=False, yes=False) -> int:
     if not yes and not _yes_no('Install these files?', True):
         return 1
     try:
-        root, cli = Path(candidate['root']), Path(candidate['cli'])
         _private_directory(root)
         _private_directory(config.root)
         if not config.path.is_file():
             raise ValueError('run_setup_first')
-        if (root / 'current.json').exists() or (root / 'units').exists():
+        if not upgrade and ((root / 'current.json').exists() or (root / 'units').exists()):
             raise ValueError('existing_installation_requires_reviewed_update')
-        if cli.exists() or cli.is_symlink():
+        if not upgrade and (cli.exists() or cli.is_symlink()):
             raise ValueError('cli_path_already_exists')
-        _snapshot(candidate)
+        _snapshot(candidate)  # before any marker moves, so a failed copy leaves the installation as it was
+        if upgrade:
+            retire(root, cli, previous)
         (root / 'units').mkdir(mode=0o700)
         for name, text in units.items():
             _write(root / 'units' / name, text.encode(), 0o644)
@@ -137,6 +172,8 @@ def install(config: Config, *, json_output=False, yes=False) -> int:
         from .startup import StartupStatus
         StartupStatus(config)
         _write(root / 'current.json', json.dumps(candidate, indent=2).encode())
+        if upgrade:
+            retire_releases(root, Path(candidate['release']).name)
     except (ValueError, RuntimeError, OSError) as exc:
         print('Installation stopped: ' + (str(exc) if isinstance(exc, (ValueError, RuntimeError)) else type(exc).__name__))
         return 2

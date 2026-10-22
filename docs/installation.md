@@ -141,6 +141,21 @@ root's configuration.
    Then run `doctor` as the user. It says whether the product is installed
    and running, and shows `Map timer: active, next run <time>`.
 
+To upgrade, as the operator:
+
+1. `sudo /var/lib/machine-audit/.local/bin/machine-audit stop`.
+2. As the user: `git -C ~/source fetch` and `git -C ~/source checkout <revision>`.
+3. From the checkout, as the user: `install --upgrade --yes`. It renames
+   `current.json` to `previous-<old>.json`, `units/` to `units.<old>/` and the
+   wrapper to `machine-audit.<old>`. It keeps the three previous releases and
+   moves older ones into `retired/`; nothing is deleted. It refuses when
+   nothing is installed or the revision is already installed.
+4. Run the two printed root commands, then `start`.
+
+To roll back, rename the markers back and place the old units.
+`scan --full`, run as the user, walks in full now, whatever the hour; one scan
+at a time still holds. Its result JSON reports the walk's `peak_rss_bytes`.
+
 `machine-audit.service` runs the collector; `machine-audit-scan.timer` runs
 `machine-audit-scan.service` hourly, and a run between 01:00 and 05:00 walks in
 full once a day. Every unit has `User=`, `ProtectSystem=strict`,

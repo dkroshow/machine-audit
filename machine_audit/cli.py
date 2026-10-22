@@ -35,8 +35,10 @@ def parser():
             sub.add_argument("--exclude",action="append",default=[],help="absolute folder path the scanner never enters")
         if command=="install":
             sub.add_argument("--yes",action="store_true",help="install without the confirmation question")
+            sub.add_argument("--upgrade",action="store_true",help="replace an existing Linux installation, keeping the old one renamed")
     scan=commands.add_parser("scan")
     scan.add_argument("--root")
+    scan.add_argument("--full",action="store_true",help="walk in full now (Linux); one scan at a time still holds")
     for command in ("now","catalog","status","series","who","coverage","around","storage"):
         sub=commands.add_parser(command)
         sub.add_argument("--json",action="store_true")
@@ -117,7 +119,7 @@ def main(argv=None):
         if args.command=="setup" and args.non_interactive:
             options["answers"]={"helper":args.helper=="yes","hosts":[h.strip().lower() for h in args.hosts.split(",") if h.strip()],"exclusions":args.exclude}
         if args.command=="install":
-            options["yes"]=args.yes
+            options.update(yes=args.yes,upgrade=args.upgrade)
         result=getattr(module,args.command)(config,json_output=args.json,**options)
         return result if isinstance(result,int) else 0
     if args.command in {"start", "stop", "permissions"}:
@@ -129,7 +131,7 @@ def main(argv=None):
             return 2
     if args.command=="scan":
         module=importlib.import_module("machine_audit.scanner")
-        return module.main(config,root=args.root)
+        return module.main(config,root=args.root,force=args.full)
     if args.command=="run":
         if not (Path(args.config) if args.config else config.path).is_file():
             print("Run machine-audit setup before starting collection.",file=sys.stderr)

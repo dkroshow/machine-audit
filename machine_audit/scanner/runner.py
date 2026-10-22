@@ -79,13 +79,15 @@ def relist(store,walker,policy,volume,now,changes):
             with store.write():store.db.execute('DELETE FROM dirty WHERE volume=? AND id=?',(volume.id,previous['id']))
 
 
-def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roots=None, access=None, exclusions=()):
+def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roots=None, access=None, exclusions=(), force=False):
     if grain not in ('files','folders'):
         raise ValueError('invalid_scanner_grain')
     if sys.platform != 'darwin':
         # Linux has no privacy-prompt boundary, so protected-area access does not apply.
         from .linux import run_scan as linux
-        return linux(data_dir,full=full,grain=grain,roots=roots,exclusions=exclusions)
+        return linux(data_dir,full=full,grain=grain,roots=roots,exclusions=exclusions,force=force)
+    # The Mac's operator request is its daily-limited requested full walk.
+    full=full or force
     from .permissions import same_process_grant
     full_disk_access=bool(full_disk_access and same_process_grant(access))
     root=Path(data_dir)

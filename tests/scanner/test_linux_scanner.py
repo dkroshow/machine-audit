@@ -99,6 +99,9 @@ class LinuxScannerTests(unittest.TestCase):
                 return self.scan()['volumes'][0].get('action', 'current')
         self.assertEqual(at(14), 'current')  # the afternoon run, nothing dirty
         self.assertEqual(at(2), 'full')
+        with patch('machine_audit.scanner.linux.os.nice'):
+            forced = run_scan(self.data, root=str(self.root), force=True)['volumes'][0]
+        self.assertEqual(forced['action'], 'full')  # scan --full walks now, at any hour
 
     def test_volume_root_the_service_user_cannot_read_is_a_denied_gap_not_a_failed_run(self):
         # First Linux scan: /boot/efi (mode 0700, root) made every nightly run end partial.

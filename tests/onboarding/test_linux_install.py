@@ -2,6 +2,8 @@
 control needs root, and setup asks only what applies on Linux."""
 from contextlib import redirect_stdout
 import io
+import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -85,6 +87,48 @@ class LinuxInstallTests(unittest.TestCase):
                 self.assertEqual(install(config, yes=True), 0)
             self.assertEqual(sorted(p.name for p in (root / 'units').iterdir()), sorted((COLLECTOR, SCANNER, TIMER)))
             self.assertTrue((root / 'current.json').is_file() and Path(candidate['cli']).is_file())
+
+    def upgrade(self, parent, prepare):
+        config = Config(data_dir=str(Path(parent) / 'data'))
+        config.save()
+        root = Path(parent) / 'app'
+        candidate = dict(CANDIDATE, release=str(root / 'releases' / 'new5'), root=str(root), config=str(config.path),
+                         data=str(config.root), revision='new5', source=parent, cli=str(Path(parent) / 'bin' / 'machine-audit'),
+                         units={name: str(root / 'units' / name) for name in (COLLECTOR, SCANNER, TIMER)})
+        prepare(root, Path(candidate['cli']))
+        output = io.StringIO()
+        with patch('machine_audit.installation_linux.plan', return_value=candidate), \
+             patch('machine_audit.installation_linux._snapshot', side_effect=lambda c: Path(c['release']).mkdir(parents=True)), \
+             patch('sys.stdin.isatty', return_value=False), redirect_stdout(output):
+            return install(config, yes=True, upgrade=True), root, Path(candidate['cli']), output.getvalue()
+
+    def test_upgrade_renames_the_old_installation_and_keeps_three_previous_releases(self):
+        # First Ubuntu upgrade: the operator renamed current.json, units/ and the CLI by hand.
+        def installed(root, cli):
+            root.mkdir(mode=0o700)
+            for age, name in enumerate(('old1', 'old2', 'old3', 'old4')):
+                (root / 'releases' / name).mkdir(parents=True)
+                os.utime(root / 'releases' / name, (1_000_000 + age, 1_000_000 + age))
+            (root / 'units').mkdir()
+            (root / 'units' / COLLECTOR).write_text('old unit')
+            (root / 'current.json').write_text(json.dumps({'revision': 'old4'}))
+            cli.parent.mkdir()
+            cli.write_text('old cli')
+        with tempfile.TemporaryDirectory() as parent:
+            result, root, cli, _ = self.upgrade(parent, installed)
+            self.assertEqual(result, 0)
+            self.assertEqual((root / 'units.old4' / COLLECTOR).read_text(), 'old unit')
+            self.assertEqual(json.loads((root / 'previous-old4.json').read_text())['revision'], 'old4')
+            self.assertEqual(cli.with_name('machine-audit.old4').read_text(), 'old cli')
+            self.assertEqual(json.loads((root / 'current.json').read_text())['revision'], 'new5')
+            self.assertEqual(sorted(p.name for p in (root / 'releases').iterdir()), ['new5', 'old2', 'old3', 'old4'])
+            self.assertEqual([p.name for p in (root / 'retired').iterdir()], ['old1'])  # moved, never deleted
+
+    def test_upgrade_refuses_when_nothing_is_installed(self):
+        with tempfile.TemporaryDirectory() as parent:
+            result, root, cli, output = self.upgrade(parent, lambda root, cli: None)
+            self.assertEqual((result, json.loads(output)['reason']), (2, 'nothing_to_upgrade'))
+            self.assertFalse(root.exists() or cli.exists())
 
     def test_doctor_reads_the_timer_without_privilege_and_refuses_root(self):
         shown = 'LoadState=loaded\nActiveState=active\nNextElapseUSecRealtime=Wed 2026-10-22 04:00:00 UTC\n'

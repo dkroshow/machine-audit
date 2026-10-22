@@ -154,10 +154,13 @@ def job_plists(candidate: dict) -> dict[str, dict]:
     }
 
 
-def install(config: Config, *, json_output=False, yes=False) -> int:
+def install(config: Config, *, json_output=False, yes=False, upgrade=False) -> int:
     if sys.platform != 'darwin':
         from .installation_linux import install as linux
-        return linux(config, json_output=json_output, yes=yes)
+        return linux(config, json_output=json_output, yes=yes, upgrade=upgrade)
+    if upgrade:
+        print(json.dumps({'status': 'not_ready', 'reason': 'upgrade_is_linux_only'}))
+        return 2
     try:
         candidate = plan(config)
     except (ValueError, RuntimeError, OSError) as exc:
