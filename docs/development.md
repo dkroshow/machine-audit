@@ -100,9 +100,15 @@ that same function for catalog and summary selection; stored raw candidates
 also receive a bounded field-level check for older permissive indexes.
 Short `who` answers reuse their exact derived points for gap coverage. Longer
 answers select non-CPU signals before deriving pending readings; CPU keeps the
-full pass to preserve existing rank ties. Coverage derives whole passes in order,
-carrying each source's prior reading and preserving all gap counts before output
-truncation.
+full pass to preserve existing rank ties. Coverage derives host and device passes
+in order, the same selection series uses, carrying each source's prior reading
+and preserving all gap counts before output truncation. Process sources keep
+their saved status counts; their per-process baseline, reset and sleep gaps
+appear in `who`. Deriving every field of 2,000-process passes made a one-hour
+coverage answer take about 30 seconds and still truncate.
+A record index on `reading_components` keeps each window reading's component
+check from scanning older history; the first writable open after upgrading
+builds it once.
 Cumulative minute/hour rollups therefore remain coherent with captured raw tail data;
 old readers use SQLite's prior snapshot. SQLite data work runs outside the
 collector lock. No hourly reconstruction scan or duplicate summary history is

@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 from machine_audit.budget import Budget
 from machine_audit.model import Clock,Field,Reading,Record
@@ -67,6 +68,27 @@ class ScaleTests(unittest.TestCase):
         for signal,component in [('process.cpu','cpu'),('process.ledger_swapins','memory'),('process.diskio_byteswritten','storage')]:
             answer=Query(self.store).who(lo,hi,signal=signal,component=component,limit=2000)
             self.assertTrue(answer['rows'],signal);self.assertTrue(answer['totals_complete'])
+
+    def test_hour_coverage_with_2000_process_passes_skips_their_fields_and_is_complete(self):
+        # Big Mac took 30 s: coverage derived every field of every pass until the
+        # decode cap, so a 1 h answer was slow and truncated. A 4 MiB cap stands in
+        # for the 25 passes that fill the real 32 MiB one.
+        procs=process_records(2000,6);records=[]
+        for p in procs:
+            c=p.reading.end
+            records.append(Record(Reading('synthetic.cpu','cpu',p.reading.start,c,(Field('cpu.busy',float(len(records)),'seconds','counter'),)),'boot','run',len(records)+1,c.wall_ns,c))
+            records.append(Record(p.reading,'boot','run',len(records)+1,c.wall_ns,c))
+        self.store.append(records)
+        decoded=[]
+        unpack=Record.unpack
+        def counting(payload):
+            record=unpack(payload);decoded.append(len(record.reading.fields));return record
+        end=procs[-1].reading.end.wall_ns
+        with patch('machine_audit.query.MAX_QUERY_BYTES',4*1024**2),patch.object(Record,'unpack',side_effect=counting):
+            answer=Query(self.store).coverage(end-3600*S,end)
+        self.assertFalse(answer['truncated'] or answer['coverage']['truncated'])
+        self.assertTrue(answer['coverage']['sources']['macos.process']['observed'])  # saved counts remain
+        self.assertLess(sum(decoded),100)  # host passes only, no 42,000-field process pass
 
     def test_large_ordinary_record_exports_at_explicit_64_mib_bound(self):
         record=process_records(2000,1)[0]
