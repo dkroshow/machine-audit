@@ -46,6 +46,20 @@ class RelistTests(unittest.TestCase):
         self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=False,lean=True)
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM files WHERE generation=?',(self.store.generation,)).fetchone()[0],31)
 
+    def test_vanished_recursive_directory_leaves_the_map_without_its_subtree(self):
+        # A must-scan root removed before its walk; the parent listing records the
+        # removal and the update still completes.
+        gone=self.tree/'parent'/'gone';gone.mkdir(parents=True)
+        for i in range(5):(gone/str(i)).write_bytes(b'x')
+        (self.tree/'parent'/'kept').write_bytes(b'kept')
+        self.baseline()
+        for i in range(5):(gone/str(i)).unlink()
+        gone.rmdir()  # Disposable test directory only.
+        walker=Walker(self.volume,self.policy,self.store,Blocks())
+        self.assertTrue(relist(self.store,walker,self.policy,self.volume,0,[(str(gone),True)]))
+        self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=False,lean=True)
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM files WHERE generation=?',(self.store.generation,)).fetchone()[0],1)
+
     def test_must_scan_still_recurses(self):
         (self.tree/'parent'/'kept').mkdir(parents=True)
         for i in range(30):(self.tree/'parent'/'kept'/str(i)).write_bytes(b'kept')

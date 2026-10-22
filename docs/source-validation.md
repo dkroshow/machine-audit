@@ -378,7 +378,12 @@ Failed-volume recovery: CLI `scan --full` retries a failed attempt even inside
 the daily cooldown. Persistent `scanner_full` retries at most daily from the
 last full attempt, stored as `volumes.full_attempt_ns` at preparation. Legacy
 stores leave this unknown until an actual attempt; no history is invented.
-Hourly waits keep the prior failure code visible. Access checks still run first;
+Hourly waits keep the prior failure code visible. The cooldown covers a failed
+full walk only: a volume whose update failed (`update_unreadable`) is updated
+again at the next hourly run from its unchanged bookmark. A changed directory
+that is gone or no longer a directory by walk time does not fail the update:
+its parent is re-listed shallowly, which records the removal or replacement,
+and only an unlistable parent fails the volume. Access checks still run first;
 published map times, points and hierarchy change only on successful publication.
 Unreadable root attempts now save their safe reason in `volumes.status`, while
 invariant exceptions already save their specific code there. A partial run at
