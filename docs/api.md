@@ -97,6 +97,10 @@ Rows carry `start_ns`, `end_ns`,
 `signal`, `entity`, `label`, `scope`, `unit`, `kind`, `status`, plus aggregate
 fields (`total`, `covered_s`, `mean`, `min`, `max`, `max_ns`, `last`, `count`,
 `peak_rate`, `peak_ns`, `above_s`, `histogram_s` as appropriate).
+`now` derives each source's newest pass once and reuses that derivation until the
+source's next reading, so repeated requests between passes do not re-derive every
+process; it keeps one full and one brief derivation per source (about 50 MB for a
+2,000-process pass). Brief derives only the fields it ranks from a process pass.
 `now` returns `sources: [{source, component, status, stale, latest, trail}]`;
 latest is a Record dictionary with bounded fields and an explicit field_count;
 raw trail is empty, while trail_rows carries bounded derived history. `who` returns ranked program
