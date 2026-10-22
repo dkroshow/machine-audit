@@ -68,20 +68,24 @@ def make_server(query, token: str, port=8765, dashboard=None, allowed_hosts=()):
                     if any(len(v)!=1 for v in args.values()):
                         raise ValueError("duplicate parameter")
                     args={k:v[0] for k,v in args.items()}
-                    allowed={"component","signals","signal","start","end","limit","at","span","action","parent","volume","parent_id","volume_id","offset","metric","cursor"}
+                    allowed={"component","signals","signal","start","end","limit","at","span","action","parent","volume","parent_id","volume_id","offset","metric","cursor","brief"}
                     if set(args)-allowed:
                         raise ValueError("unknown parameter")
                     component=args.get("component")
                     limit=int(args.get("limit",600))
                     signals=args.get("signals","").split(",") if args.get("signals") else None
                     route=parsed.path[5:]
+                    brief=args.get("brief","0")
+                    if brief not in ("0","1") or brief=="1" and route not in ("now","who"):
+                        raise ValueError("brief is 0 or 1, for now and who")
+                    brief=brief=="1"
                     if route in {"series","who","coverage"}:
                         bounds=(int(float(args["start"])*1e9),int(float(args["end"])*1e9))
-                    if route=="now": result=query.now(component,limit)
+                    if route=="now": result=query.now(component,limit,brief)
                     elif route=="catalog": result=query.catalog()
                     elif route=="status": result=query.status()
                     elif route=="series": result=query.series(*bounds,signals,component,limit)
-                    elif route=="who": result=query.who(*bounds,args.get("signal"),component,limit)
+                    elif route=="who": result=query.who(*bounds,args.get("signal"),component,limit,brief)
                     elif route=="coverage": result=query.coverage(*bounds,component,limit)
                     elif route=="around": result=query.around(int(float(args["at"])*1e9),int(float(args.get("span",60))*1e9),component,signals,limit)
                     elif route=="storage": result=query.storage_query(**args)

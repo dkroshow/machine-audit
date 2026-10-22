@@ -102,6 +102,17 @@ latest is a Record dictionary with bounded fields and an explicit field_count;
 raw trail is empty, while trail_rows carries bounded derived history. `who` returns ranked program
 rows (label, instance_count, total, covered_s, mean_rate, peak_rate and coverage)
 for additive fields; overlapping memory remains separate instance rows.
+`brief=1` (on `now` and `who` only; any other value or route is refused) returns a
+shape of a few kilobytes. Brief `who` keeps the top five rows and the answer's
+totals: `total_rows`, `totals_complete`, `accounting`, `covered`, `resolution`.
+Brief `now` gives, for each component with a workload total (cpu, memory,
+storage), `components[c].top`: the five largest workloads by that total, chosen
+as `who` chooses them, and `components[c].host`: the host totals beside it
+(`cpu.busy`, `cpu.capacity`; `disk.read`, `disk.write`; installed, available and
+swap memory, by platform). Rows keep `source`, `signal`, `entity`, `label`,
+`unit`, `rate_unit`, `status` and their measures (`value`, `mean`, `mean_rate`,
+`total`, `peak_rate`). Coverage keeps only per-source status counts and
+`gap_count`; there are no gap rows and no per-lane rows.
 `around` returns nested series/who/coverage plus events. `/api/status` reports
 collector/source health, budget and measured operation cost; no tokens.
 

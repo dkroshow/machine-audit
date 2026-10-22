@@ -128,6 +128,37 @@ class ScaleTests(unittest.TestCase):
         series=query.series(end-3600*S,end,limit=600)
         self.assertEqual(series['resolution'],'minute')
         self.assertLess(len(json.dumps(series,separators=(',',':'))),500_000)
+        # The brief shape: the top five rows, the totals and status counts, in under 20 KB
+        # where the full 600-row answer is far larger.
+        full=query.who(end-3600*S,end,component='memory',limit=600)
+        brief=query.who(end-3600*S,end,component='memory',brief=True)
+        self.assertGreater(len(json.dumps(full,separators=(',',':'))),20_000)
+        self.assertLess(len(json.dumps(brief,separators=(',',':'))),20_000)
+        self.assertEqual([(r['entity'],r['mean']) for r in brief['rows']],[(r['entity'],r['mean']) for r in full['rows'][:5]])
+        self.assertEqual((brief['total_rows'],brief['accounting']),(full['total_rows'],full['accounting']))
+        self.assertEqual(brief['coverage']['sources'],full['coverage']['sources'])
+        self.assertNotIn('gaps',brief)
+
+    def test_brief_now_gives_each_components_top_five_and_host_totals_under_20_kb(self):
+        # A first user's agent read `now` at 833 KB; brief gives a few hundred tokens.
+        procs=process_records(2000,2)
+        collector=Collector(self.store,run_id='live',boot_id='boot',clock=lambda:procs[-1].reading.end)
+        for p in procs:
+            c0,c=p.reading.start,p.reading.end
+            collector.ingest(Reading('synthetic.cpu','cpu',c0,c,(Field('cpu.busy',float(c.awake_ns//S),'seconds','counter'),)))
+            collector.ingest(Reading('synthetic.memory','memory',c0,c,(Field('memory.installed',16*10**9,'bytes'),)))
+            collector.ingest(p.reading)
+        query=Query(self.store,collector)
+        self.assertGreater(len(json.dumps(query.now(limit=600),separators=(',',':'))),20_000)
+        brief=query.now(brief=True)
+        self.assertLess(len(json.dumps(brief,separators=(',',':'))),20_000)
+        self.assertNotIn('rows',brief)
+        memory=brief['components']['memory']
+        self.assertEqual([r['value'] for r in memory['top']],[pid*100000 for pid in range(2099,2094,-1)])  # largest footprints
+        self.assertEqual([r['signal'] for r in memory['host']],['memory.installed'])
+        self.assertEqual({r['signal'] for r in brief['components']['cpu']['host']},{'cpu.busy'})
+        self.assertTrue(brief['components']['cpu']['top'][0]['entity'].startswith('program:'))
+        self.assertEqual(set(brief['coverage']['sources']),{'synthetic.cpu','synthetic.memory','macos.process'})
 
     def test_2000_process_minutes_keep_top_consumers_and_15_minute_rows_keep_all(self):
         # Big Mac grew 11.3 MB/min, half of it per-instance minute rows. Minute rows keep each

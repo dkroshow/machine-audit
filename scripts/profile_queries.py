@@ -31,6 +31,8 @@ cases = {
     "who 1h cpu": lambda: query.who(start, end, component="cpu", limit=limit),
     "who 1h memory": lambda: query.who(start, end, component="memory", limit=limit),
     "who 24h cpu": lambda: query.who(end - 24 * 3600 * 10**9, end, component="cpu", limit=limit),
+    "who 1h cpu brief": lambda: query.who(start, end, component="cpu", brief=True),
+    "who 1h memory brief": lambda: query.who(start, end, component="memory", brief=True),
 }
 for name, call in cases.items():
     call()  # warm the page cache once; the profiled run is the warm one

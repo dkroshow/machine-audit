@@ -21,6 +21,14 @@ from .model import PROCESS_ENTITIES, Record, field_component, is_process_evidenc
 WHO_TOTALS = {"cpu": {"process.cpu", "unit.cpu.stat.usage_usec"},
               "storage": {"process.diskio_byteswritten", "unit.io.stat.wbytes"},
               "memory": {"process.phys_footprint", "unit.memory.current"}}
+# Beside each component's workload total, a brief answer gives these host totals; the
+# names cover both platforms, and a signal a platform lacks is simply absent.
+HOST_TOTALS = {"cpu": {"cpu.busy", "cpu.capacity"},
+               "storage": {"disk.read", "disk.write"},
+               "memory": {"memory.installed", "memory.swap_used", "memory.MemTotal", "memory.MemAvailable"}}
+BRIEF_TOP = 5
+BRIEF_FIELDS = ("source", "signal", "entity", "label", "value", "mean", "mean_rate", "total", "peak_rate",
+                "unit", "rate_unit", "status")
 
 MAX_ROWS = 2000
 MAX_SCAN = 20000
@@ -315,11 +323,21 @@ class Query:
             for r in coarse:begins[key(r)]=min(begins.get(key(r),r["start_ns"]),r["start_ns"])
             yield from (r for r in fine if r["end_ns"]<begins.get(key(r),math.inf))
 
+    @staticmethod
+    def _brief_rows(rows):
+        return [{k:r[k] for k in BRIEF_FIELDS if r.get(k) is not None} for r in rows]
+
+    @staticmethod
+    def _brief_coverage(coverage):
+        """Per-source status counts and the gap count; no gap rows."""
+        return {k:coverage[k] for k in ("mode","sources","gap_count","truncated") if k in coverage}
+
     @measured
-    def now(self,component=None,limit=600):
+    def now(self,component=None,limit=600,brief=False):
         if not 1<=limit<=MAX_ROWS:raise ValueError("limit must be 1..2000")
         groups=self.collector.recent_records(component) if self.collector else []
         latest=[];trail=[];sources=[];raw_remaining=limit;truncated=False
+        statuses=defaultdict(lambda:defaultdict(int))
         groups.sort(key=lambda group:any(f.entity.startswith("process:") for f in group[2][-1].reading.fields))
         for source,stale,records in groups:
             process_pass=any(f.entity.startswith("process:") for f in records[-1].reading.fields)
@@ -331,6 +349,10 @@ class Query:
                 if p["sequence"]==records[-1].sequence:latest.append(p)
                 if not process_pass and not p["entity"].startswith("cpu:"):trail.append(p)
             raw_latest=selected[-1]
+            if brief:
+                statuses[source][raw_latest.reading.status]+=1
+                for f in raw_latest.reading.fields:
+                    if f.status not in GOOD:statuses[source][f.status]+=1
             available=len(raw_latest.reading.fields)
             fields=raw_latest.reading.fields[:raw_remaining]
             raw_remaining-=len(fields)
@@ -341,6 +363,19 @@ class Query:
             truncated=truncated or len(fields)<available
         latest.sort(key=lambda p:(p["entity"].startswith(("process:","program:")),p["signal"]!="process.cpu",-(p["value"] if isinstance(p["value"],(int,float)) else 0)))
         result=self._base("now","observed" if sources else "unavailable")
+        if brief:
+            # Each component's top workloads, chosen as who chooses them, and host totals.
+            components={}
+            for part,totals in WHO_TOTALS.items():
+                if component and part!=component:continue
+                top=heapq.nlargest(BRIEF_TOP,(p for p in latest if p["component"]==part and p["signal"] in totals
+                                               and p["status"] in GOOD and self._who_row(p)),key=lambda p:p["value"])
+                host=[p for p in latest if p["component"]==part and p["signal"] in HOST_TOTALS[part] and is_series(p["component"],p["entity"],p["scope"])]
+                if top or host:components[part]={"top":self._brief_rows(top),"host":self._brief_rows(host)}
+            result.update(brief=True,components=components,
+                          coverage={"mode":"live_cache" if self.collector else "store_only","sources":{k:dict(v) for k,v in statuses.items()},
+                                    "gap_count":sum(p["status"] not in GOOD or p["stale"] for p in latest)})
+            return result
         result.update(rows=latest[:limit],trail_rows=trail[-limit:],sources=sources,
                       truncated=truncated or len(latest)>limit or len(trail)>limit,
                       coverage={"mode":"live_cache" if self.collector else "store_only","reason":None if sources else "no_recent_readings",
@@ -561,8 +596,9 @@ class Query:
         return result
 
     @measured
-    def who(self,start_ns,end_ns,signal=None,component=None,limit=600):
+    def who(self,start_ns,end_ns,signal=None,component=None,limit=600,brief=False):
         self._bounds(start_ns,end_ns,limit)
+        if brief:limit=BRIEF_TOP
         if end_ns-start_ns>31*24*HOUR:raise ValueError("who interval must not exceed 31 days")
         with self._snapshot(start_ns,end_ns) as (db,captured):
             records,overflow=self._raw(db,captured,start_ns,end_ns,component) if end_ns-start_ns<=10*MINUTE else ([],False)
@@ -634,6 +670,9 @@ class Query:
                       grouping="admitted-label-for-additive-fields; instance-for-overlapping-scopes",
                       denominator="union of aligned member windows in awake seconds",partial_boundary=boundary,
                       truncated=overflow or count>limit,total_rows=count,totals_complete=not overflow,accounting=accounting)
+        if brief:
+            del result["gaps"]
+            result.update(brief=True,rows=self._brief_rows(rows),coverage=self._brief_coverage(coverage))
         return result
 
     @staticmethod
