@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {readToken,makeApi,queryPool,componentEmptyState,chartRuns,rowValue,format,seriesGroups,ranksInWho} from '../model.mjs';
+import {readToken,makeApi,queryPool,componentEmptyState,chartRuns,rowValue,format,seriesGroups,ranksInWho,cardSignals} from '../model.mjs';
 
 test('query pool delivers each result and reuses a free slot before the slow peer finishes',async()=>{
   const pending=new Map(),painted=[];let active=0,peak=0;
@@ -160,4 +160,12 @@ test('who ranks Linux unit consumption but not unit detail',()=>{
   assert.ok(!ranksInWho({signal:'unit.cpu.weight',scope:'unit_detail'}));
   assert.ok(ranksInWho({signal:'process.cpu',scope:'process'}));
   assert.ok(!ranksInWho({signal:'cpu.busy',scope:'host'}));
+});
+
+test('an overview card asks for its first three host signals in the order series lists lanes',()=>{
+  // Byte order by source then name, as the server sorts lanes; workload scopes never chart.
+  const host=(source,signal,scope='host')=>({source,signal,component:'cpu',scope});
+  const signals=[host('b','cpu.a'),host('a','cpu.z'),host('a','process.cpu','process'),host('a','cpu.B','unit_detail'),
+                 host('a','cpu.Y'),host('c','cpu.fan','fan'),{...host('a','memory.x'),component:'memory'}];
+  assert.deepEqual(cardSignals(signals,'cpu'),['cpu.Y','cpu.z','cpu.a']);
 });

@@ -77,6 +77,14 @@ export function time(ns, full=false) {
   if (!finite(ns)) return 'Unknown time';
   return new Date(ns / 1e6).toLocaleString(undefined, full ? {dateStyle:'medium',timeStyle:'medium'} : {hour:'2-digit',minute:'2-digit',second:'2-digit'});
 }
+// The host signals an overview card shows: the first `count` by source and name, as the
+// series answer orders its lanes. Workload scopes never chart (model.is_series).
+const workloadScopes = new Set(['process','unit','unit_detail']);
+export function cardSignals(signals=[], component, count=3) {
+  const order = (a,b) => a.source<b.source ? -1 : a.source>b.source ? 1 : a.signal<b.signal ? -1 : a.signal>b.signal ? 1 : 0;
+  const host = signals.filter(s => s.component===component && (component==='self' || !workloadScopes.has(s.scope))).sort(order);
+  return [...new Set(host.map(s => s.signal))].slice(0,count);
+}
 // Workload evidence that ranks in `who`. Linux unit consumption has scope `unit`;
 // `unit_detail` (limits, breakdowns, pressure) describes a unit and does not rank.
 export const ranksInWho = s => s.scope === 'unit' || /process|client|workload/.test(s.scope ?? '') || Boolean(s.signal?.startsWith('process.'));

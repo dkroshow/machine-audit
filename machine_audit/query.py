@@ -22,7 +22,10 @@ HOST_TOTALS = {"cpu": {"cpu.busy", "cpu.capacity"},
                "storage": {"disk.read", "disk.write"},
                "memory": {"memory.installed", "memory.swap_used", "memory.MemTotal", "memory.MemAvailable"}}
 BRIEF_TOP = 5
-BRIEF_FIELDS = ("source", "signal", "entity", "label", "value", "mean", "mean_rate", "total", "peak_rate",
+# A series without a component or signals answers this many host signals per component
+# when the component has no host totals.
+SERIES_HOST_SIGNALS = 2
+BRIEF_FIELDS = ("source", "signal", "entity", "label", "kind", "value", "mean", "mean_rate", "total", "peak_rate",
                 "unit", "rate_unit", "status")
 
 MAX_ROWS = 2000
@@ -244,6 +247,18 @@ class Query:
         """Whether a save covers part of the window. An hour or longer answers from saved
         summaries; until a save covers it, the unsaved tail answers."""
         return db.execute("SELECT 1 FROM summaries WHERE resolution='hour' AND bucket_ns>? AND bucket_ns<? LIMIT 1",(start_ns-HOUR,end_ns)).fetchone() is not None
+
+    @staticmethod
+    def _host_signals(db):
+        """Each component's host totals, or else its first host signals by source and name."""
+        names=defaultdict(list)
+        for source,signal,part,scope in db.execute("SELECT source,signal,component,scope FROM signal_catalog ORDER BY component,source,signal"):
+            if is_series(part,"host",scope) and signal not in names[part]:names[part].append(signal)
+        chosen=[]
+        for part,found in names.items():
+            totals=[n for n in found if n in HOST_TOTALS.get(part,())]
+            chosen.extend(totals or found[:SERIES_HOST_SIGNALS])
+        return sorted(set(chosen))
 
     @staticmethod
     def _lane(row):
@@ -550,7 +565,7 @@ class Query:
                 "mode":"store_and_tail" if captured else "store_only"}
 
     @measured
-    def series(self,start_ns,end_ns,signals=None,component=None,limit=600):
+    def series(self,start_ns,end_ns,signals=None,component=None,limit=600,brief=False):
         self._bounds(start_ns,end_ns,limit)
         signals=list(signals or [])
         if len(signals)>32:
@@ -558,16 +573,21 @@ class Query:
         resolution="raw" if end_ns-start_ns<=10*MINUTE else self._resolution(start_ns,end_ns,limit)
         with self._snapshot(start_ns,end_ns) as (db,captured):
             records=[];rows=[]
+            # Without a component or signals, choose a bounded set before reading any row.
+            chosen=None if component or signals else self._host_signals(db)
+            wanted=signals or chosen
+            # Each chosen signal gets limit // signals rows, which picks the resolution.
+            if chosen and resolution!="raw":resolution=self._resolution(start_ns,end_ns,max(1,limit//len(chosen)))
             if resolution=="raw":
                 width=1_000_000_000
                 records,overflow=self._raw(db,captured,start_ns,end_ns,component,series_only=True)
                 selected=[replace(r,reading=replace(r.reading,fields=tuple(f for f in r.reading.fields if is_series(field_component(f,r.reading.component),f.entity,f.scope) and (not component or field_component(f,r.reading.component)==component)))) for r in records]
                 derived=[p for p in points(selected) if p["start_ns"]>=start_ns and p["end_ns"]<=end_ns]
-                rows=[r for _,r in rollups(derived,width) if not signals or r["signal"] in signals]
+                rows=[r for _,r in rollups(derived,width) if not wanted or r["signal"] in wanted]
                 # Raw history may have been pruned; use retained summaries, explicitly.
                 if not rows:resolution="minute"
             if resolution!="raw":
-                rows,overflow,resolution=self._summary(db,captured,start_ns,end_ns,resolution,signals,component)
+                rows,overflow,resolution=self._summary(db,captured,start_ns,end_ns,resolution,wanted,component)
                 width=WIDTHS[resolution]
             lanes={self._lane(r):r for r in rows}
             for requested in signals:
@@ -606,9 +626,13 @@ class Query:
         measured=[r for r in rows if r["status"] in GOOD]
         result["status"]="observed" if measured else "unobserved"
         covered={"start_ns":min(r["start_ns"] for r in measured),"end_ns":max(r["end_ns"] for r in measured)} if measured else None
+        if chosen is not None:result["selected_signals"]=chosen
         result.update(requested={"start_ns":start_ns,"end_ns":end_ns},covered=covered,resolution=resolution,
                       rows=rows,gaps=coverage["gaps"],coverage=coverage,truncated=truncated,row_width_ns=width,
                       next_start_ns=covered["end_ns"] if truncated and covered else None)
+        if brief:
+            del result["gaps"]
+            result.update(brief=True,coverage=self._brief_coverage(coverage))
         return result
 
     @measured

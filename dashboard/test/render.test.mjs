@@ -171,6 +171,11 @@ test('all dashboard views render real stored replay without leaked tokens or fak
   await run("document.querySelector('#live-mode').click()");await settled();
   assert.match(await run("document.querySelector('#view').innerText"),/Original source readings/);
   assert.ok(await run("document.querySelectorAll('.chart').length>0"),'Live uses cache-derived chart data');
+  // The live overview reads brief=1 now: per-component cards, not every source's fields.
+  await run("location.hash='#overview'");await pause(100);await settled();
+  const liveOverview=await run("[...document.querySelectorAll('#view .card h2')].map(h=>h.textContent)");
+  assert.ok(liveOverview.includes('CPU'),'Live overview shows a CPU card');
+  assert.doesNotMatch(await run("document.querySelector('#view').innerText"),/Original source readings/);
   await run("document.querySelector('#history-mode').click()");await settled();
   await send('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
   assert.equal(await run('document.documentElement.scrollWidth<=innerWidth'),true,'Mobile viewport overflows');
@@ -343,10 +348,13 @@ test('overview coverage and cost containment survive a crowded catalog',{timeout
   t.after(()=>stop(preview));
   const connection=await until(()=>{try{return JSON.parse(readFileSync(ready,'utf8'));}catch{return null;}},Boolean,`Crowded replay did not start: ${startupError}`);
   const end=Date.now()/1000;
-  const generic=await (await fetch(`${connection.origin}/api/series?start=${end-3600}&end=${end}&limit=600`,
+  const fetchSeries=async query=>(await fetch(`${connection.origin}/api/series?start=${end-3600}&end=${end}&${query}`,
     {headers:{Authorization:`Bearer ${connection.token}`}})).json();
-  assert.equal(generic.truncated,true,'Fixture must reach the real global result cap');
-  assert.ok(!generic.rows.some(row=>row.component==='memory'),'Fixture must reproduce missing memory in the generic answer');
+  assert.equal((await fetchSeries('component=cpu&limit=75')).truncated,true,'Fixture must crowd a 75-row CPU answer');
+  // The component-less series is bounded: host signals per component, memory included.
+  const generic=await fetchSeries('limit=600');
+  assert.equal(generic.truncated,false);
+  assert.ok(generic.rows.some(row=>row.component==='memory'&&row.status==='observed'),'The bounded generic answer keeps memory');
   const {send,run,errors,on}=await browser(t,directory);
   const requests=[],active=new Set();let peak=0;
   on('Network.requestWillBeSent',({requestId,request})=>{
@@ -364,7 +372,7 @@ test('overview coverage and cost containment survive a crowded catalog',{timeout
   const issues=[];
   if(!cards.Memory?.includes('7 GB'))issues.push('Overview hides the observed 7 GB memory reading');
   if(cards.Memory?.includes('No measurements'))issues.push('Overview turns global truncation into missing memory');
-  if(!cards.CPU?.includes('Partial sample'))issues.push('The capped CPU card does not disclose its partial answer');
+  if(cards.CPU?.includes('Partial sample'))issues.push('The CPU card asks for more than it shows');
   if(process.env.MACHINE_AUDIT_SCREENSHOTS) {
     const image=await send('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});
     writeFileSync(join(resolve(process.env.MACHINE_AUDIT_SCREENSHOTS),'overview-crowded.png'),Buffer.from(image.data,'base64'));
@@ -382,6 +390,7 @@ test('overview coverage and cost containment survive a crowded catalog',{timeout
   if(!await run('document.documentElement.scrollWidth<=innerWidth'))issues.push('Long cost identity overflows mobile');
   assert.deepEqual(issues,[]);
   assert.deepEqual(overviewRequests.map(request=>request.component).sort(),['cpu','gpu','heat','memory','network','power','self','storage']);
+  assert.ok(overviewRequests.every(request=>request.signals&&request.signals.split(',').length<=3),'Each card asks only for the signals it shows');
   assert.ok(overviewRequests.reduce((sum,request)=>sum+Number(request.limit),0)<=600,'Overview keeps its existing total row allowance');
   assert.ok(overviewPeak<=3,'The page leaves one server slot for other clients');
   assert.deepEqual(errors,[]);

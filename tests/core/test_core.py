@@ -589,15 +589,15 @@ class CoreTests(unittest.TestCase):
             with urlopen(req) as response:result=json.load(response)
             self.assertEqual(sum(r["total"] or 0 for r in result["rows"]),7)
             self.assertEqual(next(r["unit"] for r in result["rows"] if r["total"] is not None),"seconds")
-            # brief=1 is a shape of now and who only; any other use is refused, not ignored.
+            # brief=1 is a shape of now, who and series only; any other use is refused, not ignored.
             def status(query):
                 try:
                     with urlopen(Request(f"http://127.0.0.1:{server.server_port}/api/{query}",headers={"Authorization":"Bearer "+"a"*32})) as response:
                         return response.status,json.load(response).get("brief")
                 except HTTPError as error:
                     with error:return error.code,None
-            self.assertEqual([status(q) for q in ("who?start=0&end=20&brief=1","now?brief=1","series?start=0&end=20&brief=1","who?start=0&end=20&brief=yes")],
-                             [(200,True),(200,True),(400,None),(400,None)])
+            self.assertEqual([status(q) for q in ("who?start=0&end=20&brief=1","now?brief=1","series?start=0&end=20&brief=1","coverage?start=0&end=20&brief=1","who?start=0&end=20&brief=yes")],
+                             [(200,True),(200,True),(200,True),(400,None),(400,None)])
         finally:server.shutdown();server.server_close();thread.join()
 
     def test_status_breaks_query_cost_down_by_method_and_answers_carry_server_timing(self):

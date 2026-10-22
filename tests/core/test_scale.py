@@ -150,6 +150,17 @@ class ScaleTests(unittest.TestCase):
         (every,every_reads),(ranked,ranked_reads)=answer(True),answer(False)
         self.assertEqual((ranked['rows'],ranked['total_rows']),(every['rows'],every['total_rows']))
         self.assertLess(ranked_reads,every_reads/4)
+        # Without a component, series answers each component's host totals (else its first
+        # two host signals) at limit // signals rows each: less than one component's cost.
+        def series(**kw):
+            reads=[]
+            def counting(payload,keep=None):reads.append(1);return unpack_summaries(payload,keep)
+            with patch('machine_audit.query.unpack_summaries',side_effect=counting):
+                return query.series(end-3600*S,end,limit=600,**kw),len(reads)
+        (bounded,bounded_reads),(cpu,cpu_reads)=series(),series(component='cpu')
+        self.assertEqual(bounded['selected_signals'],['cpu.level','cpu.work'])
+        self.assertEqual({r['signal'] for r in bounded['rows']},{'cpu.level','cpu.work'})
+        self.assertLess(bounded_reads,cpu_reads)
 
     def test_brief_now_gives_each_components_top_five_and_host_totals_under_20_kb(self):
         # A first user's agent read `now` at 833 KB; brief gives a few hundred tokens.
