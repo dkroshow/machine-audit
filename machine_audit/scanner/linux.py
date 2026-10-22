@@ -23,8 +23,9 @@ from .walker import Walker
 
 # System areas a walk never enters. Most are separate filesystems the walk skips anyway.
 EXCLUDED = ('/proc', '/sys', '/dev', '/run', '/tmp')
-# A nightly timer's jitter stays inside this; a second run the same night finds the map current.
+# The hourly timer's night runs walk in full; 20 h keeps it to one walk a night.
 NIGHTLY_NS = 20 * 3600 * 10**9
+NIGHT_HOURS = range(1, 5)
 
 
 def volumes(root, salt):
@@ -69,8 +70,9 @@ def run_scan(data_dir, *, full=False, grain='files', roots=None, exclusions=(), 
                                                     (old['generation'], old['key'])).fetchone()
                 now = time.time_ns()
                 age = now - old['full_ns'] if has_root else None
-                # Full when there is no map, when requested at night, or when nights were missed.
-                action = ('full' if age is None or age >= 2 * NIGHTLY_NS or (full and age >= NIGHTLY_NS) else
+                # Full when there is no map, at night or on request once a day, or when nights were missed.
+                night = time.localtime(now / 1e9).tm_hour in NIGHT_HOURS
+                action = ('full' if age is None or age >= 2 * NIGHTLY_NS or ((full or night) and age >= NIGHTLY_NS) else
                           'update' if changed.get(volume.id) or store.db.execute(
                               'SELECT 1 FROM dirty WHERE volume=? AND due_ns<=? LIMIT 1', (volume.id, now)).fetchone() else
                           'wait')

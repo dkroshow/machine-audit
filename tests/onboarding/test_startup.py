@@ -92,7 +92,8 @@ class StartupTests(unittest.TestCase):
             runtime = {'collector': {'sources': [
                 {'source': 'macos.cpu', 'status': 'observed'},
                 {'source': 'macos.gpu', 'status': 'not_enabled'}]}}
-            with patch('machine_audit.client.request', return_value=runtime):
+            # Only the Mac gates its GPU reader on a saved choice.
+            with patch('machine_audit.client.request', return_value=runtime), patch('sys.platform', 'darwin'):
                 report = inspect(config)
             self.assertTrue(report['gpu']['active_after_restart'])
             self.assertFalse(report['ready'])

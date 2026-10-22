@@ -88,10 +88,12 @@ def inspect(config: Config) -> dict:
                 actions.append("The optional helper is not shipped yet; your choice is recorded for later.")
     collector = runtime.get("collector") or {}
     source_states = collector.get("sources", [])
-    gpu_status = next((s.get('status') for s in source_states if s.get('source') == 'macos.gpu'), 'unobserved')
-    gpu_configured = bool(config.enabled.get('gpu', False))
-    gpu_pending = running and ((gpu_configured and gpu_status == 'not_enabled') or
-                              (not gpu_configured and gpu_status in {'observed', 'measured_zero'}))
+    mac = sys.platform == 'darwin'
+    gpu_status = next((s.get('status') for s in source_states if s.get('source') == ('macos.gpu' if mac else 'linux.gpu')), 'unobserved')
+    # Only the Mac gates its GPU reader on a saved choice; Linux reads amdgpu unless disabled by source name.
+    gpu_configured = bool(config.enabled.get('gpu', False)) if mac else config.enabled.get('linux.gpu', True)
+    gpu_pending = mac and running and ((gpu_configured and gpu_status == 'not_enabled') or
+                                       (not gpu_configured and gpu_status in {'observed', 'measured_zero'}))
     if gpu_pending:
         actions.append('The saved GPU choice differs from live collection; it takes effect after a controlled restart.')
     startup = read_startup(config)
@@ -126,7 +128,9 @@ def _print_report(report: dict) -> None:
     print(f"Python {report['runtime']['python']}: {'ready' if report['runtime']['ok'] else 'upgrade needed'}")
     print(f"Collector: {report['collector']}; data directory: {report['data_directory']}")
     print(f"Free space: {report['storage']['free_bytes']:,} bytes; recordings need {report['storage']['required_free_bytes']:,}")
-    for name, title in (("scanner", "Protected disk areas"), ("helper", "System process and power detail")):
+    # Linux has no protected-area grant; its scanner sees what the service user may read.
+    names = (("scanner", "Protected disk areas"),) if report["runtime"]["os"] == "Darwin" else ()
+    for name, title in names + (("helper", "System process and power detail"),):
         permission = report["permissions"][name]
         wanted = "requested" if permission["requested"] else "optional, not requested"
         print(f"{title}: {permission['status']} ({wanted})")
@@ -159,9 +163,11 @@ def _yes_no(prompt: str, default: bool) -> bool:
 
 def setup(config: Config, *, json_output: bool = False) -> int:
     """Save choices only after confirmation. Installing is a separate explicit action."""
+    mac = sys.platform == 'darwin'
     if json_output or not sys.stdin.isatty():
         result = {"status": "decisions_needed", "saved": False,
-                  "decisions": ["protected_disk_areas", "optional_helper", "exclusive_gpu_reader", "dashboard_hosts"],
+                  "decisions": (["protected_disk_areas", "optional_helper", "exclusive_gpu_reader", "dashboard_hosts"] if mac
+                                else ["optional_helper", "dashboard_hosts"]),
                   "next_action": "Run machine-audit setup in a terminal to choose access and confirm settings."}
         print(json.dumps(result, indent=2) if json_output else result["next_action"])
         return 2
@@ -170,16 +176,24 @@ def setup(config: Config, *, json_output: bool = False) -> int:
     print("Storage limit: 10 GB; warning from 5 GB. Monitoring cost stays visible.")
     proposed = deepcopy(config)
     try:
-        proposed.source_options["scan_protected_requested"] = _yes_no(
-            "Include protected disk areas? Requires Full Disk Access for the scanner.",
-            bool(config.source_options.get("scan_protected_requested", False)))
-        proposed.source_options["helper_requested"] = _yes_no(
-            "Record interest in system process and package power detail for later? The optional helper is not shipped yet.",
-            bool(config.source_options.get("helper_requested", False)))
+        if mac:
+            proposed.source_options["scan_protected_requested"] = _yes_no(
+                "Include protected disk areas? Requires Full Disk Access for the scanner.",
+                bool(config.source_options.get("scan_protected_requested", False)))
+            proposed.source_options["helper_requested"] = _yes_no(
+                "Record interest in system process and package power detail for later? The optional helper is not shipped yet.",
+                bool(config.source_options.get("helper_requested", False)))
+        else:
+            proposed.source_options["helper_requested"] = _yes_no(
+                "Record interest in other users' process disk I/O and package power for later? The optional helper is not shipped yet.",
+                bool(config.source_options.get("helper_requested", False)))
+            # Folders and large files only; the first Ubuntu walk stored 56 MB of names at every-file grain.
+            proposed.source_options.setdefault("scanner_grain", "folders")
         proposed.enabled['scanner'] = True
-        proposed.enabled['gpu'] = _yes_no(
-            "Read GPU statistics? Other GPU recorders must be paused before starting.",
-            bool(config.enabled.get('gpu', False)))
+        if mac:
+            proposed.enabled['gpu'] = _yes_no(
+                "Read GPU statistics? Other GPU recorders must be paused before starting.",
+                bool(config.enabled.get('gpu', False)))
         answer = input("Hostnames you will reach the dashboard through (comma-separated, blank for this machine only): ")
         proposed.allowed_hosts = [h.strip().lower() for h in answer.split(",") if h.strip()]
         proposed.validate()
@@ -190,7 +204,8 @@ def setup(config: Config, *, json_output: bool = False) -> int:
             return 2
         print(f"Dashboard: {', '.join(proposed.allowed_hosts) or 'this machine only'}")
         print(f"Private recordings: {proposed.root}")
-        print("Access choices are requests. The running scanner must confirm permission; the helper is not shipped yet, so its choice is recorded for later.")
+        print("Access choices are requests. The running scanner must confirm permission; the helper is not shipped yet, so its choice is recorded for later."
+              if mac else "The helper is not shipped yet, so its choice is recorded for later. The scanner maps what this user may read.")
         if not _yes_no("Save these choices?", True):
             print("Cancelled; no settings changed.")
             return 1

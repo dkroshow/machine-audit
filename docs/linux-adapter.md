@@ -1,7 +1,7 @@
 # Linux adapter
 
-Status: slices 1–3 built (all seven components and the scanner); slice 4
-(installation) planned.
+Status: slices 1–4 built (all seven components, the scanner, installation);
+awaiting validation on the targets.
 Targets: Ubuntu 24.04 (kernel 6.8, Python 3.12, systemd 255) and 26.04 (kernel
 7.0, Python 3.14, systemd 259). Validation runs on those machines; fixtures
 prove parsing only.
@@ -145,8 +145,17 @@ equals the per-CPU count). `/proc/meminfo` keeps 22 keys.
   WAL snapshot only while it runs. To measure: that statement's time on Big
   Mac's full map; above a second, the scanner's writes after publication
   can wait on it.
-- Grain: setup should choose `folders` on Linux (storage-view.md); that is
-  slice 4.
+- Grain: Linux setup chooses `folders` (storage-view.md); the first Ubuntu
+  walk stored 56 MB of names for 613,000 entries at every-file grain.
+- Schedule under systemd: the hourly timer's runs between 01:00 and 05:00
+  local time walk in full when the last walk is 20 h old or more.
+
+## Installation
+
+`installation_linux.py` writes, as the service user, a release snapshot, a
+CLI and three unit files (collector, scanner, hourly timer) with the run
+model agreed with the first user; root places them. See
+[installation](installation.md#linux-ubuntu-install).
 
 ## Gaps
 
@@ -173,4 +182,4 @@ until the first user's captured, scrubbed bundles replace it.
 1. Clock, boot id, CPU, memory, units (CPU, memory), self, platform switch. Done.
 2. Storage, network, heat, power, GPU. Done.
 3. Scanner walk, nightly schedule, default exclusions, inotify hot set. Done.
-4. Linux setup, doctor, start, stop; system unit file; onboarding text.
+4. Linux setup, doctor, start, stop; system unit file; onboarding text. Done.
