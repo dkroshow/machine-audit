@@ -1,4 +1,5 @@
 """Event replay must not turn ordinary missing paths into subtree walks."""
+import errno
 import os
 from pathlib import Path
 from dataclasses import replace
@@ -93,6 +94,30 @@ class RelistTests(unittest.TestCase):
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM dirty').fetchone()[0],1)
         self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=False,lean=True)
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM files WHERE generation=?',(self.store.generation,)).fetchone()[0],3)
+
+    def test_child_event_attaches_to_a_parent_replaced_during_the_run(self):
+        # The parent was gone at its check (its subtree cleared, its own parent re-listed,
+        # which staged the recreated parent unlisted); the child's own event then hung its
+        # new row from the removed parent row, and publication failed on a missing ancestor.
+        parent=self.tree/'parent';child=parent/'child';child.mkdir(parents=True)
+        (child/'old').write_bytes(b'old')
+        self.baseline()
+        # New inodes for both, with the replacement built before the old one goes.
+        fresh=self.tree/'fresh';(fresh/'child').mkdir(parents=True);(fresh/'child'/'new').write_bytes(b'new')
+        (child/'old').unlink();child.rmdir();parent.rmdir()  # Disposable test directories only.
+        fresh.rename(parent)
+        identity=Walker.directory_identity;real_stat=os.stat;gone=[str(parent)]
+        def gone_once(walker,path):
+            if gone and path==gone[0]:return None
+            return identity(walker,path)
+        def stat_once(path,*args,**kwargs):
+            if gone and path==gone[0]:gone.clear();raise FileNotFoundError(errno.ENOENT,'gone',path)
+            return real_stat(path,*args,**kwargs)
+        walker=Walker(self.volume,self.policy,self.store,Blocks())
+        with patch.object(Walker,'directory_identity',gone_once),patch('machine_audit.scanner.runner.os.stat',stat_once):
+            self.assertTrue(relist(self.store,walker,self.policy,self.volume,0,[(str(parent),False),(str(child),False)]))
+        self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=False,lean=True)
+        self.assertEqual([r[0] for r in self.store.db.execute('SELECT label FROM files WHERE generation=?',(self.store.generation,))],['new'])
 
     def test_must_scan_still_recurses(self):
         (self.tree/'parent'/'kept').mkdir(parents=True)

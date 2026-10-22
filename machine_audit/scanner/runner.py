@@ -50,6 +50,16 @@ def resolve_mapped(store,walker,volume,path):
     return path,found
 
 
+def live_parent(store,walker,volume,path,stored):
+    """The identity a re-listed directory hangs from now. Its stored parent can be a
+    row this same run removed: when a directory and its parent were both replaced
+    (same paths, new inodes) and each had an event, the parent's new row is staged
+    first, and the child must attach to it, not to the removed one."""
+    if path==volume.mount:return stored
+    identity=walker.directory_identity(os.path.dirname(path))
+    return identity if identity is not None and identity!=stored and store.known_directory(identity) else stored
+
+
 def relist(store,walker,policy,volume,now,changes):
     """Re-list changed folders, given as (absolute path, recursive), plus deferred ones now due."""
     roots_to_update={}
@@ -111,11 +121,11 @@ def relist(store,walker,policy,volume,now,changes):
             parent,above=resolve_mapped(store,walker,volume,os.path.dirname(path))
             # Each way this can fail names itself: the run record is the only evidence.
             if not above:walker.gaps.add('parent_unresolved');complete=False
-            elif not walker.walk(parent,above['parent'],above['kind']=='private',recursive=False):
+            elif not walker.walk(parent,live_parent(store,walker,volume,parent,above['parent']),above['kind']=='private',recursive=False):
                 if os.path.lexists(parent):walker.gaps.add('parent_unlistable');complete=False
             continue
         if recursive:store.clear_subtree(previous['id'])
-        if not walker.walk(path,previous['parent'],previous['kind']=='private',recursive=recursive):complete=False
+        if not walker.walk(path,live_parent(store,walker,volume,path,previous['parent']),previous['kind']=='private',recursive=recursive):complete=False
     return complete
 
 

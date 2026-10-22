@@ -390,7 +390,10 @@ can be found). A changed directory that still exists but cannot be opened (the
 walker names why: `denied` or `directory_unreadable`) keeps its last map and is
 deferred an hour; it is opened before anything is cleared, since a walk lists
 nothing when its open is denied and anything staged beneath a cleared, unwalked
-directory would have no ancestor. Access checks still run first;
+directory would have no ancestor. A re-listed directory attaches to the row its
+parent has now, resolved by inode, not to the stored parent: when a directory and
+its parent were both replaced and each had an event, the parent's new row is
+staged first and the stored parent row is already removed. Access checks still run first;
 published map times, points and hierarchy change only on successful publication.
 Each run row also keeps `runs.volumes`: the per-volume outcome codes of that
 run (volume id, status, action, trigger, entries, gap codes, reason), since the
