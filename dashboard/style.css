@@ -217,7 +217,7 @@ main {
   border-radius:50%;
   animation:loading-spin 1s linear infinite;
 }
-#view.loading {
+#view.loading #view-content {
   opacity:.6;
 }
 @keyframes loading-spin {

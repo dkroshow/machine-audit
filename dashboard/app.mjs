@@ -18,22 +18,38 @@ function route() { const key=location.hash.slice(1).split('/')[0];return Object.
 function interval() {const end=Date.now()/1000;return state.range ?? {start:end-state.span,end};}
 function bounds() {return {...interval(),limit:600};}
 let busyTimer;
-function setBusy(busy) {
+function clearLoading() {
   clearTimeout(busyTimer);busyTimer=null;
-  $('refresh').disabled=busy;
-  $('view').setAttribute('aria-busy',String(busy));
   $('view').classList.remove('loading');
   $('loading').hidden=true;
+}
+function setBusy(busy,immediate=false) {
+  clearLoading();
+  $('refresh').disabled=busy;
+  $('view').setAttribute('aria-busy',String(busy));
   if(!busy)return;
   const started=performance.now(),title=views[state.view].title;
   const update=()=>{
     const seconds=Math.floor((performance.now()-started)/1000);
     $('loading-text').textContent=`${seconds>=15 ? 'Still running:':'Loading'} ${title}… ${seconds} s`;
   };
-  busyTimer=setTimeout(()=>{
+  const show=()=>{
     update();$('loading').hidden=false;$('view').classList.add('loading');
     busyTimer=setInterval(update,1000);
-  },300);
+  };
+  if(immediate)show();else busyTimer=setTimeout(show,300);
+}
+function acknowledge(view,immediate) {
+  state.view=view;
+  const spec=views[view];
+  $('view').classList.toggle('cost-view',view==='cost');
+  $('view-title').textContent=spec.title;$('view-description').textContent=spec.description;document.title=`${spec.title} · Machine-audit`;
+  document.querySelectorAll('[data-view]').forEach(a=>a.setAttribute('aria-current',a.dataset.view===view?'page':'false'));
+  setBusy(true,immediate);
+}
+function paint(...content) {
+  $('view-content').replaceChildren(...content);
+  clearLoading();
 }
 function message(id,text){$(id).textContent=text??'';$(id).hidden=!text;}
 function contentGroups(answer,component,onAround) {
@@ -77,7 +93,8 @@ async function overview(params,abort,query) {
     grid.append(el('section',{class:'card'},heading,el('p',{class:'sub'},spec.description),body));
     return body;
   });
-  root.append(grid);$('view').replaceChildren(root);
+  root.append(grid);
+  const publish=()=>{if(!root.isConnected)paint(root);};
   // Eight component allowances still total 600 rows.
   await Promise.all(keys.map((key,index)=>fill(bodies[index],async()=>{
     const spec=views[key],component=spec.component ?? key;
@@ -85,7 +102,7 @@ async function overview(params,abort,query) {
     const rows=seriesGroups(answer.rows ?? []).filter(g=>(component==='self' ? !g.entity?.startsWith('program:') : !g.entity?.startsWith('process:')) && !g.entity?.startsWith('cpu:')).slice(0,3);
     return el('div',{},rows.length ? el('div',{class:'signal-list'},rows.map(g=>{const r=g.rows.at(-1);return metric(label(g.signal),format(rowValue(r),rowUnit(r)),r.status);})) : empty(answer.truncated ? 'No host or device measurements were returned in this partial sample.' : 'No host or device measurements were returned for this interval.'),
       answer.truncated ? el('p',{class:'note'},'Partial sample. Explore this component for more detail.') : null);
-  },abort)));
+  },abort,publish)));
 }
 async function workloadSection(component,params,abort,query) {
   const wanted=(state.catalog.signals ?? []).filter(s=>s.component===component && ranksInWho(s));
@@ -114,13 +131,11 @@ async function around(at,component) {
     $('around-content').replaceChildren(el('p',{class:'note'},intervalEvidence(answer.series)),signalsView(answer.series),card('Programs in this interval',whoView(answer.who ?? {},()=>{})),card('Coverage',coverageView(answer.coverage)),card('Events',answer.events?.length ? el('ul',{class:'event-list'},answer.events.map(event=>el('li',{},`${time(event.wall_ns ?? event.start_ns,true)} · ${label(event.kind ?? event.signal)} · ${event.value ?? event.status ?? ''}`))) : el('p',{class:'note'},'No events returned for this interval.')));
   } catch(e){$('around-content').replaceChildren(empty(e.message));}
 }
-async function load() {
+async function load(immediate=false) {
   clearTimeout(state.timer);state.abort?.abort();const controller=new AbortController();state.abort=controller;
-  state.view=route();const spec=views[state.view],component=spec.component ?? (state.view==='overview'||state.view==='coverage' ? undefined:state.view);
-  $('view').classList.toggle('cost-view',state.view==='cost');
-  $('view-title').textContent=spec.title;$('view-description').textContent=spec.description;document.title=`${spec.title} · Machine-audit`;
-  document.querySelectorAll('[data-view]').forEach(a=>a.setAttribute('aria-current',a.dataset.view===state.view?'page':'false'));
-  message('error');message('notice');setBusy(true);
+  acknowledge(route(),immediate);
+  const spec=views[state.view],component=spec.component ?? (state.view==='overview'||state.view==='coverage' ? undefined:state.view);
+  message('error');message('notice');
   const params=bounds();$('interval-caption').textContent=state.mode==='live' ? 'Recent source readings · refresh every 5 seconds while visible':`${time(params.start*1e9)} – ${time(params.end*1e9)} · ${Intl.DateTimeFormat().resolvedOptions().timeZone}`;
   try {
     state.catalog ??= await query('catalog',{},controller.signal);
@@ -131,17 +146,17 @@ async function load() {
     if(state.view==='coverage') {
       const [coverage,status]=await Promise.all([query('coverage',params,controller.signal),query('status',{},controller.signal)]);
       if(controller.signal.aborted)return;
-      answer=coverage;$('view').replaceChildren(statusView(status),card('Interval coverage',coverageView(coverage)));
+      answer=coverage;paint(statusView(status),card('Interval coverage',coverageView(coverage)));
     } else if(state.mode==='live') {
       answer=await query('now',{component},controller.signal);
       if(controller.signal.aborted)return;
-      $('view').replaceChildren(spec.note ? el('p',{class:'intro'},spec.note):el('p',{class:'intro'},'Recent source readings, with their actual observation times.'),liveView(answer,at=>around(at,component)));
+      paint(spec.note ? el('p',{class:'intro'},spec.note):el('p',{class:'intro'},'Recent source readings, with their actual observation times.'),liveView(answer,at=>around(at,component)));
     } else if(state.view==='overview') {
       await overview(params,controller.signal,query);
     } else {
       const series=el('div',{},loading()),extra=el('div',{},loading());
       const root=el('div',{},spec.note ? el('p',{class:'intro'},spec.note):null,series,extra);
-      const publish=()=>{if(!root.isConnected)$('view').replaceChildren(root);};
+      const publish=()=>{if(!root.isConnected)paint(root);};
       const pending=[fill(series,async()=>{
         answer=await query('series',{...params,component},controller.signal);
         const content=contentGroups(answer,component,at=>around(at,component));
@@ -163,16 +178,21 @@ async function load() {
     if(answer?.truncated)message('notice',(synthetic ? 'Synthetic replay. ' : '')+'This answer reaches the result limit. Narrow the interval for detail; the API supplies a continuation for the remaining rows.');
     $('connection').textContent=`Last answer ${new Date().toLocaleTimeString()}`;
   } catch(e) {
-    if(e.name!=='AbortError'&&!controller.signal.aborted) {controller.abort();setBusy(false);message('error',e.message);$('view').replaceChildren(empty('Measurements could not be loaded. Refresh after checking that Machine-audit is running.'));$('connection').textContent='Connection needs attention';}
+    if(e.name!=='AbortError'&&!controller.signal.aborted) {controller.abort();setBusy(false);message('error',e.message);paint(empty('Measurements could not be loaded. Refresh after checking that Machine-audit is running.'));$('connection').textContent='Connection needs attention';}
   } finally {
     if(!controller.signal.aborted){setBusy(false);if(state.mode==='live'&&!document.hidden)state.timer=setTimeout(load,5000);}
   }
 }
 $('refresh').addEventListener('click',()=>{state.catalog=null;load();});
+document.querySelectorAll('[data-view]').forEach(link=>link.addEventListener('click',event=>{
+  if(event.button!==0||event.metaKey||event.ctrlKey||event.shiftKey||event.altKey)return;
+  state.abort?.abort();acknowledge(link.dataset.view,true);
+  if(route()===link.dataset.view)load(true);
+}));
 window.addEventListener('hashchange',()=>{
   const token=readToken(window.location,window.history);
   if(token!==null)api=makeApi(token);
-  state.whoSignal=null;load();
+  state.whoSignal=null;load(true);
 });
 $('span').addEventListener('change',()=>{const custom=$('span').value==='custom';$('custom-range').hidden=!custom;if(!custom){state.span=Number($('span').value);state.range=null;load();}});
 $('interval').addEventListener('submit',event=>{event.preventDefault();const start=Date.parse($('from').value)/1000,end=Date.parse($('to').value)/1000;if(!Number.isFinite(start)||!Number.isFinite(end)||end<=start){message('error','Choose a start and end time, with the end after the start.');return;}state.range={start,end};load();});

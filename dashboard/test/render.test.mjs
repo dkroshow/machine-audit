@@ -86,7 +86,7 @@ test('all dashboard views render real stored replay without leaked tokens or fak
   assert.ok(errors.splice(authErrorStart).every(error=>error.includes('status of 401')),'Only the intentional authorization failures may be logged');
   await run(`location.hash='#token=${encodeURIComponent(connection.token)}'`);await pause(100);await settled();
   assert.match(await run("document.querySelector('#notice').textContent"),/Synthetic replay/);
-  const previousView=await run("document.querySelector('#view').innerHTML");
+  const previousView=await run("(document.querySelector('#view-content') ?? document.querySelector('#view')).innerHTML");
   let heldRequest;
   on('Fetch.requestPaused',({requestId})=>{heldRequest=requestId;});
   await send('Fetch.enable',{patterns:[{urlPattern:'*/api/coverage*'}]});
@@ -96,7 +96,7 @@ test('all dashboard views render real stored replay without leaked tokens or fak
     await pause(400);
     assert.equal(await run("!!document.querySelector('#loading')&&!document.querySelector('#loading').hidden"),true,'A held query must show the loading indicator');
     assert.match(await run("document.querySelector('#loading').textContent"),/Loading Coverage & status.*\d+ s/);
-    assert.equal(await run("document.querySelector('#view').innerHTML"),previousView,'Loading must preserve the previous view');
+    assert.equal(await run("(document.querySelector('#view-content') ?? document.querySelector('#view')).innerHTML"),previousView,'Loading must preserve the previous view');
     assert.equal(await run("document.querySelector('#view').classList.contains('loading')"),true,'Loading must dim the previous view');
     assert.equal(await run("document.querySelector('#view').getAttribute('aria-busy')"),'true');
   } finally {
@@ -110,12 +110,22 @@ test('all dashboard views render real stored replay without leaked tokens or fak
   const pendingOverview=new Map();
   on('Fetch.requestPaused',({requestId,request})=>pendingOverview.set(new URL(request.url).searchParams.get('component'),requestId));
   await send('Fetch.enable',{patterns:[{urlPattern:'*/api/series*'}]});
-  await run("location.hash='#overview'");
+  const beforeOverview=await run("(document.querySelector('#view-content') ?? document.querySelector('#view')).innerHTML");
+  const acknowledged=await run(`(() => {
+    const link=document.querySelector('[data-view="overview"]');link.click();
+    return {selected:link.getAttribute('aria-current'),visible:!document.querySelector('#loading').hidden,
+      dimmed:document.querySelector('#view').classList.contains('loading'),inside:document.querySelector('#view').contains(document.querySelector('#loading')),busy:document.querySelector('#view').getAttribute('aria-busy'),title:document.querySelector('#view-title').textContent};
+  })()`);
   try {
+    assert.deepEqual(acknowledged,{selected:'page',visible:true,dimmed:true,inside:true,busy:'true',title:'Overview'},'Navigation must be acknowledged in the click tick');
     await until(()=>pendingOverview.size,count=>count===3,'Overview did not start three requests');
+    assert.equal(await run("(document.querySelector('#view-content') ?? document.querySelector('#view')).innerHTML"),beforeOverview,'Keep the old view until the first new card arrives');
+    assert.equal(await run("document.querySelector('#view').classList.contains('loading')"),true);
     await send('Fetch.continueRequest',{requestId:pendingOverview.get('cpu')});pendingOverview.delete('cpu');
     await until(()=>run("[...document.querySelectorAll('#view .card')].some(card=>card.querySelector('h2')?.textContent==='CPU'&&!card.querySelector('.loading-indicator'))"),Boolean,'First overview card did not paint while other queries were held');
-    assert.equal(await run("document.querySelectorAll('#view .loading-indicator').length"),7);
+    assert.notEqual(await run("(document.querySelector('#view-content') ?? document.querySelector('#view')).innerHTML"),beforeOverview,'The first card replaces the old view');
+    assert.equal(await run("document.querySelector('#view').classList.contains('loading')"),false,'New cards are not dimmed');
+    assert.equal(await run("document.querySelectorAll('#view-content .loading-indicator').length"),7);
     await until(()=>pendingOverview.has('storage'),Boolean,'A free request slot did not start the next component');
   } finally {
     for(const requestId of pendingOverview.values())await send('Fetch.continueRequest',{requestId});

@@ -31,7 +31,7 @@
     <div class="side-foot"><p>Measurements, with their limits.</p><label>Appearance <select id="theme"><option value="auto">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label><p id="connection">Waiting for connection</p></div>
   </aside>
   <main id="content" tabindex="-1">
-    <header class="page-head"><div><p class="eyebrow" id="view-context">MACHINE EVIDENCE</p><h1 id="view-title">Overview</h1><span id="loading" class="loading-indicator" role="progressbar" aria-label="Loading measurements" hidden><span id="loading-text" aria-hidden="true"></span></span><p id="view-description" class="sub"></p></div><button id="refresh" type="button">Refresh</button></header>
+    <header class="page-head"><div><p class="eyebrow" id="view-context">MACHINE EVIDENCE</p><h1 id="view-title">Overview</h1><p id="view-description" class="sub"></p></div><button id="refresh" type="button">Refresh</button></header>
     <form id="interval" class="interval" aria-label="Time interval">
       <div class="mode" role="group" aria-label="Time mode"><button type="button" id="history-mode" aria-pressed="true">History</button><button type="button" id="live-mode" aria-pressed="false">Live</button></div>
       <label>Show <select id="span"><option value="300">Last 5 minutes</option><option value="3600" selected>Last hour</option><option value="86400">Last 24 hours</option><option value="604800">Last 7 days</option><option value="custom">Custom interval</option></select></label>
@@ -40,7 +40,7 @@
     </form>
     <div id="notice" class="notice" role="status" hidden></div>
     <div id="error" class="error" role="alert" hidden></div>
-    <div id="view" aria-live="polite"><p class="empty">Connecting to your measurements…</p></div>
+    <div id="view" aria-live="polite"><span id="loading" class="loading-indicator" aria-hidden="true" hidden><span id="loading-text"></span></span><div id="view-content"><p class="empty">Connecting to your measurements…</p></div></div>
     <footer id="evidence-footer"></footer>
   </main>
 </div>
