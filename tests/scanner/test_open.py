@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from machine_audit.budget import Budget
+from machine_audit.budget import Budget, BudgetExceeded
 from machine_audit.scanner.accounting import Blocks
 from machine_audit.scanner.events import Replay
 from machine_audit.scanner.native import Volume
@@ -162,13 +162,17 @@ class RootPublicationTests(unittest.TestCase):
 
     def test_unexpected_publication_error_ends_run_without_exposing_exception_text(self):
         before = self.published()
-        for error, reason in ((ValueError('synthetic private path'), 'invalid_scan_state'),
-                              (OSError(5, 'synthetic private path'), 'os_error'),
-                              (TypeError('synthetic private path'), 'unexpected_error')):
+        for error, status_code, reason in (
+                (ValueError('synthetic private path'), 'scan_failed', 'invalid_scan_state_ValueError'),
+                (OSError(5, 'synthetic private path'), 'scan_failed', 'os_error_OSError'),
+                (TypeError('synthetic private path'), 'scan_failed', 'unexpected_error_TypeError'),
+                (BudgetExceeded('synthetic private path'), 'budget_blocked', 'budget_blocked_BudgetExceeded'),
+                (sqlite3.OperationalError('synthetic private path'), 'write_failed', 'write_failed_OperationalError')):
             with self.subTest(reason=reason), patch.object(MapStore, 'finish_volume', side_effect=error):
                 result, status = self.scan([self.volume])
-                self.assertEqual(result['status'], 'scan_failed')
+                self.assertEqual(result['status'], status_code)
                 self.assertEqual(result['reason'], reason)
+                self.assertEqual(result['exception_type'], type(error).__name__)
                 self.assertEqual(status, reason)
                 self.assertNotIn('synthetic private path', repr(result))
                 # Failure status may change; published evidence cannot.
