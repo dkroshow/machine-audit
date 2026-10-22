@@ -13,7 +13,7 @@ product guidance, adapted and verified by the agent on each machine.
 
 | Target | Known inventory | Evidence still needed |
 | --- | --- | --- |
-| Big Mac | Intel Mac Pro 2019; 384 GiB RAM; AMD Radeon Pro W5500X, 8 GB VRAM | The new Python implementation's correctness and operating cost |
+| Big Mac | Intel Mac Pro 2019; 384 GiB RAM; AMD Radeon Pro W5500X, 8 GB VRAM; macOS 26.7.1 (build 25G241) since 2026-10-22, macOS 15.6.1 before | The new Python implementation's correctness and operating cost |
 | Ubuntu cloud instance | Ubuntu cloud instance, 2 vCPU class, no GPU | Current configuration, exposed sources, permissions and cost |
 | Ubuntu physical workstation | Physical machine running Ubuntu | Hardware, OS/kernel, GPU/driver and available sources, discovered during implementation |
 

@@ -7,6 +7,17 @@ is required. The `install` command needs Xcode Command Line Tools (`clang`) to
 compile the native scanner. `python3 -m machine_audit --help` displays the command
 surface; use an explicit 3.12 executable when the system `python3` is older.
 
+
+## Trial machine operating system
+
+Big Mac ran macOS 15.6.1 with AMD graphics kexts 7.0.0 for all trial
+evidence recorded before 2026-10-22 04:00 UTC, including the first real
+filesystem map and the GPU hang of 02:00 UTC that day. It has run macOS
+26.7.1 (build 25G241, AMD kexts 7.0.1) since the planned update at 04:00 UTC.
+GPU collection (`enabled.gpu`) is off on Big Mac by the operator's decision
+and reads `exclusive_gpu_reader_required`; no evidence after that time
+includes GPU readings.
+
 ## Portable verification
 
 Run the final check once on the candidate being handed off:
