@@ -85,14 +85,16 @@ class LinuxHost:
         return 'redacted' if private_token(name, self.private_tokens) else name
 
     def cpu(self):
+        """Host totals every second from the aggregate line; per-CPU states come from per_cpu."""
         count = 0
         for line in self.text('proc/stat').splitlines():
             name, *values = line.split()
-            if name.startswith('cpu') and name[3:].isdigit():
-                count += 1
+            if name == 'cpu':
                 for state, value in zip(CPU_STATES, values):
-                    yield field('cpu.' + state, int(value), 'ticks', 'counter', entity='cpu:' + name[3:],
-                                scale=1 / self.hz, additive=True, rate_unit='CPUs')
+                    yield field('cpu.' + state, int(value), 'ticks', 'counter', scale=1 / self.hz, additive=True,
+                                rate_unit='CPUs')
+            elif name.startswith('cpu') and name[3:].isdigit():
+                count += 1
             elif name == 'procs_running':
                 # Instantaneous, and it counts the thread reading it.
                 yield field('cpu.runnable', int(values[0]), 'threads')
@@ -103,6 +105,15 @@ class LinuxHost:
         for window, value in zip(('1m', '5m', '15m'), self.text('proc/loadavg').split()):
             yield field('cpu.load_' + window, float(value), 'threads')
         yield from psi(self.root / 'proc/pressure/cpu', 'cpu')
+
+    def per_cpu(self):
+        """Each logical CPU's states every 10 s, named apart so they derive no second host busy."""
+        for line in self.text('proc/stat').splitlines():
+            name, *values = line.split()
+            if name.startswith('cpu') and name[3:].isdigit():
+                for state, value in zip(CPU_STATES, values):
+                    yield field('cpu.per_cpu.' + state, int(value), 'ticks', 'counter', entity='cpu:' + name[3:],
+                                scale=1 / self.hz, additive=True, rate_unit='CPUs')
 
     def memory(self):
         meminfo = keyed(self.text('proc/meminfo'), ':')

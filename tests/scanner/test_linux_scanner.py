@@ -69,7 +69,23 @@ class LinuxScannerTests(unittest.TestCase):
         self.assertEqual((named['srv']['status'], named['home']['status']), ('observed', 'observed'))  # @home is not a bind mount
         # /proc and /tmp are excluded by default and, like configured exclusions, stay unnamed.
         self.assertEqual([(r['label'], r['listed']) for r in rows if r['status'] == 'excluded'], [(None, 0), (None, 0)])
+        row = MapQuery(self.data / 'scanner.sqlite').query('volumes')['rows'][0]
+        # First Linux scan: a complete ext4 map read "unavailable". Without an extents provider
+        # the map is observed, uses charge hard links once, and no residual is claimed.
+        self.assertEqual((row['status'], row['valid'], row['uses'], row['not_attributed']), ('observed', True, row['listed'], None))
+        self.assertIn('physical_residual_not_computed', row['gaps'])
         self.assertEqual(self.scan()['volumes'][0]['status'], 'current')  # the same night, nothing changed
+
+    def test_volume_root_the_service_user_cannot_read_is_a_denied_gap_not_a_failed_run(self):
+        # First Linux scan: /boot/efi (mode 0700, root) made every nightly run end partial.
+        os.chmod(self.root, 0o311)  # traversable, not listable
+        try:
+            result = self.scan()
+        finally:
+            os.chmod(self.root, 0o755)
+        self.assertEqual((result['status'], result['volumes'][0]['status']), ('observed', 'denied'))
+        row = MapQuery(self.data / 'scanner.sqlite').query('volumes')['rows'][0]
+        self.assertEqual((row['status'], row['gaps']), ('denied', ['denied']))
 
     def test_watched_change_is_relisted_by_the_next_run_without_a_walk(self):
         volume = self.scan()['volumes'][0]['volume_id']

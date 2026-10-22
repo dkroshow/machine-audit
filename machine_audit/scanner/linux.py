@@ -87,6 +87,14 @@ def run_scan(data_dir, *, full=False, grain='files', roots=None, exclusions=(), 
                 walker = Walker(volume, policy, store, blocks, None, grain)
                 if action == 'full':
                     walker.walk()
+                    if not walker.listed and 'denied' in walker.gaps:
+                        # A root the service user may not read (an EFI partition) is a labelled
+                        # gap on that volume, not a failed run.
+                        store.buffer.clear()
+                        store.buffer_bytes = 0
+                        store.observe_unscanned(volume, 'denied', lean=False)
+                        results.append({'volume_id': volume.id, 'status': 'denied', 'action': action})
+                        continue
                     if not walker.listed:
                         # The previous map stays published; nothing replaces it.
                         root_failed = True
@@ -102,7 +110,7 @@ def run_scan(data_dir, *, full=False, grain='files', roots=None, exclusions=(), 
                     relist(store, walker, policy, volume, now,
                            ((f['path'], False) for f in folders if f and f['path'] and same_folder(f['path'], f['id'])))
                 store.finish_volume(volume, blocks, walker.gaps, full=action == 'full', lean=False,
-                                    complete=walker.sharing_complete)
+                                    complete=walker.sharing_complete, physical=False)
                 published += 1
                 processed += walker.entries
                 store.progress(processed)

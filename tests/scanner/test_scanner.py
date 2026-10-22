@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import sys
 import sqlite3
 import tempfile
 import unittest
@@ -147,6 +148,7 @@ class ScannerTests(unittest.TestCase):
             self.assertEqual(scanner.main(config),0)
         self.assertEqual(run.call_args.kwargs['exclusions'],['/synthetic/excluded'])
 
+    @unittest.skipUnless(sys.platform == 'darwin', 'Darwin runner; Linux run_scan has no permission proof')
     def test_missing_permission_proof_preserves_existing_rich_map(self):
         from machine_audit.scanner.runner import run_scan
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:

@@ -56,6 +56,10 @@ export function time(ns, full=false) {
   if (!finite(ns)) return 'Unknown time';
   return new Date(ns / 1e6).toLocaleString(undefined, full ? {dateStyle:'medium',timeStyle:'medium'} : {hour:'2-digit',minute:'2-digit',second:'2-digit'});
 }
+// Workload evidence that ranks in `who`. Linux unit consumption has scope `unit`;
+// `unit_detail` (limits, breakdowns, pressure) describes a unit and does not rank.
+export const ranksInWho = s => s.scope === 'unit' || /process|client|workload/.test(s.scope ?? '') || Boolean(s.signal?.startsWith('process.'));
+
 export function rowValue(row) {
   if (!measured.has(row?.status)) return null;
   if (row.kind === 'counter') return row.mean_rate ?? row.value ?? null;

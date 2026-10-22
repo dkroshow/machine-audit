@@ -78,6 +78,8 @@ def inspect(config: Config) -> dict:
         actions.append("Choose a private data directory owned by this user.")
     if not running:
         actions.append("Install and start the collector, then run machine-audit doctor again.")
+    if not config.enabled.get("scanner", False):
+        actions.append("The filesystem map is off: machine-audit scan is not enabled. Run machine-audit setup to turn it on.")
     for name, permission in permissions.items():
         if permission["requested"] and permission["status"] != "granted":
             if name == "scanner":

@@ -26,7 +26,7 @@ prove parsing only.
 
 | Component | Sources (cadence) |
 | --- | --- |
-| CPU | `/proc/stat` per-CPU states, `procs_running`, `/proc/loadavg`, `/proc/pressure/cpu` (1 s); unit `cpu.stat` (10 s); `cpu.max`, `cpu.weight` (60 s) |
+| CPU | `/proc/stat` host totals from the aggregate line, `procs_running`, `/proc/loadavg`, `/proc/pressure/cpu` (1 s); per-CPU states as `cpu.per_cpu.*` (10 s); unit `cpu.stat` (10 s); `cpu.max`, `cpu.weight` (60 s) |
 | Memory | `/proc/meminfo`, `/proc/vmstat`, `/proc/pressure/memory` by key (1 s); unit `memory.current`, `memory.stat`, `memory.events`, pressure (10 s); limits (60 s) |
 | Storage | `/proc/diskstats` per whole physical disk, `/proc/pressure/io` (5 s); unit `io.stat`, `io.pressure` (10 s); `statvfs` per local filesystem (60 s) |
 | Network | `/proc/net/dev` by interface index with link state, speed and physical flag, `/proc/net/snmp` TCP and UDP (10 s); probes (5 s); resolver lookup and connect (60 s); `/proc/net/wireless` (10 s) |
@@ -74,9 +74,11 @@ data, commitment), stored as bytes (exact ×1024). PSI totals are microsecond
 counters whose rate reads as percent of time stalled. A unit limit of `max`
 is `not_enabled` (no limit), never a number.
 
-Storage cost: `/proc/stat` keeps all ten states per CPU, so a 32-thread host
-writes about 320 CPU fields a second, roughly four times the Mac. Decision:
-measure growth on the target before trimming anything.
+Storage cost: the first Ubuntu run grew 1.1 MB a minute on 2 vCPUs. Host CPU
+totals now come from the aggregate line every second and per-CPU states
+every 10 s, so a 32-thread host writes about 42 CPU fields a second instead
+of 320; `cpu.capacity` is `cpu.logical`, the online CPU count (on the Mac it
+equals the per-CPU count). `/proc/meminfo` keeps 22 keys.
 
 ## Devices and network
 
@@ -119,7 +121,10 @@ measure growth on the target before trimming anything.
 - `scanner/linux.py` walks each local disk filesystem from mountinfo (volume
   id: the capacity source's salted `f_fsid`) with the shared walker:
   `os.scandir`, `st_blocks` bytes, hard links charged once. ext4 shares no
-  blocks, so folders report listed bytes and no physical residual.
+  blocks: a complete map is `observed` with uses (hard links once) and the
+  gap `physical_residual_not_computed`; no residual is claimed. A volume
+  root the service user cannot read (an EFI partition) is a `denied` gap on
+  that volume; the run still completes.
 - Never entered: `/proc`, `/sys`, `/dev`, `/run`, `/tmp` (counted as
   `excluded`, unnamed like configured exclusions), other users' homes
   (`other_account`), the data directory (`own_store`), and a bind mount of
