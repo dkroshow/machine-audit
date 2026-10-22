@@ -2,9 +2,9 @@
 carry a salted hash, the directory inode and a leaf label for admission."""
 from __future__ import annotations
 
-import hashlib
-import hmac
 import os
+
+from .files import salted
 
 # Kept memory.stat keys: usage classes and movement named in memory-view.md.
 # Parsed by key, so keys a newer kernel adds are ignored until reviewed.
@@ -44,8 +44,7 @@ def units(base):
 
 def identity(salt, rel, directory):
     """A unit restarted under the same path gets a new inode, so its first read is a baseline."""
-    digest = hmac.new(salt, rel.encode(), hashlib.sha256).hexdigest()[:16]
-    return f'cgroup:{digest}:{os.stat(directory).st_ino}'
+    return f'cgroup:{salted(salt, rel)}:{os.stat(directory).st_ino}'
 
 
 def leaf_name(rel):

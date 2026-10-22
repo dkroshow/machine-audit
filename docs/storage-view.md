@@ -137,15 +137,14 @@ Same model on both operating systems; different mechanism, stated on the map.
 | | macOS | Ubuntu |
 | --- | --- | --- |
 | Full scan | Weekly; also first run, a lost change log, or on request (at most daily) | Nightly: the update *is* a re-walk |
-| Update | Hourly: replay the file system event log since the last bookmark, re-list only changed folders; folders with more than about 20,000 direct entries at most daily | None between walks |
-| Why | The event service keeps a persistent log whether or not anyone listens | Change notifications exist only while a process listens; per-folder watches cost kernel memory, need a raised limit and lose events on overflow; mount-wide watching needs root. A nightly walk is what Linux's own `locate` does |
-| History grain | Hourly points | Daily points |
+| Update | Hourly: replay the file system event log since the last bookmark, re-list only changed folders; folders with more than about 20,000 direct entries at most daily | Hourly: re-list the hot folders an inotify watch in the collector saw change (folders of 1 GB or more, or directly holding a file of 100 MB or more; at most 8,192 and an eighth of `max_user_watches`), with the same daily limit for large folders |
+| Why | The event service keeps a persistent log whether or not anyone listens | Change notifications exist only while a process listens; per-folder watches cost kernel memory, need a raised limit and lose events on overflow; mount-wide watching needs root. So the walk is nightly, as Linux's own `locate` does, and only a bounded hot set is watched; an overflow re-lists every hot folder |
+| History grain | Hourly points | Daily points; hourly for hot folders that changed |
 | Map age shown as | "updated 14:00, full scan Sunday" | "as of 02:00 today" |
 
 The prototype's recovery rules carry: an interrupted log read restarts from the
-last event received; three hourly runs without progress force a full scan. If
-the nightly walk measures too costly on Ubuntu, a resident watcher is the next
-candidate, chosen on that evidence.
+last event received; three hourly runs without progress force a full scan. On
+Ubuntu, changes made while the collector is stopped wait for the nightly walk.
 
 ## Grain, process and cost
 

@@ -1,6 +1,7 @@
 # Linux adapter
 
-Status: slices 1–2 built (all seven components); slices 3–4 planned.
+Status: slices 1–3 built (all seven components and the scanner); slice 4
+(installation) planned.
 Targets: Ubuntu 24.04 (kernel 6.8, Python 3.12, systemd 255) and 26.04 (kernel
 7.0, Python 3.14, systemd 259). Validation runs on those machines; fixtures
 prove parsing only.
@@ -15,7 +16,8 @@ prove parsing only.
 - `linux/cgroups.py`: unit discovery and identity. `linux/devices.py`: disks,
   volumes, hwmon heat and power, cpufreq, power supplies, amdgpu.
   `linux/network.py`: counters and probes on the shared probe rules.
-  `linux/files.py`: the kernel's text formats.
+  `linux/files.py`: the kernel's text formats and salted identities.
+  `linux/watcher.py`: the collector's inotify watch for the scanner.
 - `self_cost.py` stays shared, with a Linux field map.
 - Every source reads through a `root` path (default `/`), so tests point it
   at a directory tree instead of mocking.
@@ -105,6 +107,32 @@ measure growth on the target before trimming anything.
   `power/runtime_status` is `suspended` is not read, nor are its hwmon
   sensors (`unobserved`), because the read wakes it on kernel 6.8.
 
+## Scanner
+
+- `scanner/linux.py` walks each local disk filesystem from mountinfo (volume
+  id: the capacity source's salted `f_fsid`) with the shared walker:
+  `os.scandir`, `st_blocks` bytes, hard links charged once. ext4 shares no
+  blocks, so folders report listed bytes and no physical residual.
+- Never entered: `/proc`, `/sys`, `/dev`, `/run`, `/tmp` (counted as
+  `excluded`, unnamed like configured exclusions), other users' homes
+  (`other_account`), the data directory (`own_store`), and a second mount
+  of the walked filesystem (`bind_mount`), which would count its contents
+  twice.
+- Schedule: a full walk when there is no map, when a run requests one 20 h
+  or more after the last (the nightly timer), or after 40 h. Otherwise a run
+  re-lists the folders in the dirty file, with the Mac's re-list step
+  (`runner.relist`), or finds the map current.
+- Watcher (`linux.watcher`, 10 s, in the collector): inotify on the hot set,
+  rebuilt after each published map. A change dirties its folder; a folder
+  that went away dirties its parent; a queue overflow dirties every hot
+  folder. Each read drains the queue without waiting and merges the folders
+  into `scanner-dirty.json` (0600, volume and inode numbers only) in one
+  short budgeted write. The scanner claims the file by renaming it.
+  `self.watched_folders`, `self.watch_dirtied` and `self.watch_overflows`
+  show its work.
+- Grain: setup should choose `folders` on Linux (storage-view.md); that is
+  slice 4.
+
 ## Gaps
 
 - `shipped_helper_required`: other users' `/proc/<pid>/io`
@@ -129,5 +157,5 @@ until the first user's captured, scrubbed bundles replace it.
 
 1. Clock, boot id, CPU, memory, units (CPU, memory), self, platform switch. Done.
 2. Storage, network, heat, power, GPU. Done.
-3. Scanner walk, nightly schedule, default exclusions, inotify hot set.
+3. Scanner walk, nightly schedule, default exclusions, inotify hot set. Done.
 4. Linux setup, doctor, start, stop; system unit file; onboarding text.

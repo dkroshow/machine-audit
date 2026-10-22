@@ -8,6 +8,7 @@ from ..self_cost import ManagedProcesses, SelfCost
 from .devices import Devices
 from .host import LinuxHost, read_boot_id
 from .network import LinuxNetwork, icmp_permitted
+from .watcher import Watcher
 
 
 def boot_id(root='/'):
@@ -56,4 +57,5 @@ def sources(config, budget, operations=None, scanner=None, root='/'):
         ReadSource('self.process', 'self', 10, own.processes),
         ReadSource('self.storage', 'self', 60, own.storage),
         ReadSource('self.scanner', 'self', 60, own.scanner_runs),
+        ReadSource('linux.watcher', 'self', 10, Watcher(host.root, config.root, budget).read),
     ] + ([] if icmp else [GapSource('linux.icmp', 'network', 5, 'icmp_not_permitted')])

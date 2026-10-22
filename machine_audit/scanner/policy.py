@@ -21,8 +21,9 @@ class Decision:
 
 
 class Policy:
-    def __init__(self, *, full_disk_access=False, home=None, homes=None, exclusions=(), data_root=None):
+    def __init__(self, *, full_disk_access=False, home=None, homes=None, exclusions=(), data_root=None, mounts=()):
         self.full_disk_access = full_disk_access
+        self.mounts = tuple(os.path.normpath(p) for p in mounts)
         self.home = os.path.normpath(home or os.path.expanduser('~'))
         self.homes = homes if homes is not None else [p.pw_dir for p in pwd.getpwall() if p.pw_uid >= 501]
         self.exclusions = tuple(os.path.normpath(p) for p in exclusions)
@@ -47,6 +48,9 @@ class Policy:
             return Decision(False, False, 'excluded')
         if self.data_root and (p == self.data_root or p.startswith(self.data_root + '/')):
             return Decision(False, False, 'own_store')
+        # A second mount of the walked filesystem would count its contents twice.
+        if any(p == m or p.startswith(m + '/') for m in self.mounts):
+            return Decision(False, True, 'bind_mount')
         if root and rel == '' and PurePosixPath(root).name != PurePosixPath(self.home.lower()).name:
             return Decision(False, True, 'other_account')
         if rel in CLOUD or any(rel and rel.startswith(c + '/') for c in CLOUD):

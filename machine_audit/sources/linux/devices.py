@@ -3,13 +3,11 @@ paths and PCI addresses stay here; readings carry numbers and salted hashes."""
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
-import hmac
 import os
 import re
 
 from ..macos import error_status, field
-from .files import gap_status, keyed, optional, psi
+from .files import gap_status, keyed, optional, psi, salted
 
 # Columns of /proc/diskstats after major, minor and name (Documentation/admin-guide/iostats.rst).
 # Discard columns arrived in 4.18 and flush columns in 5.5; absent columns are not emitted.
@@ -39,21 +37,27 @@ def channels(directory, prefix):
 
 
 @dataclass(frozen=True)
-class Volume:
+class Mount:
     device: str
     mount: str
     filesystem: str
 
 
-def volumes(root):
-    """Local disk filesystems from mountinfo, once per device; bind mounts repeat a device."""
-    seen = set()
+def mounts(root):
+    """Every mountinfo line: major:minor, unescaped mount point and filesystem type."""
     for line in (root / 'proc/self/mountinfo').read_text().splitlines():
         left, _, right = line.partition(' - ')
-        f, filesystem = left.split(), right.split()[0]
-        if filesystem in FILESYSTEMS and f[2] not in seen:
-            seen.add(f[2])
-            yield Volume(f[2], re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), f[4]), filesystem)
+        f = left.split()
+        yield Mount(f[2], re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), f[4]), right.split()[0])
+
+
+def volumes(root):
+    """Local disk filesystems, once per device; a bind mount repeats a device."""
+    seen = set()
+    for mount in mounts(root):
+        if mount.filesystem in FILESYSTEMS and mount.device not in seen:
+            seen.add(mount.device)
+            yield mount
 
 
 class Devices:
@@ -61,7 +65,7 @@ class Devices:
         self.root, self.salt = root, salt
 
     def hashed(self, kind, text):
-        return kind + ':' + hmac.new(self.salt, text.encode(), hashlib.sha256).hexdigest()[:16]
+        return kind + ':' + salted(self.salt, text)
 
     def disks(self):
         disks = physical_disks(self.root)

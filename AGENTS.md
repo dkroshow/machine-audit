@@ -31,8 +31,9 @@ Command Line Tools to compile the native scanner.
 ## Conventions
 
 Runtime code has zero external dependencies: use the Python standard library
-and platform interfaces. Support is macOS only today; Linux sources are not
-implemented. Errors print codes, never exception text.
+and platform interfaces. macOS is supported today; Linux sources and scanner
+are built but not yet validated on a target ([Linux adapter](docs/linux-adapter.md)).
+Errors print codes, never exception text.
 
 [Privacy rules](docs/privacy.md) bind every new field and adapter. Read them
 before changing collection, storage, queries or exports. The scanner's private
