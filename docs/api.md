@@ -327,11 +327,25 @@ The dashboard asks for what each view renders:
 | View | Requests |
 | --- | --- |
 | Every view, once | `catalog` |
-| Overview, history | per card (CPU, Memory, Graphics, Storage, Network, Power, Heat, Monitoring cost): `series?brief=1` with that `component`, the first three host `signals` of that component in the catalog by source and name, and `limit=12`; the card shows each signal's newest of four bins. No coverage request: the overview renders none |
+| Overview, history | per card (CPU, Memory, Graphics, Storage, Network, Power, Heat, Monitoring cost): `series?brief=1` with that `component`, three host `signals` (below) and `limit=12`; the card shows each signal's newest of four bins, one per signal. No coverage request: the overview renders none |
 | Overview, live | `now?brief=1` |
 | A component, history | `series?component=…` (its coverage explains an empty view) and `who?component=…&signal=…`; `status` instead of `who` on Monitoring cost; the storage map on Storage |
 | A component, live | `now?component=…` |
 | Coverage | `coverage` and `status` |
+
+Each overview card asks for the first three of its preferred signals the catalog
+holds, then its other host signals by source and name (`cardPreferred` in
+`dashboard/model.mjs`; Linux names first, Mac names after):
+
+| Card | Preferred signals |
+| --- | --- |
+| CPU | `cpu.busy`, `cpu.load_1m`, `cpu.pressure.some`, `cpu.runnable`, `cpu.capacity` |
+| Memory | `memory.MemAvailable`, `memory.free_count`, `memory.pressure.some`, `memory.pressure_level`, `memory.SwapFree`, `memory.swap_used` |
+| Storage | `disk.read`, `disk.write`, `io.pressure.some`, `disk.read_latency` |
+| Network | `network.receive`, `network.send`, `network.ping_rtt` |
+| Power | `power.watts`, `power.average`, `power.input`, `power.supply`, `power.mains_online`, `power.battery_capacity`, `power.battery_present` |
+| Heat | `heat.temperature`, `heat.thermal_pressure`, `heat.zone_temperature`, `heat.fan_rpm`, `heat.cpu_speed_limit` |
+| Monitoring cost | `self.cpu`, `self.memory`, `self.storage` |
 
 At most three requests run at once, so one server slot stays free for other
 clients.

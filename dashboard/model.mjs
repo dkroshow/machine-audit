@@ -77,13 +77,25 @@ export function time(ns, full=false) {
   if (!finite(ns)) return 'Unknown time';
   return new Date(ns / 1e6).toLocaleString(undefined, full ? {dateStyle:'medium',timeStyle:'medium'} : {hour:'2-digit',minute:'2-digit',second:'2-digit'});
 }
-// The host signals an overview card shows: the first `count` by source and name, as the
-// series answer orders its lanes. Workload scopes never chart (model.is_series).
+// What an overview card shows first, in order, where the catalog holds it. Names differ by
+// platform (Linux first, Mac after), so each list names both; absent ones are skipped.
+const cardPreferred = {
+  cpu: ['cpu.busy','cpu.load_1m','cpu.pressure.some','cpu.runnable','cpu.capacity'],
+  memory: ['memory.MemAvailable','memory.free_count','memory.pressure.some','memory.pressure_level','memory.SwapFree','memory.swap_used'],
+  storage: ['disk.read','disk.write','io.pressure.some','disk.read_latency'],
+  network: ['network.receive','network.send','network.ping_rtt'],
+  power: ['power.watts','power.average','power.input','power.supply','power.mains_online','power.battery_capacity','power.battery_present'],
+  heat: ['heat.temperature','heat.thermal_pressure','heat.zone_temperature','heat.fan_rpm','heat.cpu_speed_limit'],
+  self: ['self.cpu','self.memory','self.storage'],
+};
+// The host signals an overview card shows: its preferred ones the catalog holds, then the
+// rest by source and name. Workload scopes never chart (model.is_series).
 const workloadScopes = new Set(['process','unit','unit_detail']);
 export function cardSignals(signals=[], component, count=3) {
   const order = (a,b) => a.source<b.source ? -1 : a.source>b.source ? 1 : a.signal<b.signal ? -1 : a.signal>b.signal ? 1 : 0;
-  const host = signals.filter(s => s.component===component && (component==='self' || !workloadScopes.has(s.scope))).sort(order);
-  return [...new Set(host.map(s => s.signal))].slice(0,count);
+  const host = [...new Set(signals.filter(s => s.component===component && (component==='self' || !workloadScopes.has(s.scope))).sort(order).map(s => s.signal))];
+  const preferred = (cardPreferred[component] ?? []).filter(name => host.includes(name));
+  return [...new Set([...preferred, ...host])].slice(0,count);
 }
 // Workload evidence that ranks in `who`. Linux unit consumption has scope `unit`;
 // `unit_detail` (limits, breakdowns, pressure) describes a unit and does not rank.

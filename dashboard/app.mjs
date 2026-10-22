@@ -101,7 +101,9 @@ async function overview(params,abort,query) {
     if(!signals.length)return empty('No host or device measurements were returned for this interval.');
     // Four bins per signal, newest last; the card renders no coverage, so the brief shape.
     const answer=await query('series',{...params,component,signals:signals.join(','),limit:12,brief:1},abort);
-    const rows=seriesGroups(answer.rows ?? []).filter(g=>(component==='self' ? !g.entity?.startsWith('program:') : !g.entity?.startsWith('process:')) && !g.entity?.startsWith('cpu:')).slice(0,3);
+    // One group per chosen signal, in the card's order: two disks must not crowd out a write.
+    const groups=seriesGroups(answer.rows ?? []).filter(g=>(component==='self' ? !g.entity?.startsWith('program:') : !g.entity?.startsWith('process:')) && !g.entity?.startsWith('cpu:'));
+    const rows=signals.map(signal=>groups.find(g=>g.signal===signal)).filter(Boolean);
     return el('div',{},rows.length ? el('div',{class:'signal-list'},rows.map(g=>{const r=g.rows.at(-1);return metric(label(g.signal),format(rowValue(r),rowUnit(r)),r.status);})) : empty(answer.truncated ? 'No host or device measurements were returned in this partial sample.' : 'No host or device measurements were returned for this interval.'),
       answer.truncated ? el('p',{class:'note'},'Partial sample. Explore this component for more detail.') : null);
   },abort,publish)));

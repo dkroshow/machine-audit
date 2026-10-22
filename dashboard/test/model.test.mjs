@@ -162,10 +162,35 @@ test('who ranks Linux unit consumption but not unit detail',()=>{
   assert.ok(!ranksInWho({signal:'cpu.busy',scope:'host'}));
 });
 
-test('an overview card asks for its first three host signals in the order series lists lanes',()=>{
+test('without preferred names an overview card falls back to the order series lists lanes',()=>{
   // Byte order by source then name, as the server sorts lanes; workload scopes never chart.
   const host=(source,signal,scope='host')=>({source,signal,component:'cpu',scope});
   const signals=[host('b','cpu.a'),host('a','cpu.z'),host('a','process.cpu','process'),host('a','cpu.B','unit_detail'),
                  host('a','cpu.Y'),host('c','cpu.fan','fan'),{...host('a','memory.x'),component:'memory'}];
   assert.deepEqual(cardSignals(signals,'cpu'),['cpu.Y','cpu.z','cpu.a']);
+});
+
+test('overview cards pick the names a glance wants on Linux and on the Mac',()=>{
+  // Alphabetical picks showed Active_anon, Active_file and Buffers instead of MemAvailable.
+  const catalog=(source,component,names,scope='host')=>names.map(signal=>({source,signal,component,scope}));
+  const linux=[...catalog('linux.cpu','cpu',['cpu.blocked','cpu.busy','cpu.capacity','cpu.load_1m','cpu.pressure.some','cpu.user']),
+    ...catalog('linux.memory','memory',['memory.Active_anon','memory.Active_file','memory.Buffers','memory.MemAvailable','memory.SwapFree','memory.pressure.some']),
+    ...catalog('linux.disk','storage',['disk.read','disk.write','disk.busy_time','io.pressure.some'],'physical_disk'),
+    ...catalog('linux.network','network',['network.receive','network.receive_errors','network.send'],'interface'),
+    ...catalog('linux.temperatures','heat',['heat.temperature','heat.temperature_max'],'sensor'),
+    ...catalog('self.process','self',['self.build_version','self.cpu','self.flush_count','self.memory','self.storage','self.storage_warning'],'managed_process')];
+  const mac=[...catalog('macos.cpu','cpu',['cpu.busy','cpu.capacity','cpu.excess_runnable','cpu.idle','cpu.runnable']),
+    ...catalog('macos.memory','memory',['memory.active_count','memory.compressions','memory.free_count','memory.pressure_level','memory.swap_used']),
+    ...catalog('macos.disk','storage',['disk.pressure','disk.read','disk.read_latency','disk.write'],'physical_disk'),
+    ...catalog('macos.network','network',['network.connect','network.ping_rtt','network.receive','network.send'],'interface'),
+    ...catalog('macos.heat','heat',['heat.cpu_available_cpus','heat.fan_cadence','heat.temperature','heat.thermal_pressure'])];
+  const picks=(signals,components)=>Object.fromEntries(components.map(c=>[c,cardSignals(signals,c)]));
+  assert.deepEqual(picks(linux,['cpu','memory','storage','network','heat','self']),{
+    cpu:['cpu.busy','cpu.load_1m','cpu.pressure.some'],memory:['memory.MemAvailable','memory.pressure.some','memory.SwapFree'],
+    storage:['disk.read','disk.write','io.pressure.some'],network:['network.receive','network.send','network.receive_errors'],
+    heat:['heat.temperature','heat.temperature_max'],self:['self.cpu','self.memory','self.storage']});
+  assert.deepEqual(picks(mac,['cpu','memory','storage','network','heat']),{
+    cpu:['cpu.busy','cpu.runnable','cpu.capacity'],memory:['memory.free_count','memory.pressure_level','memory.swap_used'],
+    storage:['disk.read','disk.write','disk.read_latency'],network:['network.receive','network.send','network.ping_rtt'],
+    heat:['heat.temperature','heat.thermal_pressure','heat.cpu_available_cpus']});
 });
