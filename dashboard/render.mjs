@@ -1,4 +1,4 @@
-import {format,number,time,label,statusText,measured,rowValue,rowUnit,seriesGroups,chartRuns,finite} from './model.mjs';
+import {format,number,time,label,statusText,measured,rowValue,rowUnit,seriesGroups,chartRuns,finite,views} from './model.mjs';
 const NS='http://www.w3.org/2000/svg';
 export function el(tag, attrs={}, ...children) {
   const svg=['svg','path','line','rect','circle','text','title'].includes(tag);
@@ -68,6 +68,14 @@ export function signalCard(group, onAround) {
 export function signalsView(answer,onAround,filter=()=>true) {
   const groups=seriesGroups(answer?.rows ?? []).filter(filter);
   return groups.length ? el('div',{class:'grid'},groups.map(g=>signalCard(g,onAround))) : empty('No measurements were returned for this component. Check Coverage & status for source access and retained history.');
+}
+export function briefView(answer) {
+  const parts = Object.entries(answer?.components ?? {});
+  if (!parts.length) return empty('No live readings are available. Live requires a running collector with a recent-read cache. Stored history remains available.');
+  return el('div', {class:'grid'}, parts.map(([component, {top=[], host=[]}]) => card(views[component]?.title ?? label(component),
+    host.length ? el('div', {class:'signal-list'}, host.map(row => metric(label(row.signal), format(rowValue(row), rowUnit(row)), row.status))) : null,
+    top.length ? table(['Workload','Measurement','Latest pass'], top.map(row => [row.label ?? row.entity, label(row.signal), format(rowValue(row), rowUnit(row))]))
+      : el('p', {class:'note'}, 'No workload readings in the latest pass.'))));
 }
 export function liveView(answer, onAround) {
   if (!answer?.sources?.length) {

@@ -1,5 +1,5 @@
-import {views,label,time,format,readToken,makeApi,queryPool,tokenKey,componentEmptyState,seriesGroups,rowValue,rowUnit,statusText,ranksInWho} from './model.mjs';
-import {el,card,empty,metric,signalsView,liveView,whoView,coverageView,statusView,intervalEvidence} from './render.mjs';
+import {views,label,time,format,readToken,makeApi,queryPool,tokenKey,componentEmptyState,seriesGroups,rowValue,rowUnit,statusText,ranksInWho,cardSignals} from './model.mjs';
+import {el,card,empty,metric,signalsView,liveView,briefView,whoView,coverageView,statusView,intervalEvidence} from './render.mjs';
 import {storageView} from './storage.mjs';
 const $=id=>document.getElementById(id);
 let api=makeApi(readToken(window.location,window.history) ?? sessionStorage.getItem(tokenKey));
@@ -95,10 +95,12 @@ async function overview(params,abort,query) {
   });
   root.append(grid);
   const publish=()=>{if(!root.isConnected)paint(root);};
-  // Eight component allowances still total 600 rows.
+  // Each card asks only for the three host signals it shows (docs/api.md, dashboard requests).
   await Promise.all(keys.map((key,index)=>fill(bodies[index],async()=>{
-    const spec=views[key],component=spec.component ?? key;
-    const answer=await query('series',{...params,component,limit:75},abort);
+    const spec=views[key],component=spec.component ?? key,signals=cardSignals(state.catalog.signals,component);
+    if(!signals.length)return empty('No host or device measurements were returned for this interval.');
+    // Four bins per signal, newest last; the card renders no coverage, so the brief shape.
+    const answer=await query('series',{...params,component,signals:signals.join(','),limit:12,brief:1},abort);
     const rows=seriesGroups(answer.rows ?? []).filter(g=>(component==='self' ? !g.entity?.startsWith('program:') : !g.entity?.startsWith('process:')) && !g.entity?.startsWith('cpu:')).slice(0,3);
     return el('div',{},rows.length ? el('div',{class:'signal-list'},rows.map(g=>{const r=g.rows.at(-1);return metric(label(g.signal),format(rowValue(r),rowUnit(r)),r.status);})) : empty(answer.truncated ? 'No host or device measurements were returned in this partial sample.' : 'No host or device measurements were returned for this interval.'),
       answer.truncated ? el('p',{class:'note'},'Partial sample. Explore this component for more detail.') : null);
@@ -148,9 +150,10 @@ async function load(immediate=false) {
       if(controller.signal.aborted)return;
       answer=coverage;paint(statusView(status),card('Interval coverage',coverageView(coverage)));
     } else if(state.mode==='live') {
-      answer=await query('now',{component},controller.signal);
+      // The overview shows each component's top workloads and host totals: the brief shape.
+      answer=await query('now',component ? {component} : {brief:1},controller.signal);
       if(controller.signal.aborted)return;
-      paint(spec.note ? el('p',{class:'intro'},spec.note):el('p',{class:'intro'},'Recent source readings, with their actual observation times.'),liveView(answer,at=>around(at,component)));
+      paint(spec.note ? el('p',{class:'intro'},spec.note):el('p',{class:'intro'},'Recent source readings, with their actual observation times.'),component ? liveView(answer,at=>around(at,component)) : briefView(answer));
     } else if(state.view==='overview') {
       await overview(params,controller.signal,query);
     } else {

@@ -102,15 +102,16 @@ latest is a Record dictionary with bounded fields and an explicit field_count;
 raw trail is empty, while trail_rows carries bounded derived history. `who` returns ranked program
 rows (label, instance_count, total, covered_s, mean_rate, peak_rate and coverage)
 for additive fields; overlapping memory remains separate instance rows.
-`brief=1` (on `now` and `who` only; any other value or route is refused) returns a
-shape of a few kilobytes. Brief `who` keeps the top five rows and the answer's
+`brief=1` (on `now`, `who` and `series` only; any other value or route is refused)
+returns a shape of a few kilobytes. Brief `series` keeps its rows and reduces
+coverage as below. Brief `who` keeps the top five rows and the answer's
 totals: `total_rows`, `totals_complete`, `accounting`, `covered`, `resolution`.
 Brief `now` gives, for each component with a workload total (cpu, memory,
 storage), `components[c].top`: the five largest workloads by that total, chosen
 as `who` chooses them, and `components[c].host`: the host totals beside it
 (`cpu.busy`, `cpu.capacity`; `disk.read`, `disk.write`; installed, available and
 swap memory, by platform). Rows keep `source`, `signal`, `entity`, `label`,
-`unit`, `rate_unit`, `status` and their measures (`value`, `mean`, `mean_rate`,
+`kind`, `unit`, `rate_unit`, `status` and their measures (`value`, `mean`, `mean_rate`,
 `total`, `peak_rate`). Coverage keeps only per-source status counts and
 `gap_count`; there are no gap rows and no per-lane rows.
 `around` returns nested series/who/coverage plus events. `/api/status` reports
@@ -312,6 +313,28 @@ merges the summary rows that end in it the way hour rows merge minutes (totals
 add, peaks keep their original values and times). So a series answer has at most
 `limit` rows. Bin rows name their edges in `bucket_start_ns`/`bucket_end_ns` and
 omit stored-bucket identities, merge state and `who` grouping fields.
+
+A series with neither `component` nor `signals` is bounded, for agents that ask
+for "the machine". Before reading any row it chooses, from the signal catalog,
+each component's host totals (the brief set above) or else its first two host
+signals by source and name, and names them in `selected_signals`. Its resolution
+then follows from `limit // len(selected_signals)` rows per signal, so an hour
+reads 15-minute rows at the default limit. It costs about one component's
+series; ask with `component` or `signals` for the rest.
+
+The dashboard asks for what each view renders:
+
+| View | Requests |
+| --- | --- |
+| Every view, once | `catalog` |
+| Overview, history | per card (CPU, Memory, Graphics, Storage, Network, Power, Heat, Monitoring cost): `series?brief=1` with that `component`, the first three host `signals` of that component in the catalog by source and name, and `limit=12`; the card shows each signal's newest of four bins. No coverage request: the overview renders none |
+| Overview, live | `now?brief=1` |
+| A component, history | `series?component=…` (its coverage explains an empty view) and `who?component=…&signal=…`; `status` instead of `who` on Monitoring cost; the storage map on Storage |
+| A component, live | `now?component=…` |
+| Coverage | `coverage` and `status` |
+
+At most three requests run at once, so one server slot stays free for other
+clients.
 
 Answers of an hour or more come from summaries. The unsaved tail (at most the
 minute since the last save) is decoded only when no save covers the window yet,
