@@ -63,6 +63,13 @@ request, exact allowed Host, and an allowed Origin if present. Dashboard loads
 `/#token=<token>`, retains the token in memory and erases the fragment. Never
 put tokens in query strings or browser storage. No API CORS wildcard.
 
+The server runs at most 4 API queries at once. When no slot is free, a request
+waits up to 2 seconds. At most 4 requests may wait; further requests receive
+HTTP 503 immediately. A wait that expires also returns HTTP 503. The body is
+`{"error":"query_capacity"}`. Clients should retry this error with backoff.
+The dashboard waits 0.5, 1, then 2 seconds, making at most 4 attempts in total;
+it does not retry other HTTP errors.
+
 GET routes: `/api/now`, `/api/catalog`, `/api/series`, `/api/who`,
 `/api/around`, `/api/coverage`, `/api/storage`, `/api/status`.
 Common parameters: `component`, comma-separated `signals`, `start` and `end`
@@ -77,7 +84,16 @@ Every answer has `schema_version: 1`, `shape`, `status`, and `coverage`.
 Intervals have `requested: {start_ns,end_ns}`, `covered`, `resolution`, `rows`,
 `gaps`, `truncated`, `next_start_ns` when paging. A field missing read after read
 is one gap row spanning those reads, with `entity` and a `reads` count; a good
-read of it ends the row. Rows carry `start_ns`, `end_ns`,
+read of it ends the row. Coverage `gaps` also contains per-source rows alongside
+collector gaps. These rows have exactly `source`, `status`, `reason`, `start_ns`,
+`end_ns`, and `reads`. They appear when a source reading overlaps the requested
+window, has no fields, and has a status outside the good set (`observed`,
+`measured_zero`). Consecutive readings of that source in the same collector run
+with the same status and reason merge into one row; `reads` counts them. A later
+good reading or a reading with fields ends the row. The bounds are clipped to
+the requested window. `reason` is a [reason code](#source-input).
+
+Rows carry `start_ns`, `end_ns`,
 `signal`, `entity`, `label`, `scope`, `unit`, `kind`, `status`, plus aggregate
 fields (`total`, `covered_s`, `mean`, `min`, `max`, `max_ns`, `last`, `count`,
 `peak_rate`, `peak_ns`, `above_s`, `histogram_s` as appropriate).
