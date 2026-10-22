@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Machine-audit</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.mjs"></script>
+</head>
+<body>
+<a class="skip" href="#content">Skip to measurements</a>
+<div class="shell">
+  <aside class="side" aria-label="Navigation">
+    <a class="brand" href="#overview"><span class="brand-mark" aria-hidden="true">m</span>Machine-audit</a>
+    <p class="nav-label">Your machine</p>
+    <nav id="navigation" aria-label="Views">
+      <a href="#overview" data-view="overview">Overview</a>
+      <a href="#cpu" data-view="cpu">CPU</a>
+      <a href="#memory" data-view="memory">Memory</a>
+      <a href="#gpu" data-view="gpu">Graphics</a>
+      <a href="#storage" data-view="storage">Storage</a>
+      <a href="#network" data-view="network">Network</a>
+      <a href="#power" data-view="power">Power</a>
+      <a href="#heat" data-view="heat">Heat</a>
+      <span class="nav-label">The monitor</span>
+      <a href="#cost" data-view="cost" class="cost-link">Monitoring cost</a>
+      <a href="#coverage" data-view="coverage">Coverage &amp; status</a>
+    </nav>
+    <div class="side-foot"><p>Measurements, with their limits.</p><label>Appearance <select id="theme"><option value="auto">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label><p id="connection">Waiting for connection</p></div>
+  </aside>
+  <main id="content" tabindex="-1">
+    <header class="page-head"><div><p class="eyebrow" id="view-context">MACHINE EVIDENCE</p><h1 id="view-title">Overview</h1><p id="view-description" class="sub"></p></div><button id="refresh" type="button">Refresh</button></header>
+    <form id="interval" class="interval" aria-label="Time interval">
+      <div class="mode" role="group" aria-label="Time mode"><button type="button" id="history-mode" aria-pressed="true">History</button><button type="button" id="live-mode" aria-pressed="false">Live</button></div>
+      <label>Show <select id="span"><option value="300">Last 5 minutes</option><option value="3600" selected>Last hour</option><option value="86400">Last 24 hours</option><option value="604800">Last 7 days</option><option value="custom">Custom interval</option></select></label>
+      <div id="custom-range" class="custom-range" hidden><label>From <input id="from" type="datetime-local" step="1"></label><label>To <input id="to" type="datetime-local" step="1"></label><button type="submit">Apply</button></div>
+      <span id="interval-caption" class="sub"></span>
+    </form>
+    <div id="notice" class="notice" role="status" hidden></div>
+    <div id="error" class="error" role="alert" hidden></div>
+    <div id="view" aria-live="polite"><p class="empty">Connecting to your measurements…</p></div>
+    <footer id="evidence-footer"></footer>
+  </main>
+</div>
+<dialog id="around-dialog" aria-labelledby="around-title"><div class="dialog-head"><h2 id="around-title">Around this moment</h2><button id="close-around" type="button">Close</button></div><div id="around-content"></div></dialog>
+</body>
+</html>

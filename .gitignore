@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.project/
+.env
+.env.*
+*.sqlite
+*.sqlite-*
+api.token
+mcp.json
+.claude/settings.local.json
+CLAUDE.local.md
+AGENTS.override.md
