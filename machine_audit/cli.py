@@ -96,8 +96,8 @@ def _run(config,ready):
         for sig in (signal.SIGINT,signal.SIGTERM):
             signal.signal(sig,lambda *_:collector.stop_event.set())
         clean=collector.run()
-        if collector.stop_code=="stop_unsaved_budget":
-            print("Collector stopped within the storage limit; unsaved readings are kept for the next start.",file=sys.stderr)
+        if collector.stop_code in ("stop_unsaved_budget","stop_unsaved_deadline"):
+            print("Collector stopped; unsaved readings are kept for the next start ("+collector.stop_code+").",file=sys.stderr)
         elif not clean:print("Collector stopped before all pending evidence was saved.",file=sys.stderr)
         return (0 if clean else 2),collector.stop_code
     finally:

@@ -67,6 +67,9 @@ class _Pending:
 
 # Save errors that mean the budget, not the store, refused the write.
 BUDGET_ERRORS = frozenset({"managed_storage_limit","sqlite_checkpoint_headroom","prune_precheck_limit","free_space_margin","sqlite_full"})
+# The part of a stop's deadline kept for writing the spill file once the final
+# save gives up. A spill writes packed bytes; merging is what takes time.
+SPILL_MARGIN_S = 2.0
 
 
 class Collector:
@@ -109,7 +112,7 @@ class Collector:
     def _save_error(exc):
         if isinstance(exc, sqlite3.Error):
             return getattr(exc,"sqlite_errorname","sqlite_storage_error").lower()
-        if isinstance(exc, (OSError, RuntimeError)) and str(exc) in {"managed_storage_limit","free_space_margin","checkpoint_pinned_by_reader","sqlite_checkpoint_headroom","prune_precheck_limit"}:
+        if isinstance(exc, (OSError, RuntimeError)) and str(exc) in {"managed_storage_limit","free_space_margin","checkpoint_pinned_by_reader","sqlite_checkpoint_headroom","prune_precheck_limit","stop_deadline"}:
             return str(exc)
         return type(exc).__name__
 
@@ -245,7 +248,7 @@ class Collector:
                 fields.append(Field("self."+key,value,"bytes" if key.endswith("bytes") else "seconds" if key.endswith("_s") else "operations","counter"))
         self.ingest(Reading("collector.health","self",now,now,tuple(fields)))
 
-    def flush(self, prunes=None):
+    def flush(self, prunes=None, deadline=None):
         """Drain the entry snapshot; keep later arrivals for the next flush."""
         with self._flush_lock:
             self._status_events()
@@ -271,7 +274,7 @@ class Collector:
                     self.tail_bytes=sum(size for _,size in self.tail)
                 try:
                     records=[Record.unpack(p.payload) for p,_ in batch]
-                    self.store.append(records,commit_lock=self.lock,on_commit=committed,prunes=prunes)
+                    self.store.append(records,commit_lock=self.lock,on_commit=committed,prunes=prunes,deadline=deadline)
                 except Exception as exc:
                     with self.lock:
                         self.last_save_error = self._save_error(exc)
@@ -348,23 +351,25 @@ class Collector:
         release it after all old native reads and the writer have completed.
         """
         self.stop_event.set()
+        # The final saves give up in time to spill what they could not save.
+        deadline=time.monotonic()+timeout_s-SPILL_MARGIN_S
         with self.lock:
             if self._closer is None or (not self._closer.is_alive() and not self._close_result):
                 def finish():
                     try:
                         # Final saves do not prune: pruning to make room can outlast
                         # any stop deadline. What does not fit is spilled below.
-                        saved=self.flush(prunes=0)
+                        saved=self.flush(prunes=0,deadline=deadline)
                         for thread in self.threads:thread.join()
                         # An in-flight read can finish during the first save or
                         # the joins. Preserve its completion before clean stop.
-                        if self.tail:saved=self.flush(prunes=0)
-                        while saved and self.tail:saved=self.flush(prunes=0)
-                        if self._started and saved:self.store.stop_run(self.run_id,self.clock().wall_ns,prunes=0)
+                        if self.tail:saved=self.flush(prunes=0,deadline=deadline)
+                        while saved and self.tail:saved=self.flush(prunes=0,deadline=deadline)
+                        if self._started and saved:self.store.stop_run(self.run_id,self.clock().wall_ns,prunes=0,deadline=deadline)
                     except Exception as exc:
                         self.last_save_error=self._save_error(exc);saved=False
-                    if self._started and not saved and self.last_save_error in BUDGET_ERRORS:
-                        saved=self._spill()
+                    if self._started and not saved and self.last_save_error in BUDGET_ERRORS|{"stop_deadline"}:
+                        saved=self._spill("stop_unsaved_deadline" if self.last_save_error=="stop_deadline" else "stop_unsaved_budget")
                     with self.lock:
                         self._close_result=saved
                         if saved and self._instance_fd is not None:
@@ -376,9 +381,9 @@ class Collector:
         closer.join(max(0,timeout_s))
         return not closer.is_alive() and self._close_result
 
-    def _spill(self):
-        """The budget refused the final save: keep the unsaved readings and the held
-        minute for the next start, which saves them under this run."""
+    def _spill(self,code):
+        """The budget refused the final save, or it ran out of time: keep the unsaved
+        readings and the held minute for the next start, which saves them under this run."""
         with self.lock:
             payloads=[pending.payload for pending,_ in self.tail]
         try:
@@ -386,5 +391,5 @@ class Collector:
         except Exception as exc:
             self.last_save_error=self._save_error(exc);self.stop_code="stop_unsaved_lost"
             return False
-        self.stop_code="stop_unsaved_budget"
+        self.stop_code=code
         return True

@@ -90,11 +90,14 @@ This preserves the deadline without claiming the blocked measurement completed.
 Final saves do not prune: at the storage limit, pruning until a save fits can
 outlast any stop deadline. A final save is checked against the limit before it
 merges its summary rows (about 15 s at 2,000 processes), so a refusal is quick.
-If the limit refuses a final save, the collector
+The final saves also give up 2 s before the stop deadline (`close()`, 10 s by
+default): merging a 2,000-process save takes about 15 s. If the limit refuses
+a final save, or it runs out of time, the collector
 writes the unsaved readings and the held minute to its own private spill file
 in the data directory (`unsaved-<run>-<time>.json`, mode 0600, created
 exclusively within the budget, never replacing an earlier one). It then stops
-cleanly and records `stop_unsaved_budget` in `startup.json`. The next start
+cleanly and records `stop_unsaved_budget` or `stop_unsaved_deadline` in
+`startup.json`. The next start
 saves each spill file under its original run, with ordinary pruning, records
 that run's stop, and removes the file; readings already saved are not saved
 twice. If that fails, the file stays for a later start and collection still

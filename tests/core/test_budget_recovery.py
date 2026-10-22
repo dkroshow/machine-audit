@@ -8,6 +8,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+import machine_audit.store
 from machine_audit.budget import Budget, BudgetExceeded
 from machine_audit.collector import Collector
 from machine_audit.model import Clock, Field, Reading, Record
@@ -193,6 +194,41 @@ class BudgetRecoveryTests(unittest.TestCase):
                     "SELECT entity,payload FROM summaries WHERE run_id='first' AND resolution='minute' AND bucket_ns=? AND entity LIKE 'process:%'",(60*10**9,))}
                 self.assertEqual(held,{'process:1':[39],'process:2':[39]})  # the whole held minute, 61-99 s
                 self.assertTrue(third.close())
+            finally:store.close()
+
+    def test_a_final_save_slower_than_the_stop_deadline_spills_and_stops_clean(self):
+        # Big Mac merges a final save for about 15 s against a 10 s stop deadline, so
+        # ordinary stops ended unclean. The save now gives up in time and spills.
+        scratch=Path(__file__).parent/'.tmp';scratch.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as root:
+            store=Store(Path(root)/'readings.sqlite',Budget(root,free_margin_bytes=0))
+            def reads(collector,first,last):
+                for t in range(first,last):
+                    clock=Clock(t*10**9,t*10**9,t*10**9)
+                    collector.ingest(Reading('synthetic.process','cpu',clock,clock,tuple(
+                        Field('process.cpu',float(t*pid),'seconds','counter',entity=f'process:{pid}',label=f'p{pid}',scope='process',additive=True)
+                        for pid in range(1,6))))
+            def saved():
+                return (store.db.execute('SELECT run_id,sequence,payload FROM readings ORDER BY run_id,sequence').fetchall(),
+                        store.db.execute('SELECT run_id,resolution,bucket_ns,entity,payload FROM summaries ORDER BY 1,2,3,4').fetchall())
+            try:
+                # Each step that grows with the process count, made slower than the deadline.
+                for name in ('merge_summaries','unpack_summaries','pack_summaries'):
+                    with self.subTest(name):
+                        slow=Collector(store,(),run_id=f'slow-{name}',boot_id='boot');slow.start()
+                        reads(slow,0,70);self.assertTrue(slow.flush());reads(slow,70,100)
+                        def delayed(*args,real=getattr(machine_audit.store,name)):
+                            time.sleep(0.2);return real(*args)
+                        before=saved();began=time.monotonic()
+                        with patch(f'machine_audit.store.{name}',delayed):
+                            self.assertTrue(slow.close(timeout_s=3))
+                        self.assertLess(time.monotonic()-began,3)
+                        self.assertEqual((slow.stop_code,saved()),('stop_unsaved_deadline',before))
+                        self.assertEqual(len(list(Path(root).glob(f'unsaved-slow-{name}-*.json'))),1)
+                        after=Collector(store,(),run_id=f'after-{name}',boot_id='boot');after.start()
+                        self.assertEqual(list(Path(root).glob('unsaved-*')),[])
+                        self.assertEqual(store.db.execute("SELECT last_sequence FROM runs WHERE run_id=? AND stopped_ns IS NOT NULL",(f'slow-{name}',)).fetchone()[0],slow.sequence)
+                        self.assertTrue(after.close())
             finally:store.close()
 
     def test_largest_prune_batches_stay_inside_declared_wal_pages(self):

@@ -101,8 +101,17 @@ def top_consumers(rows):
     return keep
 
 
-def held_rows(held):
-    return [row for payload in held["rows"].values() for row in unpack_summaries(payload)]
+def on_time(deadline):
+    """A stopping save gives up once its deadline passes; the stop then spills."""
+    if deadline is not None and time.monotonic()>=deadline:raise TimeoutError("stop_deadline")
+
+
+def held_rows(held,deadline=None):
+    rows=[]
+    for payload in held["rows"].values():
+        on_time(deadline)
+        rows.extend(unpack_summaries(payload))
+    return rows
 
 
 def unpack_summaries(payload):
@@ -164,30 +173,45 @@ class Store:
                     self.db.execute("INSERT INTO runs(run_id,boot_id,started_ns) VALUES(?,?,?)", (run_id, boot_id, started_ns))
             self._pruning_until_admitted(write)
 
-    def stop_run(self, run_id, stopped_ns, prunes=None):
+    def stop_run(self, run_id, stopped_ns, prunes=None, deadline=None):
         """Mark the run stopped and save its held minute, which is now complete."""
         with self._mutex:
+            on_time(deadline)
             prepared=[]
             held=self._held if self._held is not None and self._held["run_id"]==run_id else None
             if held:
-                rows=held_rows(held)
+                rows=held_rows(held,deadline)
                 keep=top_consumers(rows)|held["own"]
                 groups=defaultdict(list)
                 for row in rows:
                     if row["entity"] in keep:groups[(row["source"],row["component"],row["entity"])].append(row)
-                prepared=[(run_id,held["lower"],held["upper"],"minute",held["bucket"],*key,pack_summaries(group)) for key,group in groups.items()]
+                for key,group in groups.items():
+                    on_time(deadline)
+                    prepared.append((run_id,held["lower"],held["upper"],"minute",held["bucket"],*key,pack_summaries(group)))
             def write():
                 with self.budget.sqlite_write(self.db,self.path,rows=1+len(prepared),payload_bytes=sum(len(row[-1]) for row in prepared)):
                     self.db.execute("BEGIN IMMEDIATE")
                     try:
+                        self._interrupt_at(deadline)
                         self.db.executemany(UPSERT_SUMMARY,prepared)
                         self.db.execute("UPDATE runs SET stopped_ns=? WHERE run_id=?", (stopped_ns,run_id))
                         self.db.execute("COMMIT")
-                    except BaseException:
-                        if self.db.in_transaction:self.db.execute("ROLLBACK")
+                    except BaseException as exc:
+                        self._rollback(exc,deadline)
                         raise
+                    finally:
+                        self.db.set_progress_handler(None,0)
             self._pruning_until_admitted(write,prunes)
             if held:self._held=None
+
+    def _interrupt_at(self,deadline):
+        """Interrupt SQLite work that would outlast a stopping save's deadline."""
+        if deadline is not None:self.db.set_progress_handler(lambda:time.monotonic()>=deadline,1000)
+
+    def _rollback(self,exc,deadline):
+        self.db.set_progress_handler(None,0)
+        if self.db.in_transaction:self.db.execute("ROLLBACK")
+        if isinstance(exc,sqlite3.OperationalError):on_time(deadline)
 
     def _pruning_until_admitted(self,write,prunes=None):
         """Run a write, pruning the oldest history between attempts until it fits,
@@ -254,9 +278,10 @@ class Store:
                 result[source] = Record.unpack(row[0])
         return result
 
-    def append(self, records: list[Record], *, commit_lock=None, on_commit=None, prunes=None):
+    def append(self, records: list[Record], *, commit_lock=None, on_commit=None, prunes=None, deadline=None):
         """Save records. `prunes` bounds the pruning a stopping save may do; it then
-        skips proactive pruning as well."""
+        skips proactive pruning as well. A save still unfinished at `deadline`
+        raises TimeoutError("stop_deadline") and saves nothing."""
         if not records:
             return
         with self._mutex:
@@ -277,24 +302,26 @@ class Store:
                     coarser[("15-minute",bucket//QUARTER*QUARTER,row["source"],row["component"],row["entity"],row["signal"],row["unit"],row["scope"],row["kind"],row["scale"])].append(row)
                 coarser[("hour",bucket//HOUR*HOUR,row["source"],row["component"],row["entity"],row["signal"],row["unit"],row["scope"],row["kind"],row["scale"])].append(row)
             for key,rows in coarser.items():
+                on_time(deadline)
                 summaries[key[:5]].append(merge_summaries(rows) if len(rows)>1 else rows[0])
             if prunes is None:self.maintain()
-            held,lowers=self._top_minutes(records,minutes,own,summaries)
+            held,lowers=self._top_minutes(records,minutes,own,summaries,deadline)
+            on_time(deadline)
             if prunes==0:
                 # A stopping save the limit refuses before merging fails now, not after
                 # merging every row: its full reservation is larger still.
                 _,count,payload=self._bound(records,raw,summaries)
                 with self.budget.sqlite_write(self.db,self.path,rows=count,payload_bytes=payload):pass
             # Prepare once: a save that must prune to fit repeats only admission and commit.
-            batch=self._prepare(records,raw,summaries,lowers)
-            self._pruning_until_admitted(lambda:self._write(records,raw,batch,commit_lock,on_commit),prunes)
+            batch=self._prepare(records,raw,summaries,lowers,deadline)
+            self._pruning_until_admitted(lambda:self._write(records,raw,batch,commit_lock,on_commit,deadline),prunes)
             self._held=held
 
     @staticmethod
     def _capacity_error(exc):
         return getattr(exc,"sqlite_errorcode",None)==sqlite3.SQLITE_FULL or str(exc) in {"managed_storage_limit","sqlite_checkpoint_headroom"}
 
-    def _top_minutes(self,records,minutes,own,summaries):
+    def _top_minutes(self,records,minutes,own,summaries,deadline=None):
         """Add each complete minute's top consumers to summaries; return the minute to hold.
 
         Saves are not aligned with minutes. The run's newest minute is held here,
@@ -312,14 +339,18 @@ class Store:
             if bucket==newest and bucket not in minutes:continue  # only older data arrived
             rows=minutes.get(bucket,[]);mine=own;lower=first.sequence
             if held and held["bucket"]==bucket:
-                rows=held_rows(held)+rows;mine=own|held["own"];lower=held["lower"]
+                rows=held_rows(held,deadline)+rows;mine=own|held["own"];lower=held["lower"]
             if bucket==newest:
                 groups=defaultdict(dict)
                 for row in rows:
+                    on_time(deadline)
                     group=groups[(row["source"],row["component"],row["entity"])];k=signal_key(row)
                     group[k]=merge_summaries([group[k],row]) if k in group else row
-                held=dict(run_id=first.run_id,bucket=bucket,own=mine,lower=lower,upper=last.sequence,
-                          rows={key:pack_summaries(list(group.values())) for key,group in groups.items()})
+                packed={}
+                for key,group in groups.items():
+                    on_time(deadline)
+                    packed[key]=pack_summaries(list(group.values()))
+                held=dict(run_id=first.run_id,bucket=bucket,own=mine,lower=lower,upper=last.sequence,rows=packed)
                 continue
             keep={entity for entity, in self.db.execute("""SELECT entity FROM summaries WHERE run_id=? AND resolution='minute'
                 AND bucket_ns=? AND component!='self' AND (entity LIKE 'process:%' OR entity LIKE 'program:%')""",(first.run_id,bucket))}
@@ -338,12 +369,13 @@ class Store:
         count=2+len(records)+3*components+len(summaries)+len(catalog)+len({r.reading.source for r in records})+sum(any(f.kind=='event' for f in r.reading.fields) for r in records)
         return catalog,count,3*sum(len(p) for _,p in raw)
 
-    def _prepare(self,records,raw,summaries,lowers):
+    def _prepare(self,records,raw,summaries,lowers,deadline=None):
         """Merge each summary row with its saved row and count the write's bound."""
         first,last=records[0],records[-1]
         catalog,count,payload=self._bound(records,raw,summaries)
         prepared=[];replaced_payload=0
         for (resolution,bucket,source,component,entity),rows in summaries.items():
+            on_time(deadline)
             lower=lowers.get((resolution,bucket,source,component,entity),first.sequence)
             old=self.db.execute("SELECT sequence_min,payload FROM summaries WHERE run_id=? AND resolution=? AND bucket_ns=? AND source=? AND component=? AND entity=?",(first.run_id,resolution,bucket,source,component,entity)).fetchone()
             if old:replaced_payload+=len(old[1])
@@ -359,11 +391,12 @@ class Store:
         payload+=sum(len(row[-1]) for row in prepared)+replaced_payload
         return prepared,catalog,count,payload
 
-    def _write(self,records,raw,batch,commit_lock,on_commit):
+    def _write(self,records,raw,batch,commit_lock,on_commit,deadline=None):
         prepared,catalog,count,payload=batch
         with self.budget.sqlite_write(self.db,self.path,rows=count,payload_bytes=payload):
             self.db.execute("BEGIN IMMEDIATE")
             try:
+                self._interrupt_at(deadline)
                 first, last = records[0], records[-1]
                 self.db.execute("INSERT OR IGNORE INTO runs(run_id,boot_id,started_ns) VALUES(?,?,?)", (first.run_id,first.boot_id,first.reading.start.wall_ns))
                 saved, boot = self.db.execute("SELECT last_sequence,boot_id FROM runs WHERE run_id=?",(first.run_id,)).fetchone()
@@ -399,9 +432,11 @@ class Store:
                 with commit_lock if commit_lock is not None else nullcontext():
                     self.db.execute("COMMIT")
                     if on_commit is not None:on_commit()
-            except BaseException:
-                if self.db.in_transaction:self.db.execute("ROLLBACK")
+            except BaseException as exc:
+                self._rollback(exc,deadline)
                 raise
+            finally:
+                self.db.set_progress_handler(None,0)
 
     def maintain(self, required_bytes=0):
         """Prune raw, then minute, 15-minute, hour and finally rare incident history.

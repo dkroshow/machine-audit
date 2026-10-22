@@ -14,7 +14,7 @@ SIZE = 4096
 STATES = {'prepared', 'starting', 'running', 'stopped', 'failed'}
 CODES = {'port_in_use', 'port_unavailable', 'budget_exhausted', 'permission_denied',
          'storage_failed', 'collector_busy', 'initialization_failed', 'shutdown_incomplete',
-         'stop_unsaved_budget', 'stop_unsaved_lost'}
+         'stop_unsaved_budget', 'stop_unsaved_deadline', 'stop_unsaved_lost'}
 
 
 def port_status(config):
