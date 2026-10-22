@@ -53,6 +53,29 @@ it before replacing the per-run token. Each source has one timer thread and no
 read queue. The writer, query server, source loops and dashboard all share the
 collector process. A blocked native call cannot be forcibly cancelled safely.
 
+A source's `read()` runs outside the collector lock in its own daemon thread;
+there is no shared worker pool or overlapping replacement read. The IOKit
+bindings use `ctypes.CDLL`, which releases the GIL during a native call, so a
+blocked GPU property read does not hold up unrelated source threads, flushing,
+or HTTP status requests. After ten cadences, status and saved state events mark
+that source `hung`; its missing measurements remain unobserved, not zero.
+
+This is thread isolation, not process isolation: a native extension that holds
+the GIL, a process crash, or shared driver/adapter locks can still affect other
+work (the SMC sources share an adapter lock). Source construction and boot/clock
+initialization also run synchronously before collection starts. HTTP has its
+own server and request threads, but storage contention can separately delay
+queries or the writer.
+
+Shutdown attempts to save completed buffered readings before joining source
+threads.
+`close()` returns failure after its deadline if a native read or the final
+write remains stuck; it neither cancels the call nor records a clean stop.
+The daemon finalizer retains the store and instance lock until old reads return
+and their final readings are saved, preventing an overlapping collector while
+that process remains alive; process exit abandons remaining daemon threads.
+This preserves the deadline without claiming the blocked measurement completed.
+
 | Transition | Action and visible evidence |
 | --- | --- |
 | source due → reading | Start one read; keep actual start/lateness |
@@ -62,6 +85,7 @@ collector process. A blocked native call cannot be forcibly cancelled safely.
 | pending batch → committed | Commit raw readings and rollups, then advance the watermark under the query lock |
 | save fails before commit | Keep the pending batch and watermark; retry at the next flush |
 | buffer high-water reached | Suspend new reads, preserve completed ones, expose skipped coverage and the suspension span |
+| stop requested with a read in flight | Save completed readings first, then wait for that read within the caller's close deadline |
 | clean stop | Save, write a stop marker, release the instance lock |
 | hung read or failed final save | Leave the run unclean; the next query shows the gap |
 

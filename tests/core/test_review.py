@@ -112,16 +112,31 @@ class ReviewTests(unittest.TestCase):
         class Source:
             name='slow';component='cpu';cadence_s=1
             def read(self):
-                entered.set();release.wait(2)
+                entered.set();release.wait(5)
                 c=Clock(1,1,1)
                 return Reading(self.name,self.component,c,c)
         collector=Collector(self.store,[Source()]);collector.start();self.assertTrue(entered.wait(1))
-        began=time.monotonic()
-        self.assertFalse(collector.close(timeout_s=.03))
-        self.assertLess(time.monotonic()-began,.2)
+        c=Clock(2,2,2)
+        collector.ingest(Reading('completed','cpu',c,c,(Field('cpu.ready',1,'count'),)))
+        saved=threading.Event();append=self.store.append
+        def observe_save(*args,**kwargs):
+            append(*args,**kwargs);saved.set()
         replacement=Collector(self.store)
-        with self.assertRaisesRegex(RuntimeError,'collector_already_running'):replacement.acquire()
-        release.set();self.assertTrue(collector.close(timeout_s=2))
+        try:
+            with patch.object(self.store,'append',side_effect=observe_save):
+                began=time.monotonic()
+                self.assertFalse(collector.close(timeout_s=.03))
+                self.assertLess(time.monotonic()-began,.2)
+                # A hung native read must not keep already-completed evidence
+                # solely in RAM when the caller's close deadline expires.
+                self.assertTrue(saved.wait(.5),'shutdown waited for the native read before saving')
+                with self.store.read() as db:
+                    self.assertEqual(db.execute("SELECT count(*) FROM readings WHERE source='completed'").fetchone()[0],1)
+                with self.assertRaisesRegex(RuntimeError,'collector_already_running'):replacement.acquire()
+        finally:
+            release.set();self.assertTrue(collector.close(timeout_s=2))
+        with self.store.read() as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM readings WHERE source='slow'").fetchone()[0],1)
         replacement.acquire();self.assertTrue(replacement.close())
 
     def test_field_contract_rejects_host_names_and_addresses_in_units_and_reasons(self):

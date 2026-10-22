@@ -245,6 +245,7 @@ class CoreTests(unittest.TestCase):
                 return reading(1,1,source="fast")
         collector=Collector(self.store,[Slow(),Fast()])
         collector.start()
+        server=server_thread=writer=None
         try:
             self.assertTrue(slow_entered.wait(2),"slow source never started")
             self.assertTrue(fast_progress.wait(2),"other source cannot progress while one is blocked")
@@ -254,8 +255,26 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(calls.count("slow"),1)
             self.assertGreater(calls.count("fast"),1)
             self.assertEqual(next(s for s in collector.source_status() if s["source"]=="slow")["status"],"hung")
+            saved=threading.Event();outcome=[]
+            def flush():
+                outcome.append(collector.flush());saved.set()
+            writer=threading.Thread(target=flush,daemon=True);writer.start()
+            self.assertTrue(saved.wait(2),'blocked native read stalled the writer')
+            self.assertEqual(outcome,[True])
+            with self.store.read() as db:
+                self.assertGreater(db.execute("SELECT count(*) FROM readings WHERE source='fast'").fetchone()[0],0)
+            token='synthetic-token-'+'x'*32
+            server=make_server(Query(self.store,collector),token,port=0)
+            server_thread=threading.Thread(target=server.serve_forever,daemon=True);server_thread.start()
+            request=Request(f'http://127.0.0.1:{server.server_port}/api/status',headers={'Authorization':'Bearer '+token})
+            with urlopen(request,timeout=2) as response:status=json.load(response)
+            self.assertEqual(next(s for s in status['collector']['sources'] if s['source']=='slow')['status'],'hung')
+            self.assertEqual(calls.count('slow'),1)
         finally:
-            gate.set();collector.close()
+            gate.set()
+            if writer:writer.join(2)
+            collector.close()
+            if server is not None:server.shutdown();server.server_close();server_thread.join(2)
 
     def test_per_entity_timing_uses_union_not_sum_or_envelope(self):
         records=[]

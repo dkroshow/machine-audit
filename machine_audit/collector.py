@@ -333,6 +333,7 @@ class Collector:
     def close(self, timeout_s=10):
         """One deadline covers every reader and the final write.
 
+        Save completed evidence before waiting for an uncancellable native call.
         A timed-out close leaves the instance lock held. The finalizer can only
         release it after all old native reads and the writer have completed.
         """
@@ -340,9 +341,12 @@ class Collector:
         with self.lock:
             if self._closer is None or (not self._closer.is_alive() and not self._close_result):
                 def finish():
-                    for thread in self.threads:thread.join()
                     try:
                         saved=self.flush()
+                        for thread in self.threads:thread.join()
+                        # An in-flight read can finish during the first save or
+                        # the joins. Preserve its completion before clean stop.
+                        if self.tail:saved=self.flush()
                         while saved and self.tail:saved=self.flush()
                         if self._started and saved:self.store.stop_run(self.run_id,self.clock().wall_ns)
                     except Exception as exc:
