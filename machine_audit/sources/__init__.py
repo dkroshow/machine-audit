@@ -31,6 +31,16 @@ def config_identity(config):
     return hashlib.sha256(json.dumps({'enabled':config.enabled,'source_options':config.source_options},sort_keys=True).encode()).hexdigest()
 
 
+def capacity_test(config,budget,clock,name):
+    if not config.enabled.get('network_speed',False):
+        return GapSource(name,'network',3600,'active_test_not_enabled')
+    from .speed import SpeedTest
+    speed=SpeedTest(budget,clock,seconds=int(config.source_options.get('network_speed_seconds',5)),
+                    run_bytes=int(config.source_options.get('network_speed_run_bytes',10_000_000)),
+                    daily_bytes=int(config.source_options.get('network_speed_daily_bytes',0)))
+    return ReadSource(name,'network',3600,speed.read,clock)
+
+
 def boot_id():
     if sys.platform != 'darwin':
         from .linux import boot_id
@@ -88,14 +98,7 @@ def _macos(config,budget,operations,scanner):
         GapSource('macos.system_process','cpu',60,'shipped_helper_required'),
         GapSource('macos.package_power','power',30,'shipped_helper_required'),
     ]
-    if config.enabled.get('network_speed',False):
-        from .speed import SpeedTest
-        speed=SpeedTest(budget,mac.clock,seconds=int(config.source_options.get('network_speed_seconds',5)),
-                        run_bytes=int(config.source_options.get('network_speed_run_bytes',10_000_000)),
-                        daily_bytes=int(config.source_options.get('network_speed_daily_bytes',0)))
-        sources.append(ReadSource('macos.capacity_test','network',3600,speed.read,mac.clock))
-    else:
-        sources.append(GapSource('macos.capacity_test','network',3600,'active_test_not_enabled'))
+    sources.append(capacity_test(config,budget,mac.clock,'macos.capacity_test'))
     if config.enabled.get('gpu',False):
         sources.extend([ReadSource('macos.gpu','gpu',5,device.gpu,mac.clock),
                         ReadSource('macos.gpu_clients','gpu',10,device.clients,mac.clock)])

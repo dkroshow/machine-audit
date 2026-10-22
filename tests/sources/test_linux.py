@@ -3,6 +3,7 @@ Formats follow proc(5) and the cgroup v2 documentation; captured bundles replace
 import os
 from pathlib import Path
 import re
+import shutil
 import tempfile
 import unittest
 
@@ -11,7 +12,9 @@ from machine_audit.config import Config
 from machine_audit.derive import points
 from machine_audit.model import Clock, Field, Reading, Record
 from machine_audit.sources.linux import sources
+from machine_audit.sources.linux.devices import Devices
 from machine_audit.sources.linux.host import LinuxHost
+from machine_audit.sources.linux.network import LinuxNetwork, TcpProber
 from machine_audit.sources.macos import ReadSource
 from machine_audit.sources.self_cost import ManagedProcesses, SelfCost
 
@@ -129,16 +132,78 @@ class LinuxSourceTests(unittest.TestCase):
         self.assertEqual(busy(first, list(self.host.cpu())), 10 + 1 + 5 + 2 + 3)
         self.assertEqual(busy(mac(100, 50, 900, 4), mac(110, 55, 1000, 5)), 10 + 5 + 1)
 
-    def test_linux_factory_covers_every_component_with_readings_or_named_gaps(self):
+    def test_unit_limit_max_means_no_limit_not_a_number(self):
+        limits = list(self.host.unit_limits())
+        ssh = by_name(f for f in limits if f.label == 'ssh.service')
+        worker = by_name(f for f in limits if f.label == 'worker.service')
+        self.assertEqual((ssh['unit.memory.max'].value, ssh['unit.memory.max'].status), (None, 'not_enabled'))
+        self.assertEqual((ssh['unit.cpu.max.quota'].status, ssh['unit.cpu.max.period'].value), ('not_enabled', 100000))
+        self.assertEqual((worker['unit.memory.max'].value, worker['unit.cpu.max.quota'].value), (1073741824, 50000))
+
+    def test_disks_are_whole_physical_devices_and_unit_io_counts_a_request_once(self):
+        # A request through LVM appears on dm-0 and on the nvme disk beneath it.
+        disks = list(Devices(self.root, b'0' * 64).disks())
+        self.assertEqual({f.entity for f in disks if f.name == 'disk.read'}, {'disk:259:0', 'disk:259:3'})
+        first = by_name(disks, 'disk:259:0')
+        self.assertEqual(first['disk.read'].value, 80000 * 512)  # diskstats sectors are 512 bytes
+        self.assertEqual((first['disk.flush_operations'].value, first['disk.in_progress'].kind), (9, 'gauge'))
+        self.assertEqual(by_name(disks)['io.pressure.full'].value, 41000)
+        ssh = by_name(f for f in self.host.workloads() if f.label == 'ssh.service')
+        self.assertEqual((ssh['unit.io.stat.rbytes'].value, ssh['unit.io.pressure.some'].component), (4096, 'storage'))
+
+    def test_interfaces_are_indexes_down_links_are_states_and_addresses_stay_private(self):
+        network = LinuxNetwork(self.root, Clock.now, b'0' * 64, icmp=False)
+        fields = list(network.interfaces()) + list(network.wifi())
+        self.assertEqual({f.entity for f in fields if f.name == 'network.receive'},
+                         {'interface:2', 'interface:3', 'interface:4', 'interface:5'})  # loopback skipped
+        down = by_name(fields, 'interface:3')
+        self.assertEqual((down['network.link_state'].value, down['network.link_state'].status), ('down', 'observed'))
+        self.assertEqual(down['network.link_speed'].status, 'unavailable')
+        self.assertEqual(by_name(fields)['network.tcp.RetransSegs'].value, 25)
+        # Gateway 0101A8C0 is little-endian; the lower metric of two default routes wins.
+        self.assertEqual(network.path(), {'Router': '192.168.1.1', 'PrimaryInterface': 'eth0'})
+        session = network.session_id('192.168.1.1')
+        self.assertRegex(session, r'\A[0-9a-f]{16}\Z')
+        router = TcpProber().ping_many({'router': '192.168.1.1'})['router']
+        self.assertEqual((router.outcome, router.rtt_ns), ('icmp_not_permitted', None))
+        text = repr(fields) + session
+        for private in ('eth0', 'wlan0', '192.168', '02:00:5e', '025e'):
+            self.assertNotIn(private, text)
+
+    def test_heat_power_and_gpu_come_from_named_chips_and_a_suspended_gpu_is_not_read(self):
+        devices = Devices(self.root, b'0' * 64)
+        temperatures = list(devices.temperatures())
+        self.assertEqual(sorted(f.label for f in temperatures if f.name == 'heat.temperature'),
+                         ['amdgpu edge', 'k10temp Tctl', 'mt7921_phy0 temp1', 'nvme Composite', 'nvme Composite'])
+        self.assertEqual(len({f.entity for f in temperatures if f.label == 'nvme Composite'}), 2)
+        tctl = next(f for f in temperatures if f.label == 'k10temp Tctl')
+        self.assertEqual((tctl.value, tctl.unit), (45.125, 'degC'))  # hwmon millidegrees
+        power = by_name(devices.power())['power.average']
+        self.assertEqual((power.label, power.value, power.unit), ('amdgpu PPT', 12345000, 'uW'))
+        gpu = by_name(devices.gpu())
+        self.assertEqual((gpu['gpu.utilization'].value, gpu['gpu.vram_used'].value), (7, 536870912))
+        for status in ('sys/class/drm/card1/device/power/runtime_status', 'sys/class/hwmon/hwmon1/device/power/runtime_status'):
+            (self.root / status).write_text('suspended\n')
+        os.chmod(self.root / 'sys/class/drm/card1/device/gpu_busy_percent', 0)  # a read would fail the test
+        self.assertEqual([f.name for f in devices.gpu()], ['gpu.runtime_status'])
+        edge = next(f for f in devices.temperatures() if f.label == 'amdgpu edge')
+        self.assertEqual((edge.value, edge.status), (None, 'unobserved'))
+
+    def test_host_without_sensors_gpu_or_cpufreq_covers_every_component_with_named_gaps(self):
+        for absent in ('sys/class/hwmon', 'sys/class/drm', 'sys/devices/system/cpu'):
+            shutil.rmtree(self.root / absent)
         config = Config(data_dir=str(self.root / 'data'))
-        made = sources(config, Budget(config.root), root=self.root)
-        readings = {s.name: s.read() for s in made}
-        self.assertEqual({s.component for s in made}, {'cpu', 'memory', 'gpu', 'storage', 'network', 'power', 'heat', 'self'})
-        for name in ('linux.cpu', 'linux.memory', 'linux.workloads', 'self.process'):
+        made = {s.name: s for s in sources(config, Budget(config.root), root=self.root)}
+        self.assertEqual({s.component for s in made.values()},
+                         {'cpu', 'memory', 'gpu', 'storage', 'network', 'power', 'heat', 'self'})
+        # Probes and the resolver check send packets; tests never contact a network.
+        readings = {name: s.read() for name, s in made.items() if name not in ('linux.probes', 'linux.dns_connect')}
+        for name in ('linux.cpu', 'linux.memory', 'linux.workloads', 'linux.disk', 'linux.network', 'self.process'):
             self.assertEqual(readings[name].status, 'observed', name)
-        self.assertEqual((readings['platform.heat'].status, readings['platform.heat'].reason),
-                         ('unavailable', 'linux_sources_not_implemented'))
+        for name in ('linux.temperatures', 'linux.fans', 'linux.thermal_zones', 'linux.power', 'linux.gpu', 'linux.cpu_frequency'):
+            self.assertEqual((readings[name].status, readings[name].reason), ('unavailable', 'no_devices'), name)
         self.assertEqual(readings['linux.other_user_io'].reason, 'shipped_helper_required')
+        self.assertEqual(readings['linux.gpu_clients'].status, 'not_enabled')
 
 
 if __name__ == '__main__':

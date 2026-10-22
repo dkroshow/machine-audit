@@ -1,8 +1,9 @@
 # Ubuntu implementation handoff
 
 This is source for a coding agent to adapt on the target machine. **It is not
-an Ubuntu installer.** Linux collection is partly built and service
-installation is not; [the Linux adapter](linux-adapter.md) tracks both. The Mac build is in its first live trial; a successful Mac scan
+an Ubuntu installer.** Linux collection is built for all seven components
+but not yet validated on a target; service installation is not built.
+[The Linux adapter](linux-adapter.md) tracks both. The Mac build is in its first live trial; a successful Mac scan
 does not establish Ubuntu correctness.
 
 **Current handoff: preparation only.** Read the code and inspect the target's

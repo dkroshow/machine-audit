@@ -4,6 +4,9 @@ Replace with captured, scrubbed bundles. Each section is a file under the source
 ==> /proc/sys/kernel/random/boot_id <==
 3f2a7c1e-9b4d-4e8a-a1c2-5d6e7f8091ab
 
+==> /proc/sys/kernel/hostname <==
+ubuntu
+
 ==> /proc/stat <==
 cpu  4705 356 584 3699176 2011 0 128 0 0 0
 cpu0 2342 170 300 1849500 1000 0 100 0 0 0
@@ -409,6 +412,35 @@ full avg10=0.00 avg60=0.00 avg300=0.00 total=1000
 some avg10=0.00 avg60=0.00 avg300=0.00 total=300
 full avg10=0.00 avg60=0.00 avg300=0.00 total=100
 
+==> /sys/fs/cgroup/system.slice/ssh.service/io.stat <==
+252:0 rbytes=4096 wbytes=8192 rios=1 wios=2 dbytes=0 dios=0
+259:0 rbytes=4096 wbytes=8192 rios=1 wios=2 dbytes=0 dios=0
+
+==> /sys/fs/cgroup/system.slice/ssh.service/io.pressure <==
+some avg10=0.00 avg60=0.00 avg300=0.00 total=700
+full avg10=0.00 avg60=0.00 avg300=0.00 total=600
+
+==> /sys/fs/cgroup/system.slice/ssh.service/memory.max <==
+max
+
+==> /sys/fs/cgroup/system.slice/ssh.service/memory.high <==
+max
+
+==> /sys/fs/cgroup/system.slice/ssh.service/memory.low <==
+0
+
+==> /sys/fs/cgroup/system.slice/ssh.service/memory.min <==
+0
+
+==> /sys/fs/cgroup/system.slice/ssh.service/memory.swap.max <==
+max
+
+==> /sys/fs/cgroup/system.slice/ssh.service/cpu.max <==
+max 100000
+
+==> /sys/fs/cgroup/system.slice/ssh.service/cpu.weight <==
+100
+
 ==> /sys/fs/cgroup/system.slice/ssh.service/cgroup.procs <==
 801
 
@@ -603,6 +635,12 @@ full avg10=0.00 avg60=0.00 avg300=0.00 total=1000
 some avg10=0.00 avg60=0.00 avg300=0.00 total=300
 full avg10=0.00 avg60=0.00 avg300=0.00 total=100
 
+==> /sys/fs/cgroup/system.slice/worker.service/memory.max <==
+1073741824
+
+==> /sys/fs/cgroup/system.slice/worker.service/cpu.max <==
+50000 100000
+
 ==> /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/cgroup.procs <==
 
 
@@ -663,10 +701,9 @@ full avg10=0.00 avg60=0.00 avg300=0.00 total=100
 
 ==> /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/cgroup.procs <==
 1500
-==> /proc/sys/kernel/hostname <==
-ubuntu
 
 ==> /sys/fs/cgroup/system.slice/mnt-ProjectX.mount/cgroup.procs <==
+
 
 ==> /sys/fs/cgroup/system.slice/mnt-ProjectX.mount/cpu.stat <==
 usage_usec 1200
@@ -675,7 +712,259 @@ system_usec 400
 
 ==> /sys/fs/cgroup/system.slice/ubuntu-advantage.service/cgroup.procs <==
 
+
 ==> /sys/fs/cgroup/system.slice/ubuntu-advantage.service/cpu.stat <==
-usage_usec 300
-user_usec 200
-system_usec 100
+usage_usec 1200
+user_usec 800
+system_usec 400
+
+==> /proc/pressure/io <==
+some avg10=0.30 avg60=0.10 avg300=0.05 total=88000
+full avg10=0.10 avg60=0.05 avg300=0.01 total=41000
+
+==> /proc/diskstats <==
+ 259       0 nvme0n1 1000 10 80000 300 2000 20 160000 400 0 1200 700 5 0 80 6 9 1
+ 259       1 nvme0n1p1 100 10 8000 300 10 20 80 400 0 50 700 5 0 80 6 9 1
+ 259       2 nvme0n1p2 900 10 72000 300 1990 20 159920 400 0 1150 700 5 0 80 6 9 1
+ 252       0 dm-0 900 10 72000 300 1990 20 159920 400 0 1150 700 5 0 80 6 9 1
+ 259       3 nvme1n1 50 10 4000 300 5 20 40 400 0 30 700 5 0 80 6 9 1
+   7       0 loop0 3 10 24 300 0 20 0 400 0 1 700 5 0 80 6 9 1
+
+==> /sys/block/nvme0n1/dev <==
+259:0
+
+==> /sys/block/nvme0n1/device <==
+
+
+==> /sys/block/nvme1n1/dev <==
+259:3
+
+==> /sys/block/nvme1n1/device <==
+
+
+==> /sys/block/dm-0/dev <==
+252:0
+
+==> /sys/block/loop0/dev <==
+7:0
+
+==> /proc/self/mountinfo <==
+22 1 252:0 / / rw,relatime shared:1 - ext4 /dev/mapper/vg-root rw
+23 22 259:1 / /boot/efi rw,relatime shared:2 - vfat /dev/nvme0n1p1 rw
+24 22 259:3 / /mnt/two rw,relatime shared:3 - ext4 /dev/nvme1n1 rw
+25 22 0:21 / /proc rw,nosuid shared:4 - proc proc rw
+26 22 0:24 / /run rw,nosuid shared:5 - tmpfs tmpfs rw,size=819200k
+27 22 252:0 /srv /bound rw,relatime shared:1 - ext4 /dev/mapper/vg-root rw
+
+==> /proc/net/dev <==
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo:    1000      10    0    0    0     0          0         0     1000      10    0    0    0     0       0          0
+  eth0: 5000000    4000    1    2    0     0          0        10  3000000    2500    3    4    0     0       0          0
+  eth1:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0
+ wlan0:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0
+   br0:     400       4    0    0    0     0          0         0      800       8    0    0    0     0       0          0
+
+==> /sys/class/net/lo/ifindex <==
+1
+
+==> /sys/class/net/lo/type <==
+772
+
+==> /sys/class/net/lo/operstate <==
+unknown
+
+==> /sys/class/net/eth0/ifindex <==
+2
+
+==> /sys/class/net/eth0/type <==
+1
+
+==> /sys/class/net/eth0/operstate <==
+up
+
+==> /sys/class/net/eth0/speed <==
+1000
+
+==> /sys/class/net/eth0/device <==
+
+
+==> /sys/class/net/eth1/ifindex <==
+3
+
+==> /sys/class/net/eth1/type <==
+1
+
+==> /sys/class/net/eth1/operstate <==
+down
+
+==> /sys/class/net/eth1/device <==
+
+
+==> /sys/class/net/wlan0/ifindex <==
+4
+
+==> /sys/class/net/wlan0/type <==
+1
+
+==> /sys/class/net/wlan0/operstate <==
+dormant
+
+==> /sys/class/net/wlan0/device <==
+
+
+==> /sys/class/net/br0/ifindex <==
+5
+
+==> /sys/class/net/br0/type <==
+1
+
+==> /sys/class/net/br0/operstate <==
+up
+
+==> /proc/net/snmp <==
+Ip: Forwarding DefaultTTL InReceives InHdrErrors
+Ip: 1 64 902211 0
+Tcp: RtoAlgorithm RtoMin RtoMax MaxConn ActiveOpens PassiveOpens AttemptFails EstabResets CurrEstab InSegs OutSegs RetransSegs InErrs OutRsts InCsumErrors
+Tcp: 1 200 120000 -1 500 40 7 3 12 90000 80000 25 0 9 0
+Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors IgnoredMulti MemErrors
+Udp: 4000 2 0 4100 0 0 0 0 0
+
+==> /proc/net/route <==
+Iface	Destination	Gateway 	Flags	RefCnt	Use	Metric	Mask		MTU	Window	IRTT
+br0	000011AC	00000000	0001	0	0	0	0000FFFF	0	0	0
+wlan0	00000000	0101A8C0	0003	0	0	600	00000000	0	0	0
+eth0	00000000	0101A8C0	0003	0	0	100	00000000	0	0	0
+eth0	0001A8C0	00000000	0001	0	0	100	00FFFFFF	0	0	0
+
+==> /proc/net/arp <==
+IP address       HW type     Flags       HW address            Mask     Device
+192.168.1.7      0x1         0x0         00:00:00:00:00:00     *        eth0
+192.168.1.1      0x1         0x2         02:00:5e:10:00:01     *        eth0
+
+==> /proc/net/wireless <==
+Inter-| sta-|   Quality        |   Discarded packets               | Missed | WE
+ face | tus | link level noise |  nwid  crypt   frag  retry   misc | beacon | 22
+ wlan0: 0000   54.  -56.  -256        0      0      0      0      0        0
+
+==> /etc/resolv.conf <==
+nameserver 127.0.0.53
+options edns0 trust-ad
+search .
+
+==> /sys/class/hwmon/hwmon0/name <==
+k10temp
+
+==> /sys/class/hwmon/hwmon0/temp1_input <==
+45125
+
+==> /sys/class/hwmon/hwmon0/temp1_label <==
+Tctl
+
+==> /sys/class/hwmon/hwmon1/name <==
+amdgpu
+
+==> /sys/class/hwmon/hwmon1/temp1_input <==
+41000
+
+==> /sys/class/hwmon/hwmon1/temp1_label <==
+edge
+
+==> /sys/class/hwmon/hwmon1/power1_average <==
+12345000
+
+==> /sys/class/hwmon/hwmon1/power1_label <==
+PPT
+
+==> /sys/class/hwmon/hwmon1/freq1_input <==
+600000000
+
+==> /sys/class/hwmon/hwmon1/freq1_label <==
+sclk
+
+==> /sys/class/hwmon/hwmon1/device/power/runtime_status <==
+active
+
+==> /sys/class/hwmon/hwmon2/name <==
+nvme
+
+==> /sys/class/hwmon/hwmon2/temp1_input <==
+38850
+
+==> /sys/class/hwmon/hwmon2/temp1_label <==
+Composite
+
+==> /sys/class/hwmon/hwmon2/temp1_max <==
+81850
+
+==> /sys/class/hwmon/hwmon2/temp1_crit <==
+84850
+
+==> /sys/class/hwmon/hwmon3/name <==
+nvme
+
+==> /sys/class/hwmon/hwmon3/temp1_input <==
+36850
+
+==> /sys/class/hwmon/hwmon3/temp1_label <==
+Composite
+
+==> /sys/class/hwmon/hwmon3/temp1_max <==
+81850
+
+==> /sys/class/hwmon/hwmon3/temp1_crit <==
+84850
+
+==> /sys/class/hwmon/hwmon4/name <==
+mt7921_phy0
+
+==> /sys/class/hwmon/hwmon4/temp1_input <==
+42000
+
+==> /sys/class/drm/card0/device/uevent <==
+DRIVER=simple-framebuffer
+
+==> /sys/class/drm/card1/device/uevent <==
+DRIVER=amdgpu
+PCI_CLASS=38000
+PCI_ID=1002:0000
+PCI_SLOT_NAME=0000:01:00.0
+
+==> /sys/class/drm/card1/device/power/runtime_status <==
+active
+
+==> /sys/class/drm/card1/device/gpu_busy_percent <==
+7
+
+==> /sys/class/drm/card1/device/mem_info_vram_used <==
+536870912
+
+==> /sys/class/drm/card1/device/mem_info_vram_total <==
+2147483648
+
+==> /sys/class/drm/card1/device/mem_info_gtt_used <==
+268435456
+
+==> /sys/class/drm/card1/device/mem_info_gtt_total <==
+30064771072
+
+==> /sys/class/drm/card1/device/hwmon/hwmon1/freq1_input <==
+600000000
+
+==> /sys/class/drm/card1-eDP-1/status <==
+connected
+
+==> /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq <==
+2400000
+
+==> /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq <==
+5100000
+
+==> /sys/devices/system/cpu/cpu1/cpufreq/scaling_cur_freq <==
+2500000
+
+==> /sys/devices/system/cpu/cpu1/cpufreq/scaling_max_freq <==
+5100000
+
+==> /sys/devices/system/cpu/online <==
+0-1

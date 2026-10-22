@@ -17,6 +17,8 @@ MEMORY_STAT.update({k: 'count' for k in (
 CPU_STAT = {'usage_usec': 'us', 'user_usec': 'us', 'system_usec': 'us', 'nr_periods': 'count',
             'nr_throttled': 'count', 'throttled_usec': 'us'}
 MEMORY_EVENTS = ('low', 'high', 'max', 'oom', 'oom_kill', 'oom_group_kill')
+IO_STAT = {'rbytes': 'bytes', 'wbytes': 'bytes', 'rios': 'operations', 'wios': 'operations',
+           'dbytes': 'bytes', 'dios': 'operations'}
 
 
 def units(base):

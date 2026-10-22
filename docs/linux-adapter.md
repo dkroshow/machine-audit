@@ -1,6 +1,6 @@
-# Linux adapter plan
+# Linux adapter
 
-Status: slice 1 built (CPU, memory, units, self); slices 2–4 planned.
+Status: slices 1–2 built (all seven components); slices 3–4 planned.
 Targets: Ubuntu 24.04 (kernel 6.8, Python 3.12, systemd 255) and 26.04 (kernel
 7.0, Python 3.14, systemd 259). Validation runs on those machines; fixtures
 prove parsing only.
@@ -12,8 +12,10 @@ prove parsing only.
 - `linux/host.py`: boot id (`/proc/sys/kernel/random/boot_id`), CPU, memory,
   and the workload pass. `Clock.now()` already reads `CLOCK_MONOTONIC` and
   `CLOCK_BOOTTIME` on Linux, so it is the native clock.
-- `linux/cgroups.py`: unit attribution. `linux/devices.py`: disks, volumes,
-  hwmon heat and power, amdgpu. `linux/network.py`: counters and probes.
+- `linux/cgroups.py`: unit discovery and identity. `linux/devices.py`: disks,
+  volumes, hwmon heat and power, cpufreq, power supplies, amdgpu.
+  `linux/network.py`: counters and probes on the shared probe rules.
+  `linux/files.py`: the kernel's text formats.
 - `self_cost.py` stays shared, with a Linux field map.
 - Every source reads through a `root` path (default `/`), so tests point it
   at a directory tree instead of mocking.
@@ -22,13 +24,14 @@ prove parsing only.
 
 | Component | Sources (cadence) |
 | --- | --- |
-| CPU | `/proc/stat` per-CPU states, `procs_running`, `/proc/loadavg`, `/proc/pressure/cpu` (1 s); unit `cpu.stat` (10 s); `scaling_cur_freq` when present (5 s) |
+| CPU | `/proc/stat` per-CPU states, `procs_running`, `/proc/loadavg`, `/proc/pressure/cpu` (1 s); unit `cpu.stat` (10 s); `cpu.max`, `cpu.weight` (60 s) |
 | Memory | `/proc/meminfo`, `/proc/vmstat`, `/proc/pressure/memory` by key (1 s); unit `memory.current`, `memory.stat`, `memory.events`, pressure (10 s); limits (60 s) |
-| Storage | `/proc/diskstats`, `/proc/pressure/io`, unit `io.stat` (5 s/10 s); `statvfs` per local mount (60 s) |
-| Network | `/proc/net/dev` by interface index, `operstate` as state (10 s); `/proc/net/snmp` (10 s); probes (5 s); resolver lookup and connect (60 s) |
-| Heat, power | hwmon by chip and label: `k10temp` Tctl, `amdgpu` edge and `power1_average`, `nvme` Composite, Wi-Fi phy (5 s) |
-| GPU | amdgpu `gpu_busy_percent`, `mem_info_vram_*`, `mem_info_gtt_*` (5 s), skipped while runtime-suspended |
-| Self | own `/proc/<pid>/stat`, `statm`, `io`; scanner run records |
+| Storage | `/proc/diskstats` per whole physical disk, `/proc/pressure/io` (5 s); unit `io.stat`, `io.pressure` (10 s); `statvfs` per local filesystem (60 s) |
+| Network | `/proc/net/dev` by interface index with link state, speed and physical flag, `/proc/net/snmp` TCP and UDP (10 s); probes (5 s); resolver lookup and connect (60 s); `/proc/net/wireless` (10 s) |
+| Heat | hwmon temperatures by chip and label, with `max`/`crit`; hwmon fans; thermal zones; `scaling_cur_freq` and `scaling_max_freq` (5 s) |
+| Power | hwmon `power*_average`, `_input`, `_cap` in microwatts; `/sys/class/power_supply` (5 s) |
+| GPU | amdgpu `gpu_busy_percent`, `mem_busy_percent`, `mem_info_vram_*`, `mem_info_gtt_*`, sclk (5 s) |
+| Self | the workload pass's own processes; storage and scanner run records |
 
 ## Workloads
 
@@ -63,15 +66,53 @@ One 10 s pass, `linux.workloads`, reads units and their processes together.
 Host CPU busy time is user+nice+system+irq+softirq per `cpu-view.md`; iowait,
 steal and guest (already inside user) are kept but not added. `/proc/meminfo`
 `kB` values are stored as bytes (exact ×1024). PSI totals are microsecond
-counters whose rate reads as percent of time stalled.
+counters whose rate reads as percent of time stalled. A unit limit of `max`
+is `not_enabled` (no limit), never a number.
+
+Storage cost: `/proc/stat` keeps all ten states per CPU, so a 32-thread host
+writes about 320 CPU fields a second, roughly four times the Mac. Decision:
+measure growth on the target before trimming anything.
+
+## Devices and network
+
+- Disks: rows of `/proc/diskstats` whose `/sys/block/<name>/device` exists,
+  entity `disk:<major>:<minor>`. Partitions, dm, loop and zram rows are
+  skipped. Sectors are 512 bytes; busy time reads as percent busy. Unit
+  `io.stat` sums physical disks only, because a request through LVM is also
+  counted on its dm device.
+- Volumes: local disk filesystems from mountinfo, once per device, entity
+  `volume:<statvfs f_fsid>` (derived from the filesystem UUID on ext4).
+- Interfaces: entity `interface:<ifindex>`; loopback is skipped. A down link
+  is `network.link_state` = `down`, not a failure. `network.physical` marks
+  interfaces with a device; bridges, veth and tunnels repeat that traffic.
+- Probes reuse the Mac rules. With ping sockets allowed, ICMP replies carry
+  `SO_TIMESTAMPNS` receive times. Without them, `linux.icmp` reports
+  `icmp_not_permitted`, the router ping has that outcome, and the internet
+  probe is a TCP connect to port 443 timed in user space
+  (`network.probe_method` = `tcp_connect`); probe byte counts are then
+  unobserved. Router identity is the salted hash of its ARP hardware address.
+- The resolver is `systemd-resolved stub` when `resolv.conf` names
+  127.0.0.53.
+- Sensors: entity is a salted hash of the hwmon device path and channel;
+  label is chip plus channel label (`k10temp Tctl`, `nvme Composite`).
+  Temperatures are millidegrees, stored as °C. Power stays in microwatts:
+  `uW` joined `UNITS` because hwmon `power*` files report microwatts.
+- GPU: amdgpu cards only, entity a salted hash of the PCI slot. A card whose
+  `power/runtime_status` is `suspended` is not read, nor are its hwmon
+  sensors (`unobserved`), because the read wakes it on kernel 6.8.
 
 ## Gaps
 
-`shipped_helper_required`: other users' `/proc/<pid>/io`, RAPL package power.
-`icmp_not_permitted`: ICMP when `ping_group_range` excludes us; probes fall
-back to TCP connect. `unavailable/no_devices`: thermal zones, fans, cpufreq,
-GPU, battery, Wi-Fi when absent. `not_enabled`: GPU clients (DRM fdinfo),
-capacity test.
+- `shipped_helper_required`: other users' `/proc/<pid>/io`
+  (`linux.other_user_io`); RAPL package power when powercap exists
+  (`linux.package_power`; `no_devices` without it).
+- `icmp_not_permitted` (`linux.icmp`): ping sockets not allowed.
+- `unavailable/no_devices`: any of temperatures, fans, thermal zones,
+  cpufreq, hwmon power and amdgpu that the host lacks.
+- `cgroup_v2_required`: workloads and unit limits without cgroup v2.
+- `not_enabled`: GPU clients (`drm_fdinfo_not_implemented`), capacity test.
+- Not read: Wi-Fi link rate (nl80211), thermal trip points and cooling
+  devices.
 
 ## Fixtures
 
@@ -82,7 +123,7 @@ until the first user's captured, scrubbed bundles replace it.
 
 ## Slices
 
-1. Clock, boot id, CPU, memory, units (CPU, memory), self, platform switch.
-2. Storage, network, heat, power, GPU.
+1. Clock, boot id, CPU, memory, units (CPU, memory), self, platform switch. Done.
+2. Storage, network, heat, power, GPU. Done.
 3. Scanner walk, nightly schedule, default exclusions, inotify hot set.
 4. Linux setup, doctor, start, stop; system unit file; onboarding text.

@@ -1,7 +1,6 @@
 """Linux CPU, memory and workload sources. Keyed files are parsed by key, never by position."""
 from __future__ import annotations
 
-import errno
 import hashlib
 import os
 import pwd
@@ -10,8 +9,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from machine_audit.model import Clock, Reading, process_identity
-from ..macos import error_status, field, private_token
+from ..macos import field, private_token
 from . import cgroups
+from .devices import physical_disks
+from .files import keyed, kib, optional, pressure, psi
 
 CPU_STATES = ('user', 'nice', 'system', 'idle', 'iowait', 'irq', 'softirq', 'steal', 'guest', 'guest_nice')
 # Movement and limit counters named in memory-view.md. pgpgin/pgpgout are KiB.
@@ -23,36 +24,6 @@ VMSTAT.update((k, 'count') for k in (
 # Per unit: the top CPU users since the last pass, the largest resident set,
 # and our own processes. A process entering this set starts with a baseline.
 TOP_CPU, TOP_RESIDENT = 3, 1
-
-
-def gap_status(exc):
-    """A file the kernel does not provide, or PSI switched off, is unavailable rather than failed."""
-    return 'unavailable' if getattr(exc, 'errno', None) in (errno.ENOENT, errno.EOPNOTSUPP) else error_status(exc)
-
-
-def keyed(text, separator=' '):
-    """'key value' (cgroup, vmstat) or 'Key: value unit' (meminfo, status, io) lines."""
-    return {key.strip(): value.split() for key, _, value in (line.partition(separator) for line in text.splitlines()) if value.strip()}
-
-
-def kib(values, key):
-    """The kernel's 'kB' is KiB; the byte value is exact."""
-    value = values.get(key)
-    return int(value[0]) * 1024 if value else None
-
-
-def pressure(text):
-    """PSI 'some' and 'full' lines; only the integer microsecond totals are kept."""
-    return {kind: int(dict(pair.split('=', 1) for pair in pairs)['total'])
-            for kind, *pairs in (line.split() for line in text.splitlines() if line.strip())}
-
-
-def optional(path):
-    """A file a controller does not provide is absent, not zero."""
-    try:
-        return path.read_text()
-    except FileNotFoundError:
-        return None
 
 
 def read_boot_id(root):
@@ -108,15 +79,6 @@ class LinuxHost:
     def label(self, name):
         return 'redacted' if private_token(name, self.private_tokens) else name
 
-    def pressure(self, rel, name):
-        try:
-            totals, kw = pressure(self.text(rel)), {}
-        except OSError as exc:
-            totals, kw = {}, {'status': gap_status(exc)}
-        for kind in ('some', 'full'):
-            yield field(f'{name}.pressure.{kind}', totals.get(kind), 'us', 'counter', scale=1e-4,
-                        rate_unit='percent', **kw)
-
     def cpu(self):
         count = 0
         for line in self.text('proc/stat').splitlines():
@@ -135,7 +97,7 @@ class LinuxHost:
         yield field('cpu.tick_hz', self.hz, 'Hz')
         for window, value in zip(('1m', '5m', '15m'), self.text('proc/loadavg').split()):
             yield field('cpu.load_' + window, float(value), 'threads')
-        yield from self.pressure('proc/pressure/cpu', 'cpu')
+        yield from psi(self.root / 'proc/pressure/cpu', 'cpu')
 
     def memory(self):
         meminfo = keyed(self.text('proc/meminfo'), ':')
@@ -150,10 +112,17 @@ class LinuxHost:
             yield field('memory.' + key, None if value is None else int(value[0]) * (1024 if unit == 'bytes' else 1),
                         unit, 'counter')
         yield field('memory.page_size', os.sysconf('SC_PAGE_SIZE'), 'bytes')
-        yield from self.pressure('proc/pressure/memory', 'memory')
+        yield from psi(self.root / 'proc/pressure/memory', 'memory')
 
-    def unit_fields(self, directory, kw):
-        directory = Path(directory)
+    def each_unit(self):
+        for rel, directory in cgroups.units(self.cgroup):
+            try:
+                entity = cgroups.identity(self.salt, rel, directory)
+            except FileNotFoundError:
+                continue  # the unit stopped during the pass
+            yield Path(directory), dict(entity=entity, label=self.label(cgroups.leaf_name(rel)), scope='unit')
+
+    def unit_fields(self, directory, kw, disks):
         stat = keyed(optional(directory / 'cpu.stat') or '')
         for key, unit in cgroups.CPU_STAT.items():
             if key in stat:
@@ -173,12 +142,41 @@ class LinuxHost:
             if key in events:
                 yield field('unit.memory.events.' + key, int(events[key][0]), 'count', 'counter', additive=True,
                             component='memory', **kw)
-        for resource in ('cpu', 'memory'):
+        io = optional(directory / 'io.stat')
+        if io is not None:
+            # Physical disks only: a request through LVM is also counted on its dm device.
+            # A disk with no line has had no I/O from this unit.
+            totals = dict.fromkeys(cgroups.IO_STAT, 0)
+            for device, *pairs in (line.split() for line in io.splitlines() if line.strip()):
+                if device in disks:
+                    for key, value in (pair.split('=', 1) for pair in pairs):
+                        if key in totals:
+                            totals[key] += int(value)
+            for key, value in totals.items():
+                yield field('unit.io.stat.' + key, value, cgroups.IO_STAT[key], 'counter', additive=True,
+                            component='storage', **kw)
+        for resource, component in (('cpu', 'cpu'), ('memory', 'memory'), ('io', 'storage')):
             totals = pressure(optional(directory / (resource + '.pressure')) or '')
             for kind in ('some', 'full'):
                 if kind in totals:
                     yield field(f'unit.{resource}.pressure.{kind}', totals[kind], 'us', 'counter', scale=1e-4,
-                                rate_unit='percent', component=resource, **kw)
+                                rate_unit='percent', component=component, **kw)
+
+    def unit_limits(self):
+        """Limits in force; 'max' (no limit) is not_enabled, never a number."""
+        for directory, kw in self.each_unit():
+            for name in ('memory.max', 'memory.high', 'memory.low', 'memory.min', 'memory.swap.max', 'cpu.max', 'cpu.weight'):
+                text = optional(directory / name)
+                if text is None:
+                    continue
+                values = text.split()
+                if name == 'cpu.max':
+                    yield field('unit.cpu.max.period', int(values[1]), 'us', **kw)
+                    name = 'cpu.max.quota'
+                unit = 'bytes' if name.startswith('memory') else 'us' if name == 'cpu.max.quota' else 'integer'
+                limited = values[0] != 'max'
+                yield field('unit.' + name, int(values[0]) if limited else None, unit,
+                            component='memory' if unit == 'bytes' else 'cpu', **({} if limited else {'status': 'not_enabled'}), **kw)
 
     def process_fields(self, p):
         observed = Clock.now()
@@ -206,15 +204,11 @@ class LinuxHost:
     def workloads(self):
         start = Clock.now()
         roles = self.managed.snapshot() if self.managed else {}
+        disks = physical_disks(self.root)
         fields, ticks, seen = [], {}, set()
-        for rel, directory in cgroups.units(self.cgroup):
+        for directory, kw in self.each_unit():
             observed = Clock.now()
-            try:
-                kw = dict(entity=cgroups.identity(self.salt, rel, directory),
-                          label=self.label(cgroups.leaf_name(rel)), scope='unit')
-                unit = list(self.unit_fields(directory, kw))
-            except FileNotFoundError:
-                continue  # the unit stopped during the pass
+            unit = list(self.unit_fields(directory, kw, disks))
             listed = cgroups.pids(directory)
             procs = []
             for pid in listed:
