@@ -1,5 +1,6 @@
 """Compact map publication preserves evidence without copying unchanged files."""
 from pathlib import Path
+from contextlib import contextmanager
 import sqlite3
 import tempfile
 import unittest
@@ -67,6 +68,54 @@ class CompactMapTests(unittest.TestCase):
             self.node(str(branch),'1',2*GB)
             for file in range(50):self.store.file(str(branch*100+file),str(branch),f'f{file}',40_000_000,0)
         self.store.finish_volume(self.volume,Blocks(),[],full=True,lean=True)
+
+    def test_obsolete_generation_pruning_is_batched_resumable_and_generation_last(self):
+        # A restarted walk used one transaction to delete millions of abandoned
+        # rows; cache_spill=OFF retained its dirty pages for the whole deletion.
+        self.store.prepare(self.volume);self.node('published',None,2*GB)
+        self.store.finish_volume(self.volume,Blocks(),[],full=True,lean=True)
+        before=MapQuery(self.store.path).query()
+        vid=self.store.vid
+        with self.store.write():
+            for generation,status in ((100,'retired'),(101,'building')):
+                self.store.db.execute('INSERT INTO generations VALUES(?,?,?)',(generation,vid,status))
+                self.store.db.execute('INSERT INTO nodes VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (generation,vid,0,None,'obsolete','directory',0,0,0,0,'observed',0))
+                self.store.db.executemany('INSERT INTO files VALUES(?,?,?,?,?,?,?)',
+                    ((generation,vid,i//100,i%100,'obsolete',1,0) for i in range(4097)))
+                self.store.db.executemany('INSERT INTO holders VALUES(?,?,?,?,?,?,?,?)',
+                    ((generation,vid,i//100,i%100,i%100,1,None,0) for i in range(4097)))
+                self.store.db.execute('INSERT INTO charges VALUES(?,?,?,?,?,?,?,?)',(generation,vid,0,1,1,None,0,0))
+                self.store.db.execute('INSERT INTO listings VALUES(?,?,?,?,?)',(generation,vid,0,0,4097))
+                for table in ('removed','reset_dirs','removed_charges'):
+                    self.store.db.execute(f'INSERT INTO {table} VALUES(?,?,?)',(generation,vid,0))
+        tables=('nodes','files','holders','charges','listings','removed','reset_dirs','removed_charges')
+        original_write=self.store.write;committed=[];interrupt=True
+        @contextmanager
+        def checked_write(*args,**kwargs):
+            changes=self.store.db.total_changes
+            with original_write(*args,**kwargs):yield
+            committed.append(self.store.db.total_changes-changes)
+            self.assertLessEqual(committed[-1],4096)
+            for generation in (100,101):
+                if not self.store.db.execute('SELECT 1 FROM generations WHERE id=?',(generation,)).fetchone():
+                    for table in tables:
+                        self.assertIsNone(self.store.db.execute(
+                            f'SELECT 1 FROM {table} WHERE generation=? LIMIT 1',(generation,)).fetchone())
+            if interrupt:raise RuntimeError('synthetic interruption after committed batch')
+        with patch.object(self.store,'write',checked_write):
+            with self.assertRaisesRegex(RuntimeError,'synthetic interruption'):
+                self.store.prune_generations(full=False)
+            self.assertIsNotNone(self.store.db.execute('SELECT 1 FROM generations WHERE id=101').fetchone())
+            interrupt=False
+            self.store.prune_generations(full=False)
+            self.assertEqual(self.store.db.execute('SELECT count(*) FROM files WHERE generation=100').fetchone()[0],4097)
+            self.assertIsNone(self.store.db.execute('SELECT 1 FROM generations WHERE id=101').fetchone())
+            self.store.prune_generations(full=True)
+        self.assertIn(4096,committed)
+        self.assertEqual(MapQuery(self.store.path).query(),before)
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM generations').fetchone()[0],1)
+        self.assertEqual(self.store.db.execute('PRAGMA cache_spill').fetchone()[0],0)
 
     def test_inode_uint64_and_fixture_namespaces_round_trip_without_collisions(self):
         values=['0',str(2**63-1),str(2**63),str(2**64-1),'-1','fixture:1','01','a']
