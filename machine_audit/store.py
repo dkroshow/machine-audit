@@ -114,11 +114,19 @@ def held_rows(held,deadline=None):
     return rows
 
 
-def unpack_summaries(payload):
+def unpack_summaries(payload, keep=None):
+    """Rows of one stored bundle. `keep(signal, kind, component)` drops rows before
+    their dictionaries are built."""
     version, groups = json.loads(zlib.decompress(payload))
     if version != 2:
         raise ValueError("unsupported_summary_encoding")
-    return [dict(zip(keys,values)) for keys,rows in groups for values in rows]
+    if keep is None:
+        return [dict(zip(keys,values)) for keys,rows in groups for values in rows]
+    result=[]
+    for keys,rows in groups:
+        signal,kind,component=(keys.index(k) for k in ("signal","kind","component"))
+        result.extend(dict(zip(keys,values)) for values in rows if keep(values[signal],values[kind],values[component]))
+    return result
 
 
 class Store:

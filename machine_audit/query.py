@@ -8,6 +8,7 @@ import threading
 import math
 import zlib
 import heapq
+from operator import itemgetter
 from dataclasses import replace
 from itertools import chain, groupby, takewhile
 from .derive import points, rollups, summarize, merge_summaries, GOOD, BUSY
@@ -25,6 +26,8 @@ MAX_ROWS = 2000
 MAX_SCAN = 20000
 MAX_QUERY_BYTES = 32*1024**2
 RESOLUTIONS = tuple(WIDTHS)
+# One measure of an entity within a summary bundle.
+SUMMARY_KEY = itemgetter("signal","unit","kind","scope","scale")
 
 def bounded_payloads(cursor):
     result=[];size=0
@@ -165,9 +168,10 @@ class Query:
         return sorted(unique.values(),key=lambda r:(r.reading.end.wall_ns,r.sequence)),overflow
 
     def _iter_summaries(self,db,captured,start_ns,end_ns,resolution,signals=None,
-                        component=None,program_only=False,series_only=False,spans=None,stored=None):
+                        component=None,program_only=False,series_only=False,spans=None,stored=None,keep=None):
         """Matching summary rows in source, entity, bucket order. `stored`, a one-item
-        list, accumulates the stored payload bytes read, for callers that bound them."""
+        list, accumulates the stored payload bytes read, for callers that bound them;
+        `keep` is passed to unpack_summaries."""
         width = WIDTHS[resolution]
         spans = spans or [(resolution,start_ns//width*width,end_ns)]
         args=[];parts=[]
@@ -201,7 +205,7 @@ class Query:
             for identifier,bucket,res,source in batch:
                 payload=payloads[identifier]
                 if stored is not None:stored[0]+=len(payload)
-                try:rows=unpack_summaries(payload)
+                try:rows=unpack_summaries(payload,keep)
                 except (zlib.error,ValueError):
                     # A payload damaged on disk (crash, recovery) is a reported gap,
                     # not a failed answer for every window that contains it.
@@ -264,29 +268,31 @@ class Query:
         for a,b in sides:
             spans+=[("15-minute",a//QUARTER*QUARTER,b),("minute",a//MINUTE*MINUTE,b)]
         # Rows outside the window still show which minutes have a row; filter after choosing.
-        wide=self._iter_summaries(db,captured,start_ns//QUARTER*QUARTER,end_ns+QUARTER,"hour",[signal] if signal else None,component,program_only=signal=="process.cpu",spans=spans)
+        # Without a named signal only component totals rank; skip the rest unbuilt.
+        keep=None if signal else self._ranks
+        wide=self._iter_summaries(db,captured,start_ns//QUARTER*QUARTER,end_ns+QUARTER,"hour",[signal] if signal else None,component,program_only=signal=="process.cpu",spans=spans,keep=keep)
         rows=(row for _,group in groupby(wide,key=lambda r:(r["source"],r["entity"])) for row in self._edge_rows(group,start_ns,end_ns)
               if row["start_ns"]<end_ns and row["end_ns"]>=start_ns)
         first=next(rows,None)
         if first is None:
-            rows=self._iter_summaries(db,captured,start_ns,end_ns,"hour",[signal] if signal else None,component,program_only=signal=="process.cpu")
+            rows=self._iter_summaries(db,captured,start_ns,end_ns,"hour",[signal] if signal else None,component,program_only=signal=="process.cpu",keep=keep)
         else:
             rows=chain((first,),rows)
         current=None;merged={};edges={}
         def done():
-            for key,row in merged.items():
+            for key,rows in merged.items():
+                row=merge_summaries(rows) if len(rows)>1 else rows[0]  # once, not pairwise
                 # The coarsest grain that set an edge; hour only when no side row was used.
                 row["summary_resolution"]=max(edges.get(key,{"hour"}),key=WIDTHS.get)
                 yield row
         for row in rows:
-            if signal is None and not self._ranks(row):continue  # who drops it; skip the merge
             row["partial_boundary"]=row["start_ns"]<start_ns or row["end_ns"]>end_ns
             entity=(row["source"],row["entity"])
             if current is not None and entity!=current:
                 yield from done();merged={};edges={}
             current=entity
-            key=tuple(row[k] for k in ("signal","unit","kind","scope","scale"))
-            merged[key]=merge_summaries([merged[key],row]) if key in merged else row
+            key=SUMMARY_KEY(row)
+            merged.setdefault(key,[]).append(row)
             if row["summary_resolution"]!="hour":edges.setdefault(key,set()).add(row["summary_resolution"])
         yield from done()
 
@@ -295,7 +301,7 @@ class Query:
         """Per quarter hour of a side: minute rows when they cover each of its minutes in
         the window, otherwise the 15-minute rows. Minute rows ending before a 15-minute row
         begins predate 15-minute rows and still count."""
-        def key(r):return tuple(r[k] for k in ("signal","unit","kind","scope","scale"))
+        key=SUMMARY_KEY
         quarters=defaultdict(lambda:([],[]))
         for row in rows:
             if row["summary_resolution"]=="hour":yield row
@@ -601,7 +607,7 @@ class Query:
             heap=[];count=0;attributed=None;lo=None;hi=None;partial=False;boundary=False
             for r in candidates:
                 if not self._who_row(r):continue
-                if signal is None and not self._ranks(r):continue
+                if signal is None and not self._ranks(r["signal"],r["kind"],r["component"]):continue
                 count+=1;lo=r["start_ns"] if lo is None else min(lo,r["start_ns"]);hi=r["end_ns"] if hi is None else max(hi,r["end_ns"])
                 partial=partial or r.get("partial_members",False);boundary=boundary or r.get("partial_boundary",False)
                 if signal=="process.cpu" and r["total"] is not None:attributed=(attributed or 0)+r["total"]*r["scale"]
@@ -639,10 +645,10 @@ class Query:
         return [replace(r,reading=replace(r.reading,fields=tuple(f for f in r.reading.fields if f.name in wanted))) for r in records]
 
     @staticmethod
-    def _ranks(row):
+    def _ranks(signal,kind,component):
         """Without a named signal: the component total, plus states and events (failed
         reads, identities), which remain evidence."""
-        return row["kind"] in ("state","event") or row["signal"] in WHO_TOTALS.get(row["component"],(row["signal"],))
+        return kind in ("state","event") or signal in WHO_TOTALS.get(component,(signal,))
 
     @staticmethod
     def _who_row(row):
