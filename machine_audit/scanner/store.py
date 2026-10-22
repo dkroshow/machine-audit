@@ -2,6 +2,7 @@
 from __future__ import annotations
 from contextlib import contextmanager
 from collections import defaultdict, deque
+from itertools import groupby, islice
 from array import array
 import base64
 import hashlib
@@ -109,7 +110,7 @@ class MapStore:
         except BaseException:
             if self.db is not None:self.db.close()
             raise
-        self.buffer=[];self.buffer_bytes=0
+        self.buffer=[];self.buffer_bytes=0;self.pending_resets=set()
         self.generation=self.volume=self.vid=self.base_gen=self.run=None
         self.changed=set();self.last_progress=0.0;self.entries=0
 
@@ -159,6 +160,7 @@ class MapStore:
         self.volume,self.vid,self.mount=volume.id,old['key'],volume.mount
         self.base_gen=old['generation'] if not full else None
         self.changed=set()
+        self.pending_resets.clear()
         return old
 
     def prune_generations(self,full=True):
@@ -192,11 +194,16 @@ class MapStore:
 
     def flush(self):
         if not self.buffer:return
-        groups=defaultdict(list)
-        for query,args in self.buffer:groups[query].append(args)
+        if self.base_gen is None:
+            grouped=defaultdict(list)
+            for query,args in self.buffer:grouped[query].append(args)
+            groups=grouped.items()
+        else:
+            # Reset/delete operations must stay before that directory's inserts.
+            groups=((query,[args for _,args in batch]) for query,batch in groupby(self.buffer,key=lambda item:item[0]))
         with self.write(rows=len(self.buffer),payload_bytes=self.buffer_bytes):
-            for query,rows in groups.items():self.db.executemany(query,rows)
-        self.buffer.clear();self.buffer_bytes=0
+            for query,rows in groups:self.db.executemany(query,rows)
+        self.buffer.clear();self.buffer_bytes=0;self.pending_resets.clear()
 
     def listed(self,identity,count):
         self._queue('INSERT OR REPLACE INTO listings VALUES(?,?,?,?,?)',
@@ -235,7 +242,7 @@ class MapStore:
         staged=f'SELECT * FROM {table}{hint} WHERE generation=? AND volume=? AND {where}'
         params=[self.generation,self.vid,*args]
         if table in ('nodes','listings'):
-            staged+=f' AND {identity} NOT IN (SELECT id FROM removed WHERE generation=? AND volume=?)'
+            staged+=f' AND NOT EXISTS (SELECT 1 FROM removed r WHERE r.generation=? AND r.volume=? AND r.id={table}.{identity})'
             params.extend((self.generation,self.vid))
         if self.base_gen is None:return self.db.execute(staged,params)
         if table in ('files','holders'):
@@ -288,11 +295,22 @@ class MapStore:
 
     def begin_directory(self,identity):
         if self.base_gen is None:return
-        self.flush();identity=inode_key(identity)
-        with self.write():
-            self.db.execute('INSERT OR IGNORE INTO reset_dirs VALUES(?,?,?)',(self.generation,self.vid,identity))
-            for table,key in (('files','parent'),('holders','dir')):
-                self.db.execute(f'DELETE FROM {table} WHERE generation=? AND volume=? AND {key}=?',(self.generation,self.vid,identity))
+        identity=inode_key(identity)
+        repeated=identity in self.pending_resets or self.db.execute(
+            'SELECT 1 FROM reset_dirs WHERE generation=? AND volume=? AND id=?',
+            (self.generation,self.vid,identity)).fetchone()
+        if repeated:
+            self.flush()
+            for table,parent,key in (('files','parent','id'),('holders','dir','file_id')):
+                while True:
+                    keys=[r[0] for r in self.db.execute(f'''SELECT {key} FROM {table}
+                        WHERE generation=? AND volume=? AND {parent}=? LIMIT 4096''',(self.generation,self.vid,identity))]
+                    if not keys:break
+                    with self.write(rows=len(keys)):
+                        self.db.executemany(f'DELETE FROM {table} WHERE generation=? AND volume=? AND {parent}=? AND {key}=?',
+                            ((self.generation,self.vid,identity,key) for key in keys))
+        self.pending_resets.add(identity)
+        self._queue('INSERT OR IGNORE INTO reset_dirs VALUES(?,?,?)',(self.generation,self.vid,identity))
 
     def _subtree(self,identity):
         pending=[identity];seen=set()
@@ -306,14 +324,19 @@ class MapStore:
     def relocate(self,identity,parent,label,path,private):
         key=inode_key(identity);old=self._node(key)
         if old is None:return False
+        # A shallow parent listing cannot observe whether a child's private
+        # marker disappeared. Only a listing of that child can expose names.
+        was_private=old['kind']=='private'
+        if was_private and old['parent']==inode_key(parent) and old['label'] in (None,label):return True
+        private=private or was_private
         if old['parent']==inode_key(parent) and old['label']==(None if private else label) and (old['kind']=='private')==private:
             return True
-        changed={key} if not private else self._subtree(key)
+        changed=self._subtree(key) if private and not was_private else {key}
         for current in changed:
             node=dict(self._node(current))
             node.update(generation=self.generation)
             if current==key:node.update(parent=inode_key(parent),label=None if private else label)
-            if private:
+            if private and not was_private:
                 node.update(label=None,kind='private')
                 files=list(self._rows('files','parent=?',(current,)))
                 holders=list(self._rows('holders','dir=?',(current,)))
@@ -331,8 +354,10 @@ class MapStore:
 
     def clear_subtree(self,identity):
         self.flush();keys=self._subtree(inode_key(identity))
-        with self.write():
-            self.db.executemany('INSERT OR IGNORE INTO removed VALUES(?,?,?)',((self.generation,self.vid,k) for k in keys))
+        pending=iter(keys)
+        while batch:=list(islice(pending,4096)):
+            with self.write(rows=len(batch)):
+                self.db.executemany('INSERT OR IGNORE INTO removed VALUES(?,?,?)',((self.generation,self.vid,k) for k in batch))
         self.changed.update(keys)
 
     def _old_node(self,key):
@@ -556,7 +581,7 @@ class MapStore:
                     self.db.execute('INSERT INTO points VALUES(?,?,?,?,?,?,?)',(self.volume,tracked['id'],now,last['label'],metric,None,'not_observed'))
 
     def mark_failed(self,status):
-        self.buffer.clear();self.buffer_bytes=0
+        self.buffer.clear();self.buffer_bytes=0;self.pending_resets.clear()
         with self.write(rows=1):self.db.execute('UPDATE volumes SET status=? WHERE id=?',(status,self.volume))
         self.progress(status=status)
 

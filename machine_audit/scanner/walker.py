@@ -1,6 +1,7 @@
 """One metadata walk. The store, not Python objects, holds the growing map."""
 from __future__ import annotations
 from dataclasses import dataclass
+import errno
 import os
 import stat
 from .accounting import Stream
@@ -33,6 +34,26 @@ class Walker:
         self.gaps = set()
         self.sharing_complete = True
 
+    def _open_directory(self,path):
+        flags=os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC
+        # macOS O_NOFOLLOW_ANY rejects intermediate links and cannot combine
+        # with O_NOFOLLOW. Use the identical boundary for replay identity reads.
+        flags|=0x20000000 if self.fs else os.O_NOFOLLOW
+        return os.open(path,flags)
+
+    def directory_identity(self,path):
+        try:fd=self._open_directory(path)
+        except PermissionError:
+            self.gaps.add('denied');return None
+        except OSError as exc:
+            if exc.errno not in (errno.ENOENT,errno.ENOTDIR,errno.ELOOP):
+                self.gaps.add('directory_unreadable')
+            return None
+        try:
+            info=os.fstat(fd)
+            return str(info.st_ino) if info.st_dev==self.volume.device else None
+        finally:os.close(fd)
+
     def walk(self, root=None, parent_id=None, inherited_private=False, recursive=True):
         root = root or self.volume.mount
         try:
@@ -59,12 +80,7 @@ class Walker:
                     self.gaps.add(decision.reason)
                     self.sink.directory(Node(identity, parent, label, 'directory', 0, 0, decision.reason, path if names else None, st.st_mtime_ns))
                     continue
-                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
-                if self.fs:
-                    flags |= 0x20000000  # macOS O_NOFOLLOW_ANY cannot combine with O_NOFOLLOW.
-                else:
-                    flags |= os.O_NOFOLLOW
-                fd = os.open(path, flags)
+                fd = self._open_directory(path)
                 try:
                     opened = os.fstat(fd)
                     if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):

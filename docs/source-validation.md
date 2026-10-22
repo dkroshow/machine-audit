@@ -277,3 +277,24 @@ not a measured Big Mac map or a bound for all filenames, history and sharing
 metadata. The conservative budget still requires roughly twice the database
 space plus other managed files. If admission fails, the last complete map stays
 published; no file grain, cadence, history or accounting mode is silently reduced.
+
+## Scheduled replay regression
+
+Ordinary events whose path no longer exists now shallow-list the nearest
+known directory. New child directories still receive an initial recursive
+walk; `MUST_SCAN` retains recursive semantics. Private directories can be
+resolved by inode through the walker's no-follow directory open, without
+persisting event paths or exposing their contents. A shallow parent listing
+cannot remove a child's previously observed privacy boundary.
+
+Disposable-directory regressions reproduce the old amplification: an ordinary
+missing path visited 33 entries instead of the required three, and a private
+event visited three instead of one. Both now visit only the required entries.
+A 150-directory recursive update previously committed 304 transactions;
+buffered directory-reset records reduce it to at most four before publication.
+Reset and insert order is preserved, including repeat visits after a staged
+file was removed. Publication remains atomic, and failure keeps the prior map.
+These checks do not measure Big Mac hourly throughput or prove event-history
+availability. Counted insert/charge/aggregate batches use the shared write
+contract in `storage-approach.md`; uncounted final publication retains the
+conservative whole-database reservation.

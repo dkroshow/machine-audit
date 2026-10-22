@@ -44,12 +44,18 @@ def relist(store,walker,policy,volume,now,changes):
         # Changes inside excluded folders or this store must not re-walk their parent.
         if policy.decide(shown_path(volume,path)).reason in ('excluded','own_store'):
             continue
-        # Private descendants have no stored names. Revisit the nearest
-        # visible parent, keeping their names out of the persistent map.
-        event_target=path
+        # Resolve the nearest mapped directory without exporting event paths.
         found=None
         while path.startswith(volume.mount):
             found=store.find_path(path)
+            if not found:
+                # Private directories intentionally have no stored path. Resolve
+                # their inode through the same no-follow open used by the walk.
+                identity=walker.directory_identity(path)
+                private=store.known_directory(identity) if identity is not None else None
+                if private and private['kind']=='private':
+                    parent=walker.directory_identity(os.path.dirname(path)) if path!=volume.mount else None
+                    if parent==private['parent']:found=private
             if found:
                 break
             if path==volume.mount:
@@ -63,7 +69,7 @@ def relist(store,walker,policy,volume,now,changes):
                 walker.gaps.add('large_directory_deferred')
                 continue
             roots_to_update[path]=found
-            if recursive or path!=event_target:recursive_roots.add(path)
+            if recursive:recursive_roots.add(path)
     # The deepest event under an already selected ancestor needs no second walk.
     paths=sorted(roots_to_update,key=len)
     chosen=[]
