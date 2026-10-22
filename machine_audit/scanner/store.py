@@ -160,11 +160,20 @@ class MapStore:
         return old
 
     def prune_generations(self,full=True):
-        with self.write():
-            obsolete=[r[0] for r in self.db.execute("SELECT id FROM generations WHERE status='building' OR (? AND status='retired')",(full,))]
-            for generation in obsolete:
-                for table in MAP_TABLES+STAGE_TABLES:
-                    self.db.execute(f'DELETE FROM {table} WHERE generation=?',(generation,))
+        obsolete=[r[0] for r in self.db.execute("SELECT id FROM generations WHERE status='building' OR (? AND status='retired')",(full,))]
+        for generation in obsolete:
+            for table in MAP_TABLES+STAGE_TABLES:
+                columns=sorted(self.db.execute(f'PRAGMA table_info({table})'),key=lambda r:r['pk'])
+                key=','.join(r['name'] for r in columns if r['pk'])
+                # Cache spilling stays disabled. Bound deletions per commit,
+                # retaining the generation record so interrupted cleanup resumes.
+                while True:
+                    with self.write():
+                        removed=self.db.execute(f'''DELETE FROM {table} WHERE ({key}) IN
+                            (SELECT {key} FROM {table} WHERE generation=? ORDER BY {key} LIMIT 4096)''',
+                            (generation,)).rowcount
+                    if removed<4096:break
+            with self.write():
                 self.db.execute('DELETE FROM generations WHERE id=?',(generation,))
 
     def observe_unscanned(self,volume,reason,lean=True):

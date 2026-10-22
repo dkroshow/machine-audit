@@ -133,6 +133,10 @@ controlled source replacements retained the scanner executable and its observed
 Full Disk Access grant, preserved recordings, and verified clean stop markers.
 The first full filesystem walk is still pending accounting and cost acceptance.
 
+The Intel Mac restart recorded a one-off walk peak RSS of 1.2 GB after pruning
+a 13.6 M-entry abandoned generation, versus 462 MB on a clean store; this
+lifetime peak includes startup work and is not the walk's current resident memory.
+
 ## Review regressions and scale measurements
 
 Run the portable boundary checks in a complete source checkout with Python 3.12:
