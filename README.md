@@ -102,6 +102,34 @@ into the existing config to disable the default probes:
 Then restart with `machine-audit stop` and `machine-audit start`. To disable the
 optional speed test, set `enabled.network_speed` to false.
 
+## Compared with existing tools
+
+Machine-audit uses none of the tools below and does not shell out to them.
+It has zero runtime package dependencies. It reads OS interfaces directly:
+macOS sysctl, Mach task info, IOKit, SMC and FSEvents. The Linux sources, in
+progress, read `/proc`, `/sys` and cgroup v2, and use inotify.
+
+Installation runs `git`, `/usr/bin/clang` and `/usr/bin/codesign`; service control
+and permission checks use `/bin/launchctl`. Bounded DNS/connect and
+captive-portal probes run a child of the same Python interpreter.
+
+The focus is continuous recording with explicit coverage: gaps are reported,
+never filled with zero. Process, Linux service (cgroup) and folder attribution
+can be queried over time. Recording has a storage cap; measured operating cost
+is recorded and shown, with unmeasured cost left explicit. The dashboard and
+agents share one [query interface](docs/api.md). A
+[privacy boundary](docs/privacy.md) defines what a reading may contain;
+the scanner's named filesystem map stays separate.
+
+| Tool family | What it answers | What this adds |
+| --- | --- | --- |
+| Process viewers: top, htop, btop, ps, Activity Monitor | What processes are running and using resources? | Recorded process attribution and coverage over time. |
+| Dashboards: glances, Stats | What is the machine doing now? | Shared historical queries for the dashboard and agents. |
+| GPU and power monitors: asitop, macmon, nvtop | What GPU activity or power readings are available? | Readings alongside other resources, with explicit measurement gaps. |
+| Disk usage: df, du | How much space is used or available? | Folder growth history alongside disk activity. |
+| Resource and I/O tools: iostat, iotop, vmstat, uptime | What resource activity, load or uptime is reported? | Recorded resource history, attribution and measured monitoring cost. |
+| Network tools: iftop, nethogs, netstat, ss | What network traffic or connections are present? | Recorded traffic and probe history alongside resource readings. |
+
 ## Product documents
 
 - [Vision](docs/vision.md): purpose, ambitions and principles.
