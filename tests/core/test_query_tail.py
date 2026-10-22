@@ -119,6 +119,15 @@ class QueryTailTests(unittest.TestCase):
             self.assertFalse(answer['truncated'])
             self.assertFalse(any(g.get('signal')=='process.phys_footprint' for g in answer['gaps']))
 
+    def test_default_who_ranks_each_program_once_by_its_total(self):
+        # First Ubuntu run: an 8-row page showed 4 consumers, each as its total and its user time.
+        # The Mac-shaped pass showed the same, with system, child, runnable and wakeup rows too.
+        self.populate(count=8)
+        for component, total in (('cpu', 'process.cpu'), ('storage', 'process.diskio_byteswritten')):
+            rows = [r for r in self.query.who(0, 20*S, component=component, limit=75)['rows'] if r['additive']]
+            self.assertEqual({r['signal'] for r in rows}, {total}, component)
+            self.assertEqual(len(rows), len({r['entity'] for r in rows}), component)
+
     def test_bundled_memory_and_storage_who_match_saved_rows(self):
         self.populate(count=8)
         live = {}

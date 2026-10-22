@@ -165,6 +165,9 @@ class LinuxSourceTests(unittest.TestCase):
         # A unit ranks as itself; programs group processes only, so no unit is counted twice.
         units = [r for r in rows if r['scope'] == 'unit']
         self.assertTrue(units and all(r['entity'].startswith('cgroup:') for r in units))
+        # Each workload ranks once, by its total; user and system time need --signal.
+        self.assertEqual(len(rows), len({r['entity'] for r in rows}), signals)
+        self.assertLessEqual(signals, {'unit.cpu.stat.usage_usec', 'process.cpu'})
         self.assertFalse(signals & {'unit.cpu.weight', 'unit.cpu.max.quota', 'unit.processes', 'unit.cpu.pressure.some',
                                     'unit.cpu.stat.nr_periods'})
 

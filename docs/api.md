@@ -193,6 +193,10 @@ manifest appears only after complete chunk creation. Neither file contains
 scanner tables. Existing destinations are refused; transfer/acknowledgement
 and disposal policy remain with the transfer component.
 
+Without a `signal`, `who` ranks each workload once, by its component total
+(`WHO_TOTALS` in `query.py`: CPU time for `cpu`, written bytes for `storage`);
+components such as user time, child time, wakeups and read bytes need an
+explicit `signal`. Gauges and failed-read evidence still appear.
 `who` returns CPU accounting separately from ranking. Original-unit program
 totals are converted to CPU-seconds only for comparison. A remainder is given
 only when host and attributed observation bounds match; mismatches and negative
