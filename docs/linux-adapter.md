@@ -121,7 +121,10 @@ equals the per-CPU count). `/proc/meminfo` keeps 22 keys.
 - `scanner/linux.py` walks each local disk filesystem from mountinfo (volume
   id: the capacity source's salted `f_fsid`) with the shared walker:
   `os.scandir`, `st_blocks` bytes, hard links charged once. ext4 shares no
-  blocks, so folders report listed bytes and no physical residual.
+  blocks: a complete map is `observed` with uses (hard links once) and the
+  gap `physical_residual_not_computed`; no residual is claimed. A volume
+  root the service user cannot read (an EFI partition) is a `denied` gap on
+  that volume; the run still completes.
 - Never entered: `/proc`, `/sys`, `/dev`, `/run`, `/tmp` (counted as
   `excluded`, unnamed like configured exclusions), other users' homes
   (`other_account`), the data directory (`own_store`), and a bind mount of

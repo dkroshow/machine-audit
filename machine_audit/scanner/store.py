@@ -477,7 +477,7 @@ class MapStore:
                             (self.base_gen,self.generation,self.vid))
             self.db.execute(f'DELETE FROM {table} WHERE generation=? AND volume=?',(self.generation,self.vid))
 
-    def finish_volume(self,volume,blocks,gaps,*,full,lean,bookmark=None,event_uuid=None,complete=True):
+    def finish_volume(self,volume,blocks,gaps,*,full,lean,bookmark=None,event_uuid=None,complete=True,physical=True):
         self.flush();old=self.db.execute('SELECT * FROM volumes WHERE id=?',(self.volume,)).fetchone()
         if full:
             affected,sharing_complete=self._sharing(blocks,True)
@@ -490,8 +490,13 @@ class MapStore:
             complete=complete and sharing_complete
             roots=list(self._rows('nodes','parent IS NULL'))
             total=sum(r['uses'] for r in roots) if roots else None
-            result=reconcile(volume.used,total,supported=volume.fs in ('apfs','hfs'),complete=complete,
-                             previously_invalid=bool(old['generation'] and not old['valid']),full=full)
+            if physical:
+                result=reconcile(volume.used,total,supported=volume.fs in ('apfs','hfs'),complete=complete,
+                                 previously_invalid=bool(old['generation'] and not old['valid']),full=full)
+            else:
+                # No extents provider (Linux): uses charge hard links once; no residual is claimed.
+                result={'valid':True,'uses':total,'not_attributed':None,'status':'observed' if complete else 'partial'}
+                gaps=set(gaps)|{'physical_residual_not_computed'}
             self._publish_changes()
             published=self.base_gen if self.base_gen is not None else self.generation
             now=time.time_ns()
@@ -636,7 +641,7 @@ class MapQuery:
                     valid = bool(v['valid'])
                     rows.append(dict(id=v['id'],label=v['label'],observed_ns=v['observed_ns'],full_scan_ns=v['full_ns'],
                                      listed=listed,uses=uses if valid else None,volume_used=v['volume_used'],
-                                     not_attributed=v['volume_used']-uses if valid and uses is not None else None,
+                                     not_attributed=v['volume_used']-uses if valid and uses is not None and v['volume_used'] is not None else None,
                                      capacity=v['capacity'],free=v['free'],available=v['available'],valid=valid,status=v['status'],
                                      mounted=bool(v['mounted']),gaps=json.loads(v['gaps'])))
                 truncated=len(rows)>limit
