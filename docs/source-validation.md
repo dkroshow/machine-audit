@@ -385,7 +385,8 @@ bookmark. A changed directory that is gone, or no longer a directory, by scan
 time does not fail the update: its subtree is dropped and its parent re-listed
 shallowly, which records the removal or replacement; a parent gone too is
 recorded by its own ancestor's listing, and only an unlistable parent fails the
-volume. A changed directory that still exists but cannot be read keeps its last
+volume (gap `parent_unlistable`, or `parent_unresolved` when no mapped ancestor
+can be found). A changed directory that still exists but cannot be read keeps its last
 map, adds the `directory_unreadable` gap and is deferred an hour; it is never
 cleared first, since anything staged beneath a cleared, unwalked directory
 would have no ancestor. Access checks still run first;

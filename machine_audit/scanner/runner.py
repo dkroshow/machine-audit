@@ -32,6 +32,24 @@ def scan_lock(root):
         os.close(fd)
 
 
+def resolve_mapped(store,walker,volume,path):
+    """The nearest mapped directory at or above `path`, as (path, row), without
+    exporting event paths. Private directories intentionally have no stored path;
+    their inode is resolved through the same no-follow open used by the walk."""
+    found=None
+    while path.startswith(volume.mount):
+        found=store.find_path(path)
+        if not found:
+            identity=walker.directory_identity(path)
+            private=store.known_directory(identity) if identity is not None else None
+            if private and private['kind']=='private':
+                parent=walker.directory_identity(os.path.dirname(path)) if path!=volume.mount else None
+                if parent==private['parent']:found=private
+        if found or path==volume.mount:break
+        path=os.path.dirname(path)
+    return path,found
+
+
 def relist(store,walker,policy,volume,now,changes):
     """Re-list changed folders, given as (absolute path, recursive), plus deferred ones now due."""
     roots_to_update={}
@@ -54,23 +72,7 @@ def relist(store,walker,policy,volume,now,changes):
             if ancestor==volume.mount:break
             ancestor=os.path.dirname(ancestor)
         else:continue
-        # Resolve the nearest mapped directory without exporting event paths.
-        found=None
-        while path.startswith(volume.mount):
-            found=store.find_path(path)
-            if not found:
-                # Private directories intentionally have no stored path. Resolve
-                # their inode through the same no-follow open used by the walk.
-                identity=walker.directory_identity(path)
-                private=store.known_directory(identity) if identity is not None else None
-                if private and private['kind']=='private':
-                    parent=walker.directory_identity(os.path.dirname(path)) if path!=volume.mount else None
-                    if parent==private['parent']:found=private
-            if found:
-                break
-            if path==volume.mount:
-                break
-            path=os.path.dirname(path)
+        path,found=resolve_mapped(store,walker,volume,path)
         if found:
             # A >20k-entry directory is visited at most daily.
             listing=store.listing(found['id'])
@@ -103,11 +105,12 @@ def relist(store,walker,policy,volume,now,changes):
             # records the removal or replacement. A parent gone too is recorded by
             # its own ancestor's listing; only an unlistable parent fails the update.
             store.clear_subtree(previous['id'])
-            parent=os.path.dirname(path) if path!=volume.mount else None
-            above=store.find_path(parent) if parent else None
-            if not above:complete=False
+            if path==volume.mount:complete=False;continue
+            parent,above=resolve_mapped(store,walker,volume,os.path.dirname(path))
+            # Each way this can fail names itself: the run record is the only evidence.
+            if not above:walker.gaps.add('parent_unresolved');complete=False
             elif not walker.walk(parent,above['parent'],above['kind']=='private',recursive=False):
-                if os.path.lexists(parent):complete=False
+                if os.path.lexists(parent):walker.gaps.add('parent_unlistable');complete=False
             continue
         if recursive:store.clear_subtree(previous['id'])
         if not walker.walk(path,previous['parent'],previous['kind']=='private',recursive=recursive):complete=False
