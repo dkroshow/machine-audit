@@ -236,16 +236,23 @@ class Store:
     def prune_oldest(self):
         with self._mutex:
             summary_heads=[]
+            preserved=[]
             row = self.db.execute("SELECT MIN(wall_ns) FROM readings").fetchone()
-            if row[0] is not None:
+            while row[0] is not None:
                 kind, start = "raw", row[0]
                 end = (start // MINUTE + 1) * MINUTE
-                table, condition, args = "readings", "wall_ns < ?", (end,)
+                table, condition, args = "readings", "wall_ns>=? AND wall_ns<?", (start,end)
                 # Every raw row must have a committed summary fragment before pruning.
-                missing = self.db.execute("SELECT 1 FROM readings r WHERE wall_ns<? AND NOT EXISTS (SELECT 1 FROM coverage s WHERE s.run_id=r.run_id AND s.resolution='minute' AND s.sequence_max>=r.sequence AND s.source=r.source) LIMIT 1",(end,)).fetchone()
-                if missing:
-                    return False
-            else:
+                missing = self.db.execute("SELECT 1 FROM readings r WHERE wall_ns>=? AND wall_ns<? AND NOT EXISTS (SELECT 1 FROM coverage s WHERE s.run_id=r.run_id AND s.resolution='minute' AND s.sequence_max>=r.sequence AND s.source=r.source AND s.start_ns<=r.wall_ns AND s.end_ns>=r.wall_ns) LIMIT 1",(start,end)).fetchone()
+                if not missing:break
+                if preserved and preserved[-1][1]==start//MINUTE*MINUTE:
+                    preserved[-1]=(preserved[-1][0],end)
+                else:preserved.append((start,end))
+                row=self.db.execute('SELECT MIN(wall_ns) FROM readings WHERE wall_ns>=?',(end,)).fetchone()
+            skipped_raw=bool(preserved)
+            if row[0] is None:
+                # Uncovered windows remain intact; covered raw still comes
+                # before summaries, even when it follows a retained window.
                 summary_heads=self._summary_heads('minute')
                 if summary_heads:
                     start=min(t for _,t in summary_heads)
@@ -273,6 +280,8 @@ class Store:
             else:
                 rows=self.db.execute(f"SELECT rowid,length(payload) FROM {table} WHERE {condition} LIMIT ?",(*args,PRUNE_BATCH)).fetchall()
             page=self.db.execute('PRAGMA page_size').fetchone()[0]
+            preserved=[(start,end) for start,end in preserved if not self.db.execute(
+                "SELECT 1 FROM retention WHERE kind='raw_preserved' AND start_ns<=? AND end_ns>=?",(start,end)).fetchone()]
             while rows:
                 payload_pages=sum((size+page-1)//page for _,size in rows)
                 coverage=[]
@@ -283,7 +292,7 @@ class Store:
                 coverage_pages=sum((size+page-1)//page for _,size in coverage)
                 vacuum_steps=min(PRUNE_BATCH,payload_pages+len(rows))
                 # Bounded delete/index work, overflow pages, then bounded page moves.
-                frames=64+(len(rows)+len(coverage))*PRUNE_ROW_PAGES+payload_pages+coverage_pages+8*vacuum_steps
+                frames=64+(len(rows)+len(coverage)+len(preserved))*PRUNE_ROW_PAGES+payload_pages+coverage_pages+8*vacuum_steps
                 try:
                     with self.budget.sqlite_write(self.db,self.path,0,max_growth_bytes=8*page,dirty_pages=frames):
                         self.db.execute("BEGIN IMMEDIATE")
@@ -294,9 +303,11 @@ class Store:
                                 self.db.execute(f"DELETE FROM reading_components WHERE (run_id,sequence) IN (SELECT run_id,sequence FROM readings WHERE rowid IN ({placeholders}))",ids)
                             self.db.execute(f"DELETE FROM {table} WHERE rowid IN ({placeholders})",ids)
                             self.db.executemany('DELETE FROM coverage WHERE rowid=?',((row[0],) for row in coverage))
-                            previous=self.db.execute("SELECT rowid FROM retention WHERE kind=? AND start_ns<=? AND end_ns>=? AND reason='storage_budget'",(kind,start,start)).fetchone()
+                            self.db.executemany("INSERT INTO retention VALUES('raw_preserved',?,?,'missing_summary_coverage')",preserved)
+                            reason='storage_budget_raw_uncovered' if skipped_raw and kind!='raw' else 'storage_budget'
+                            previous=self.db.execute("SELECT rowid FROM retention WHERE kind=? AND start_ns<=? AND end_ns>=? AND reason=?",(kind,start,start,reason)).fetchone()
                             if previous:self.db.execute("UPDATE retention SET end_ns=max(end_ns,?) WHERE rowid=?",(end,previous[0]))
-                            else:self.db.execute("INSERT INTO retention VALUES(?,?,?,?)",(kind,start,end,"storage_budget"))
+                            else:self.db.execute("INSERT INTO retention VALUES(?,?,?,?)",(kind,start,end,reason))
                             for _ in range(min(vacuum_steps,self.db.execute("PRAGMA freelist_count").fetchone()[0])):
                                 self.db.execute("PRAGMA incremental_vacuum(1)")
                             self.db.execute("COMMIT")
@@ -398,7 +409,7 @@ class Store:
                 with path.open("rb") as stream:
                     digest=hashlib.file_digest(stream,"sha256").hexdigest()
                     os.fsync(stream.fileno())
-                pruned=[dict(r) for r in source.execute("SELECT * FROM retention ORDER BY start_ns LIMIT 1001")]
+                pruned=[dict(r) for r in source.execute("SELECT * FROM retention WHERE kind!='raw_preserved' ORDER BY start_ns LIMIT 1001")]
                 manifest={"schema_version":1,"format":"machine-audit-records-sqlite-v1","device_id":device_id,"run_id":run_id,
                           "after_sequence":after_sequence,"first_sequence":included[0][0] if included else None,
                           "last_sequence":included[-1][0] if included else None,"count":len(included),

@@ -70,6 +70,17 @@ This bounded pruning path lets recovery remove raw readings, then minute
 summaries, then hourly summaries, retaining incident history longest, even
 when the ordinary whole-database write reservation no longer fits.
 
+If crash recovery leaves a raw window without summary coverage, keep that
+window and search forward for the oldest fully covered raw window. Only after
+all covered raw windows are gone may pruning continue into minute summaries,
+hour summaries and incidents. Coverage evidence must match both sequence and
+observation time; a later high sequence alone does not prove an earlier window
+was summarized. Each retained window is recorded as `raw_preserved` with reason
+`missing_summary_coverage`. These records appear in retention history, but are
+excluded from pruned gaps and export `pruned_ranges`. Summary deletions made
+while raw is retained carry reason `storage_budget_raw_uncovered`. Uncovered
+raw must neither block startup recovery nor cause covered raw to accumulate.
+
 Alerts appear in the dashboard and agent output, with status events;
 external notification delivery is outside the current scope.
 

@@ -317,7 +317,7 @@ class Query:
                 gaps.append(dict(status="unobserved",reason="after_last_save",start_ns=max(start_ns,last),end_ns=effective_stop,run_id=run["run_id"]))
             cursor=max(cursor,effective_stop if not stopped else min(stopped,end_ns))
         if cursor<end_ns:gaps.append(dict(status="unobserved",reason="no_collector",start_ns=cursor,end_ns=end_ns))
-        gaps.extend(dict(r,status="pruned") for r in retention)
+        gaps.extend(dict(r,status="pruned") for r in retention if r['kind']!='raw_preserved')
         def streamed_points():
             previous={}
             for record in records:

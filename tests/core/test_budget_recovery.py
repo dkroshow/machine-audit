@@ -8,10 +8,38 @@ import unittest
 from machine_audit.budget import Budget
 from machine_audit.collector import Collector
 from machine_audit.model import Clock, Field, Reading, Record
+from machine_audit.query import Query
 from machine_audit.store import Store, pack_summaries
 
 
 class BudgetRecoveryTests(unittest.TestCase):
+    def test_uncovered_window_does_not_block_later_covered_raw_windows(self):
+        scratch=Path(__file__).parent/'.tmp';scratch.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as root:
+            store=Store(Path(root)/'readings.sqlite',Budget(root,free_margin_bytes=0))
+            try:
+                records=[]
+                for seq,t in enumerate((1,60_000_000_001,120_000_000_001),1):
+                    clock=Clock(t,t,t)
+                    records.append(Record(Reading('synthetic','memory',clock,clock,
+                        (Field('memory.used',seq,'bytes'),)),'boot','run',seq,t,clock))
+                store.append(records)
+                store.db.execute('DELETE FROM coverage WHERE end_ns<60000000000')
+                summaries=store.db.execute('SELECT count(*) FROM summaries').fetchone()[0]
+                for sequence in (2,3):
+                    self.assertTrue(store.prune_oldest())
+                    self.assertIsNone(store.db.execute('SELECT 1 FROM readings WHERE sequence=?',(sequence,)).fetchone())
+                    self.assertEqual(store.db.execute('SELECT payload FROM readings WHERE sequence=1').fetchone()[0],records[0].packed)
+                    self.assertEqual(store.db.execute('SELECT count(*) FROM summaries').fetchone()[0],summaries)
+                retained=store.db.execute("SELECT start_ns,end_ns,reason FROM retention WHERE kind='raw_preserved'").fetchall()
+                self.assertEqual(retained,[(1,60_000_000_000,'missing_summary_coverage')])
+                answer=Query(store).coverage(0,180_000_000_000)['coverage']
+                self.assertTrue(any(r['kind']=='raw_preserved' for r in answer['retention']))
+                self.assertFalse(any(r.get('kind')=='raw_preserved' for r in answer['gaps']))
+                manifest=store.export_chunk(Path(root)/'chunk.sqlite',device_id='device',run_id='run')
+                self.assertFalse(any(r['kind']=='raw_preserved' for r in manifest['pruned_ranges']))
+            finally:store.close()
+
     def test_largest_prune_batches_stay_inside_declared_wal_pages(self):
         class ObservedBudget(Budget):
             @contextmanager
@@ -49,6 +77,12 @@ class BudgetRecoveryTests(unittest.TestCase):
             finally:store.close()
 
     def test_restart_prunes_raw_then_minutes_and_keeps_collecting(self):
+        self.restart_fixture(uncovered=False)
+
+    def test_restart_preserves_uncovered_raw_and_prunes_summaries(self):
+        self.restart_fixture(uncovered=True)
+
+    def restart_fixture(self,uncovered):
         # The live store was below its cap but could not reserve a whole-DB WAL.
         scratch=Path(__file__).parent/'.tmp';scratch.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=scratch) as root:
@@ -61,6 +95,14 @@ class BudgetRecoveryTests(unittest.TestCase):
                           'boot','old',1,1,clock)
             store.append([record])
             store.db.execute('PRAGMA max_page_count=50000')  # Synthetic fixture construction.
+            # A crash-recovered window may contain raw evidence without its
+            # coverage rows. Keep that evidence while making room elsewhere.
+            orphan=Record(Reading('recovered','memory',clock,clock,
+                                 (Field('memory.used',3,'bytes'),)),
+                          'boot','recovered',1,1,clock)
+            if uncovered:
+                store.db.execute('INSERT INTO readings VALUES(?,?,?,?,?,?)',
+                                 ('recovered',1,0,'recovered','memory',orphan.packed))
             rng=random.Random(7)
             payload=pack_summaries([{'signal':'synthetic','sample':rng.randbytes(4096).hex()}])
             store.db.execute('BEGIN')
@@ -78,9 +120,14 @@ class BudgetRecoveryTests(unittest.TestCase):
                 collector=Collector(store,(),run_id='new',boot_id='boot')
                 collector.start()
                 kinds=[r[0] for r in store.db.execute('SELECT kind FROM retention ORDER BY rowid')]
-                self.assertIn('raw',kinds)
                 self.assertIn('minute',kinds)
-                self.assertLess(kinds.index('raw'),kinds.index('minute'))
+                if uncovered:
+                    self.assertNotIn('raw',kinds)
+                    self.assertEqual(store.db.execute("SELECT payload FROM readings WHERE run_id='recovered'").fetchone()[0],orphan.packed)
+                    self.assertIn('storage_budget_raw_uncovered',[r[0] for r in store.db.execute('SELECT reason FROM retention')])
+                else:
+                    self.assertIn('raw',kinds)
+                    self.assertLess(kinds.index('raw'),kinds.index('minute'))
                 self.assertNotIn('hour',kinds)
                 self.assertEqual(store.db.execute("SELECT count(*) FROM summaries WHERE resolution='hour'").fetchone()[0],hours)
                 collector.ingest(Reading('fresh','memory',clock,clock,(Field('memory.used',2,'bytes'),)))
