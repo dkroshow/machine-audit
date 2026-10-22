@@ -103,6 +103,35 @@ class BudgetRecoveryTests(unittest.TestCase):
                 self.assertFalse(any(r['kind']=='raw_preserved' for r in manifest['pruned_ranges']))
             finally:store.close()
 
+    def test_a_long_uncovered_prefix_resumes_and_never_blocks_pruning(self):
+        # Big Mac after a crash: every flush restarted the bounded proof search at the
+        # oldest raw window, ran out inside a long uncovered prefix and saved nothing.
+        # Each search now resumes after the windows already recorded; one that still
+        # runs out prunes the oldest summaries instead.
+        scratch=Path(__file__).parent/'.tmp';scratch.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as root:
+            store=Store(Path(root)/'readings.sqlite',Budget(root,free_margin_bytes=0))
+            try:
+                records=[]
+                for seq,t in enumerate(range(1,300*60,10),1):
+                    clock=Clock(t*10**9,t*10**9,t*10**9)
+                    records.append(Record(Reading('synthetic','memory',clock,clock,
+                        (Field('memory.used',seq,'bytes'),)),'boot','run',seq,clock.wall_ns,clock))
+                store.append(records)
+                store.db.execute('DELETE FROM coverage WHERE end_ns<?',(200*MINUTE,))
+                def raw(lo,hi):
+                    return store.db.execute('SELECT count(*) FROM readings WHERE wall_ns>=? AND wall_ns<?',(lo,hi)).fetchone()[0]
+                reasons=[]
+                with patch('machine_audit.store.PRUNE_PRECHECK_STEPS',3_000):
+                    while raw(200*MINUTE,300*MINUTE)==600:
+                        self.assertTrue(store.prune_oldest())
+                        reasons.append(store.db.execute('SELECT reason FROM retention ORDER BY rowid DESC LIMIT 1').fetchone()[0])
+                        self.assertLess(len(reasons),20)
+                self.assertEqual(raw(0,200*MINUTE),1200)  # uncovered readings stay
+                self.assertIn('storage_budget_raw_uncovered',reasons[:-1])  # ran out, pruned summaries
+                self.assertEqual(reasons[-1],'storage_budget')  # then reached covered raw
+            finally:store.close()
+
     def test_largest_prune_batches_stay_inside_declared_wal_pages(self):
         class ObservedBudget(Budget):
             @contextmanager

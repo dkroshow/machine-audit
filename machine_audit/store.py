@@ -374,28 +374,57 @@ class Store:
         finally:
             self.db.set_progress_handler(None,0)
 
-    def _prune_candidates(self,deadline):
-        summary_heads=[]
-        preserved=[]
+    def _covered_raw(self,deadline,preserved):
+        """The oldest raw window whose every reading is proven summarized, and whether
+        an uncovered window came first. Uncovered windows found are added to
+        `preserved`; windows already recorded as preserved are passed over, so each
+        search resumes where the last one stopped."""
+        skipped=False
         row = self.db.execute("SELECT MIN(wall_ns) FROM readings").fetchone()
         while row[0] is not None:
             if time.monotonic()>=deadline:raise BudgetExceeded("prune_precheck_limit")
-            kind, start = "raw", row[0]
+            start = row[0]
+            resume = self.db.execute("SELECT max(end_ns) FROM retention WHERE kind='raw_preserved' AND start_ns<=? AND end_ns>?",(start,start)).fetchone()[0]
+            if resume is not None:
+                skipped=True
+                row=self.db.execute('SELECT MIN(wall_ns) FROM readings WHERE wall_ns>=?',(resume,)).fetchone()
+                continue
             end = (start // MINUTE + 1) * MINUTE
-            table, condition, args = "readings", "wall_ns>=? AND wall_ns<?", (start,end)
             # Keep every proof condition, but seek recent coverage first.
             # EXISTS discards ORDER BY; the non-null scalar preserves it.
             missing = self.db.execute("""SELECT 1 FROM readings r WHERE wall_ns>=? AND wall_ns<? AND
             (SELECT s.start_ns FROM coverage s WHERE s.run_id=r.run_id AND s.resolution='minute'
              AND s.sequence_max>=r.sequence AND s.source=r.source AND s.start_ns<=r.wall_ns AND s.end_ns>=r.wall_ns
              ORDER BY s.start_ns DESC LIMIT 1) IS NULL LIMIT 1""",(start,end)).fetchone()
-            if not missing:break
+            if not missing:return (start,end),skipped or bool(preserved)
             if preserved and preserved[-1][1]==start//MINUTE*MINUTE:
                 preserved[-1]=(preserved[-1][0],end)
             else:preserved.append((start,end))
             row=self.db.execute('SELECT MIN(wall_ns) FROM readings WHERE wall_ns>=?',(end,)).fetchone()
-        skipped_raw=bool(preserved)
-        if row[0] is None:
+        return None,skipped or bool(preserved)
+
+    def _prune_candidates(self):
+        preserved=[]
+        exhausted=False
+        try:
+            with self._prune_precheck() as deadline:
+                window,skipped_raw=self._covered_raw(deadline,preserved)
+        except BudgetExceeded as exc:
+            # The search ran out before a covered window: prune coarser history now,
+            # and record the uncovered windows found so the next search goes further.
+            if str(exc)!="prune_precheck_limit":raise
+            window,skipped_raw,exhausted=None,True,True
+        with self._prune_precheck():
+            batch=self._prune_batch(window,preserved,skipped_raw)
+        if batch is None and exhausted:raise BudgetExceeded("prune_precheck_limit")
+        return batch
+
+    def _prune_batch(self,window,preserved,skipped_raw):
+        summary_heads=[]
+        if window:
+            kind,(start,end)="raw",window
+            table, condition, args = "readings", "wall_ns>=? AND wall_ns<?", (start,end)
+        else:
             # Uncovered windows remain intact; covered raw still comes
             # before summaries, even when it follows a retained window.
             for kind,width in WIDTHS.items():
@@ -426,8 +455,7 @@ class Store:
 
     def prune_oldest(self):
         with self._mutex:
-            with self._prune_precheck() as deadline:
-                batch=self._prune_candidates(deadline)
+            batch=self._prune_candidates()
             if batch is None:return self._reclaim_free_pages()
             kind,start,end,table,rows,preserved,skipped_raw,page=batch
             while rows:

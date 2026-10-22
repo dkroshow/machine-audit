@@ -97,9 +97,14 @@ The raw-pruning proof searches the existing coverage-time index backward from
 each reading. It retains the run, source, sequence and time checks; any matching
 fragment proves coverage. The read-only candidate search stops after one million
 SQLite VM instructions or one second, checked every 1,000 instructions and
-between windows. It reports `prune_precheck_limit` without deleting history or
-discarding pending readings. Native I/O must return before SQLite can check its
-progress limit. No additional index or background scan is needed.
+between windows. Each search passes over windows already recorded as
+`raw_preserved`, so it resumes where the last one stopped. A search that runs
+out before a covered window prunes the oldest summaries instead, with reason
+`storage_budget_raw_uncovered`, and records the uncovered windows it found.
+Only when nothing coarser remains does it report `prune_precheck_limit`, without
+deleting history or discarding pending readings. Native I/O must return before
+SQLite can check its progress limit. No additional index or background scan is
+needed.
 The regression uses 32,768 covered raw rows, an older uncovered row and 33,000
 coverage fragments. Its two coverage proofs use about 4,000 VM instructions;
 the previous query exceeds 100,000. This is synthetic query work, not a live
