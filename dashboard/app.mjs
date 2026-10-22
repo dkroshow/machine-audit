@@ -1,8 +1,8 @@
-import {views,label,time,format,readToken,makeApi,seriesGroups,rowValue,rowUnit,statusText,ranksInWho} from './model.mjs';
+import {views,label,time,format,readToken,makeApi,tokenKey,seriesGroups,rowValue,rowUnit,statusText,ranksInWho} from './model.mjs';
 import {el,card,empty,metric,signalsView,liveView,whoView,coverageView,statusView,intervalEvidence} from './render.mjs';
 import {storageView} from './storage.mjs';
 const $=id=>document.getElementById(id);
-let api=makeApi(readToken(window.location,window.history));
+let api=makeApi(readToken(window.location,window.history) ?? sessionStorage.getItem(tokenKey));
 const state={mode:'history',view:'overview',span:3600,range:null,abort:null,timer:null,catalog:null,whoSignal:null};
 const sections={
   cpu:[['Usage and capacity',/busy|capacity|cpu_count|user|system|idle|steal|logical|physical/],['Demand and constraints',/runnable|wait|pressure|thrott|quota|limit/]],

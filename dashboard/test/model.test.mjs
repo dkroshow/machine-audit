@@ -24,6 +24,36 @@ test('missing authentication does not make an unauthenticated API request',async
   for(const status of [401,403])await assert.rejects(makeApi('synthetic',async()=>({status}))('now'),{message});
 });
 
+function tokenStorage() {
+  const values=new Map([['machine-audit.token','synthetic']]);
+  return {getItem:key=>values.get(key) ?? null,setItem:(key,value)=>values.set(key,value),removeItem:key=>values.delete(key)};
+}
+
+test('authorization failures clear the per-tab token and stop further requests',async()=>{
+  for(const status of [401,403]) {
+    const storage=tokenStorage();let calls=0;
+    const api=makeApi('synthetic',async()=>{calls++;return {status};},storage);
+    await assert.rejects(api('now'),/This session is not authorized/);
+    assert.equal(storage.getItem('machine-audit.token'),null);
+    await assert.rejects(api('now'),/This session is not authorized/);
+    assert.equal(calls,1,'The rejected token must also be cleared from memory');
+  }
+});
+
+test('a changed collector run clears authorization at the status response boundary',async()=>{
+  const storage=tokenStorage();let calls=0;
+  const api=makeApi('synthetic',async()=>{
+    calls++;
+    return {ok:true,status:200,json:async()=>({collector:{run_id:calls<3 ? 'synthetic-run-a':'synthetic-run-b'}})};
+  },storage);
+  await api('status');await api('status');
+  assert.equal(storage.getItem('machine-audit.token'),'synthetic');
+  await assert.rejects(api('status'),/This session is not authorized/);
+  assert.equal(storage.getItem('machine-audit.token'),null);
+  await assert.rejects(api('now'),/This session is not authorized/);
+  assert.equal(calls,3,'A run change must also clear the token from memory');
+});
+
 test('chart splits denied and absent intervals but preserves a measured zero',()=>{
   const row=(a,b,value,status='observed')=>({start_ns:a,end_ns:b,kind:'gauge',status,last:value});
   const rows=[row(0,1,5),row(1,2,0,'measured_zero'),row(2,3,20,'denied'),row(3,4,7),row(6,7,9)];

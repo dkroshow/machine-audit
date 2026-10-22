@@ -66,7 +66,25 @@ test('all dashboard views render real stored replay without leaked tokens or fak
   assert.ok((await run("document.querySelector('#view').innerText")).length>50,'A token supplied after load must load data');
   assert.equal(await run('location.hash'),'#overview');
   assert.equal(await run('localStorage.length'),0);
-  assert.equal(await run('sessionStorage.length'),0);
+  assert.deepEqual(await run('Object.keys(sessionStorage)'),['machine-audit.token']);
+  assert.equal(await run("sessionStorage.getItem('machine-audit.token')"),connection.token);
+  await send('Page.reload',{ignoreCache:true});
+  await until(()=>run("performance.getEntriesByType('navigation')[0]?.type"),value=>value==='reload','The page did not reload');
+  await settled();
+  assert.equal(await run("document.querySelector('#error').hidden"),true,'A reload without a fragment must restore this tab token');
+  assert.ok((await run("document.querySelector('#view').innerText")).length>50);
+  assert.equal(await run('location.hash'),'#overview');
+  assert.equal(await run('localStorage.length'),0);
+  assert.deepEqual(await run('Object.keys(sessionStorage)'),['machine-audit.token']);
+  const authErrorStart=errors.length;
+  await run("location.hash='#token=synthetic-invalid'");await pause(100);await settled();
+  assert.equal(await run("document.querySelector('#error').hidden"),false);
+  assert.match(await run("document.querySelector('#error').textContent"),/This session is not authorized/);
+  assert.equal(await run('sessionStorage.length'),0,'A 401 must clear the per-tab token');
+  assert.ok(!(await run('location.hash')).includes('token'));
+  await pause(100);
+  assert.ok(errors.splice(authErrorStart).every(error=>error.includes('status of 401')),'Only the intentional authorization failures may be logged');
+  await run(`location.hash='#token=${encodeURIComponent(connection.token)}'`);await pause(100);await settled();
   assert.match(await run("document.querySelector('#notice').textContent"),/Synthetic replay/);
   await run("document.querySelector('#span').value='300';document.querySelector('#span').dispatchEvent(new Event('change'))");await settled();
   for(const view of ['overview','cpu','memory','gpu','storage','network','power','heat','cost','coverage']) {
@@ -134,8 +152,16 @@ test('all dashboard views render real stored replay without leaked tokens or fak
   await run("location.hash='#storage'");await pause(100);await settled();
   assert.match(await run("document.querySelector('#view').innerText"),/Reconciliation is invalid/);
   assert.equal(await run("document.querySelectorAll('.storage-bar').length"),0);
-  await send('Page.reload');await settled();
-  assert.match(await run("document.querySelector('#error').textContent"),/machine-audit open/);
+  await run(`sessionStorage.setItem('machine-audit.token','synthetic-stale');history.replaceState(null,'','#token=${encodeURIComponent(invalid.token)}&view=storage')`);
+  await send('Page.reload');
+  await until(()=>run("performance.getEntriesByType('navigation')[0]?.type"),value=>value==='reload','The page did not reload');
+  await settled();
+  assert.equal(await run("document.querySelector('#error').hidden"),true,'A fragment must take precedence over a stored token');
+  assert.equal(await run('location.hash'),'#storage');
+  assert.equal(await run("sessionStorage.getItem('machine-audit.token')"),invalid.token);
+  assert.deepEqual(await run('Object.keys(sessionStorage)'),['machine-audit.token']);
+  assert.equal(await run('localStorage.length'),0);
+  assert.match(await run("document.querySelector('#view').innerText"),/Reconciliation is invalid/);
   assert.ok(errors.length===0,errors.join('\n'));
 });
 
