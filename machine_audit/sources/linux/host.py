@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import os
 import pwd
 import re
-import socket
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -56,10 +56,11 @@ def optional(path):
 
 
 def read_boot_id(root):
-    value = (Path(root) / 'proc/sys/kernel/random/boot_id').read_text().strip().replace('-', '')
-    if not re.fullmatch(r'[0-9a-f]{32}', value):
+    """Hashed, as the Mac hashes its boot time, so the kernel's value never enters an entity."""
+    value = (Path(root) / 'proc/sys/kernel/random/boot_id').read_text().strip()
+    if not re.fullmatch(r'[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}', value):
         raise ValueError('invalid_boot_id')
-    return value
+    return hashlib.sha256(value.encode()).hexdigest()[:32]
 
 
 @dataclass(frozen=True)
@@ -91,7 +92,7 @@ class LinuxHost:
         self.boot_id = read_boot_id(self.root)
         self.hz = os.sysconf('SC_CLK_TCK')
         # Core admission is the final gate; this also drops labels naming a person or this host.
-        self.private_tokens = (socket.gethostname().split('.')[0],
+        self.private_tokens = ((self.root / 'proc/sys/kernel/hostname').read_text().strip().split('.')[0],
                                *(p.pw_name for p in pwd.getpwall() if 1000 <= p.pw_uid < 65534))
         self.managed = None
         self.ticks = {}

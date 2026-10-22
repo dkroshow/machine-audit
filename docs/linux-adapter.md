@@ -41,7 +41,11 @@ One 10 s pass, `linux.workloads`, reads units and their processes together.
   `who` like programs, never as host series.
 - Label: the leaf name; a templated unit uses its template name
   (`getty@tty1.service` → `getty.service`), because instances can carry
-  private names. Labels naming a person or the host become `redacted`.
+  private names. Mount, automount and swap units are labelled `mount`,
+  `automount` or `swap`: their names are escaped paths. Labels containing a
+  login name or the host's short name become `redacted`; a common host name
+  such as `ubuntu` also redacts legitimate names like
+  `ubuntu-advantage.service`.
 - Kept keys: `cpu.stat` usage and throttling, `memory.current`,
   `memory.swap.current`, the `memory.stat` usage and movement keys listed in
   `cgroups.py`, `memory.events`, CPU and memory PSI totals. Keys a newer
@@ -50,8 +54,11 @@ One 10 s pass, `linux.workloads`, reads units and their processes together.
   the largest resident set, and our own processes. A process entering that
   set starts with a baseline window; its CPU in that window stays in the unit
   total. `unit.processes` and `unit.processes_sampled` give coverage.
-- Process labels come from `comm` (the field in `/proc/<pid>/stat`). Linux
-  `self.memory` is the resident set, not the Mac footprint.
+- Process labels come from `comm` (the field in `/proc/<pid>/stat`) for
+  every process. Residual under the upload hold: a script's `comm` is its
+  file name. Linux `self.memory` is the resident set, not the Mac footprint.
+- The boot id is a hash of the kernel's `boot_id`, as the Mac hashes its boot
+  time, so the kernel value never enters an entity.
 
 Host CPU busy time is user+nice+system+irq+softirq per `cpu-view.md`; iowait,
 steal and guest (already inside user) are kept but not added. `/proc/meminfo`

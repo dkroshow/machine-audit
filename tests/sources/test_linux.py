@@ -70,15 +70,17 @@ class LinuxSourceTests(unittest.TestCase):
     def test_units_are_one_non_overlapping_level_hashed_and_named_by_template(self):
         fields = self.host.workloads()
         units = {f.entity: f.label for f in fields if f.scope == 'unit'}
-        self.assertEqual(sorted(units.values()), ['getty.service', 'init.scope', 'machine-audit.service',
-                                                  'ssh.service', 'user.service', 'worker.service'])
+        # mnt-ProjectX.mount names a path. The host name 'ubuntu' also redacts the legitimate
+        # ubuntu-advantage.service: the known cost of the name filter.
+        self.assertEqual(sorted(units.values()), ['getty.service', 'init.scope', 'machine-audit.service', 'mount',
+                                                  'redacted', 'ssh.service', 'user.service', 'worker.service'])
         self.assertTrue(all(re.fullmatch(r'cgroup:[0-9a-f]{16}:\d+', e) for e in units))
         user = next(e for e, label in units.items() if label == 'user.service')
         self.assertEqual(by_name(fields, user)['unit.processes'].value, 1)  # held in a nested app.slice
         getty = by_name(fields, next(e for e, label in units.items() if label == 'getty.service'))
         self.assertNotIn('unit.memory.current', getty)  # no memory controller: absent, not zero
         text = repr(fields)
-        for private in ('slice', 'tty1', '@', '/'):
+        for private in ('slice', 'tty1', '@', '/', 'ProjectX', 'ubuntu', '3f2a7c1e'):  # last: the raw boot id
             self.assertNotIn(private, text)
 
     def test_unit_samples_top_cpu_since_last_pass_largest_resident_and_own_processes(self):

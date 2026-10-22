@@ -47,8 +47,12 @@ def identity(salt, rel, directory):
 
 
 def leaf_name(rel):
-    """A templated unit is named by its template; the instance can carry private names."""
+    """A templated unit is named by its template; the instance can carry private names.
+    Mount, automount and swap units are named by their type: their names are escaped paths."""
     leaf = rel.rsplit('/', 1)[-1]
+    kind = leaf.rpartition('.')[2]
+    if kind in ('mount', 'automount', 'swap'):
+        return kind
     template, at, instance = leaf.partition('@')
     if not at:
         return leaf

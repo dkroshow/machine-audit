@@ -663,3 +663,19 @@ full avg10=0.00 avg60=0.00 avg300=0.00 total=100
 
 ==> /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/cgroup.procs <==
 1500
+==> /proc/sys/kernel/hostname <==
+ubuntu
+
+==> /sys/fs/cgroup/system.slice/mnt-ProjectX.mount/cgroup.procs <==
+
+==> /sys/fs/cgroup/system.slice/mnt-ProjectX.mount/cpu.stat <==
+usage_usec 1200
+user_usec 800
+system_usec 400
+
+==> /sys/fs/cgroup/system.slice/ubuntu-advantage.service/cgroup.procs <==
+
+==> /sys/fs/cgroup/system.slice/ubuntu-advantage.service/cpu.stat <==
+usage_usec 300
+user_usec 200
+system_usec 100
