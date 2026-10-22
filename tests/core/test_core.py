@@ -1,11 +1,13 @@
 """Synthetic boundary checks; never read live sources or the user's recorder."""
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import json
 import os
 from pathlib import Path
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -29,6 +31,83 @@ def reading(t,value,*,entity="host",label=None,name="cpu.counter",kind="counter"
 def record(t,value,seq,**kwargs):
     r=reading(t,value,**kwargs)
     return Record(r,"boot","run",seq,r.end.wall_ns,r.end)
+
+
+class HttpCapacityTests(unittest.TestCase):
+    @contextmanager
+    def full_server(self):
+        gates = [threading.Event() for _ in range(4)]
+        entered = threading.Condition()
+
+        class BlockedQuery:
+            collector = None
+            count = 0
+
+            def now(self, component, limit):
+                with entered:
+                    index = self.count
+                    self.count += 1
+                    entered.notify_all()
+                if index < len(gates):
+                    gates[index].wait(10)
+                return {"rows": []}
+
+        query = BlockedQuery()
+        server = make_server(query, "a" * 32, port=0)
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+
+        def request():
+            req = Request(f"http://127.0.0.1:{server.server_port}/api/now",
+                          headers={"Authorization": "Bearer " + "a" * 32})
+            try:
+                with urlopen(req, timeout=5) as response:
+                    return response.status, json.load(response)
+            except HTTPError as error:
+                return error.code, json.load(error)
+
+        try:
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                occupied = [pool.submit(request) for _ in gates]
+                try:
+                    with entered:
+                        self.assertTrue(entered.wait_for(lambda: query.count == 4, timeout=3))
+                    yield request, pool, gates
+                finally:
+                    for gate in gates:
+                        gate.set()
+                    for future in occupied:
+                        future.result(timeout=5)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_full_server_waits_for_a_slot_that_frees_soon(self):
+        """An authenticated fifth request waits instead of failing during a short query burst."""
+        with self.full_server() as (request, pool, gates):
+            waiting = pool.submit(request)
+            with self.assertRaises(TimeoutError):
+                waiting.result(timeout=0.15)
+            gates[0].set()
+            self.assertEqual(waiting.result(timeout=3), (200, {"rows": []}))
+
+    def test_full_server_limits_the_wait_to_two_seconds(self):
+        """A fifth request retains the capacity error after the bounded wait expires."""
+        with self.full_server() as (request, pool, gates):
+            started = time.monotonic()
+            self.assertEqual(pool.submit(request).result(timeout=4), (503, {"error": "query_capacity"}))
+            self.assertGreaterEqual(time.monotonic() - started, 1.8)
+
+    def test_full_server_rejects_more_than_four_waiters(self):
+        """Four waiting requests cannot grow into an unbounded queue of server threads."""
+        with self.full_server() as (request, pool, gates):
+            waiting = [pool.submit(request) for _ in range(4)]
+            for future in waiting:
+                with self.assertRaises(TimeoutError):
+                    future.result(timeout=0.1)
+            self.assertEqual(pool.submit(request).result(timeout=0.5), (503, {"error": "query_capacity"}))
+            self.assertTrue(all(not future.done() for future in waiting))
 
 
 class CoreTests(unittest.TestCase):

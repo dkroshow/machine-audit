@@ -3,6 +3,7 @@ import {el,card,empty,metric,signalsView,liveView,whoView,coverageView,statusVie
 import {storageView} from './storage.mjs';
 const $=id=>document.getElementById(id);
 let api=makeApi(readToken(window.location,window.history) ?? sessionStorage.getItem(tokenKey));
+const query=queryPool((...args)=>api(...args));
 const state={mode:'history',view:'overview',span:3600,range:null,abort:null,timer:null,catalog:null,whoSignal:null};
 const sections={
   cpu:[['Usage and capacity',/busy|capacity|cpu_count|user|system|idle|steal|logical|physical/],['Demand and constraints',/runnable|wait|pressure|thrott|quota|limit/]],
@@ -109,14 +110,13 @@ async function around(at,component) {
   const dialog=$('around-dialog');$('around-content').replaceChildren(empty('Loading the surrounding interval…'));
   if(!dialog.open)dialog.showModal();
   try {
-    const answer=await api('around',{component,at:at/1e9,span:60,limit:600});
+    const answer=await query('around',{component,at:at/1e9,span:60,limit:600});
     $('around-title').textContent=`Around ${time(at,true)}`;
     $('around-content').replaceChildren(el('p',{class:'note'},intervalEvidence(answer.series)),signalsView(answer.series),card('Programs in this interval',whoView(answer.who ?? {},()=>{})),card('Coverage',coverageView(answer.coverage)),card('Events',answer.events?.length ? el('ul',{class:'event-list'},answer.events.map(event=>el('li',{},`${time(event.wall_ns ?? event.start_ns,true)} · ${label(event.kind ?? event.signal)} · ${event.value ?? event.status ?? ''}`))) : el('p',{class:'note'},'No events returned for this interval.')));
   } catch(e){$('around-content').replaceChildren(empty(e.message));}
 }
 async function load() {
   clearTimeout(state.timer);state.abort?.abort();const controller=new AbortController();state.abort=controller;
-  const query=queryPool(api);
   state.view=route();const spec=views[state.view],component=spec.component ?? (state.view==='overview'||state.view==='coverage' ? undefined:state.view);
   $('view').classList.toggle('cost-view',state.view==='cost');
   $('view-title').textContent=spec.title;$('view-description').textContent=spec.description;document.title=`${spec.title} · Machine-audit`;

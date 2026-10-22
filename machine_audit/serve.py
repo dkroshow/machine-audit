@@ -13,6 +13,7 @@ def make_server(query, token: str, port=8765, dashboard=None, allowed_hosts=()):
     if len(token)<32:
         raise ValueError("API token is too short")
     slots=threading.BoundedSemaphore(4)
+    waiters=threading.BoundedSemaphore(4)
     root=Path(dashboard).resolve() if dashboard else Path(__file__).resolve().parent.parent/"dashboard"
 
     class Handler(BaseHTTPRequestHandler):
@@ -54,7 +55,14 @@ def make_server(query, token: str, port=8765, dashboard=None, allowed_hosts=()):
                 if len(self.headers.get_all("Authorization",[]))!=1 or len(supplied)>512 or not hmac.compare_digest(supplied,"Bearer "+token):
                     return self._send(401,{"error":"authentication_required"})
                 if not slots.acquire(blocking=False):
-                    return self._send(503,{"error":"query_capacity"})
+                    if not waiters.acquire(blocking=False):
+                        return self._send(503,{"error":"query_capacity"})
+                    try:
+                        acquired=slots.acquire(timeout=2)
+                    finally:
+                        waiters.release()
+                    if not acquired:
+                        return self._send(503,{"error":"query_capacity"})
                 try:
                     args=parse_qs(parsed.query,keep_blank_values=True)
                     if any(len(v)!=1 for v in args.values()):

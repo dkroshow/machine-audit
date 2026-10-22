@@ -112,11 +112,11 @@ test('all dashboard views render real stored replay without leaked tokens or fak
   await send('Fetch.enable',{patterns:[{urlPattern:'*/api/series*'}]});
   await run("location.hash='#overview'");
   try {
-    await until(()=>pendingOverview.size,count=>count===2,'Overview did not start two requests');
+    await until(()=>pendingOverview.size,count=>count===3,'Overview did not start three requests');
     await send('Fetch.continueRequest',{requestId:pendingOverview.get('cpu')});pendingOverview.delete('cpu');
     await until(()=>run("[...document.querySelectorAll('#view .card')].some(card=>card.querySelector('h2')?.textContent==='CPU'&&!card.querySelector('.loading-indicator'))"),Boolean,'First overview card did not paint while other queries were held');
     assert.equal(await run("document.querySelectorAll('#view .loading-indicator').length"),7);
-    await until(()=>pendingOverview.has('gpu'),Boolean,'A free request slot did not start the next component');
+    await until(()=>pendingOverview.has('storage'),Boolean,'A free request slot did not start the next component');
   } finally {
     for(const requestId of pendingOverview.values())await send('Fetch.continueRequest',{requestId});
     await send('Fetch.disable');
@@ -373,6 +373,6 @@ test('overview coverage and cost containment survive a crowded catalog',{timeout
   assert.deepEqual(issues,[]);
   assert.deepEqual(overviewRequests.map(request=>request.component).sort(),['cpu','gpu','heat','memory','network','power','self','storage']);
   assert.ok(overviewRequests.reduce((sum,request)=>sum+Number(request.limit),0)<=600,'Overview keeps its existing total row allowance');
-  assert.ok(overviewPeak<=2,'Overview leaves server capacity for other clients');
+  assert.ok(overviewPeak<=3,'The page leaves one server slot for other clients');
   assert.deepEqual(errors,[]);
 });

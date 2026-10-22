@@ -9,15 +9,13 @@ test('query pool delivers each result and reuses a free slot before the slow pee
     pending.set(name,()=>{active--;resolve(name);});
   }));
   const done=['cpu','memory','gpu','storage'].map(name=>query(name).then(value=>painted.push(value)));
-  assert.deepEqual([...pending.keys()],['cpu','memory']);
+  assert.deepEqual([...pending.keys()],['cpu','memory','gpu']);
   pending.get('cpu')();await new Promise(setImmediate);
   assert.deepEqual(painted,['cpu']);
-  assert.ok(pending.has('gpu'),'The third query starts while memory is still pending');
-  pending.get('gpu')();await new Promise(setImmediate);
-  assert.ok(pending.has('storage'));
-  pending.get('storage')();pending.get('memory')();await Promise.all(done);
-  assert.equal(peak,2);
-  assert.deepEqual(painted,['cpu','gpu','storage','memory']);
+  assert.ok(pending.has('storage'),'The fourth query starts while memory and GPU are still pending');
+  pending.get('storage')();pending.get('gpu')();pending.get('memory')();await Promise.all(done);
+  assert.equal(peak,3);
+  assert.deepEqual(painted,['cpu','storage','gpu','memory']);
 });
 
 test('query pool does not start queued work after its view is aborted',async()=>{
@@ -27,9 +25,9 @@ test('query pool does not start queued work after its view is aborted',async()=>
   const done=Promise.allSettled([0,1,2,3].map(()=>query('series',{},controller.signal)));
   controller.abort();pending.forEach(resolve=>resolve());
   const results=await done;
-  assert.equal(started,2);
-  assert.deepEqual(results.map(result=>result.status),['fulfilled','fulfilled','rejected','rejected']);
-  assert.equal(results[2].reason.name,'AbortError');
+  assert.equal(started,3);
+  assert.deepEqual(results.map(result=>result.status),['fulfilled','fulfilled','fulfilled','rejected']);
+  assert.equal(results[3].reason.name,'AbortError');
 });
 
 test('fragment bootstrap removes the secret before navigation and API uses a header',async()=>{
@@ -58,6 +56,33 @@ function tokenStorage() {
   const values=new Map([['machine-audit.token','synthetic']]);
   return {getItem:key=>values.get(key) ?? null,setItem:(key,value)=>values.set(key,value),removeItem:key=>values.delete(key)};
 }
+
+test('query capacity retries recover without retrying unrelated failures',async()=>{
+  let calls=0;
+  const api=makeApi('synthetic',async()=>++calls===1 ? {status:503,json:async()=>({error:'query_capacity'})} : {ok:true,status:200,json:async()=>({rows:['ready']})});
+  assert.deepEqual(await api('now'),{rows:['ready']});
+  assert.equal(calls,2);
+  calls=0;
+  const other=makeApi('synthetic',async()=>{calls++;return {status:503,json:async()=>({error:'other_failure'})};});
+  await assert.rejects(other('now'),/HTTP 503/);
+  assert.equal(calls,1);
+});
+
+test('query capacity stops after four total attempts',async()=>{
+  let calls=0;
+  const api=makeApi('synthetic',async()=>{calls++;return {status:503,json:async()=>({error:'query_capacity'})};});
+  await assert.rejects(api('now'),{message:'The now request failed (HTTP 503). No missing values have been replaced with zero.'});
+  assert.equal(calls,4);
+});
+
+test('aborting a capacity backoff prevents the next request',async()=>{
+  const controller=new AbortController();let calls=0;
+  const api=makeApi('synthetic',async()=>{calls++;return {status:503,json:async()=>({error:'query_capacity'})};});
+  const timer=setTimeout(()=>controller.abort(),25);
+  try {await assert.rejects(api('now',{},controller.signal),{name:'AbortError'});}
+  finally {clearTimeout(timer);}
+  assert.equal(calls,1);
+});
 
 test('authorization failures clear the per-tab token and stop further requests',async()=>{
   for(const status of [401,403]) {

@@ -103,7 +103,7 @@ export function readToken(location, history) {
 }
 const unauthorizedMessage='This session is not authorized. Open the dashboard link again with its #token=... fragment; the operator finds the current link with machine-audit open on the machine.';
 export const tokenKey='machine-audit.token';
-const QUERY_CONCURRENCY=2;
+const QUERY_CONCURRENCY=3;
 export function queryPool(request) {
   const queued=[];let active=0;
   function start() {
@@ -130,7 +130,22 @@ export function makeApi(token, fetcher=fetch, storage=globalThis.sessionStorage)
     if (!token) throw Object.assign(new Error(unauthorizedMessage),{status:401});
     const query=new URLSearchParams();
     for (const [key,value] of Object.entries(parameters)) if (value !== undefined && value !== null) query.set(key,Array.isArray(value) ? value.join(',') : String(value));
-    const response=await fetcher(`/api/${shape}${query.size ? '?'+query : ''}`, {headers:{Authorization:`Bearer ${token}`},credentials:'omit',cache:'no-store',signal});
+    const delays=[500,1000,2000];
+    let response;
+    for(let attempt=0;attempt<=delays.length;attempt++) {
+      if(signal?.aborted)throw signal.reason;
+      response=await fetcher(`/api/${shape}${query.size ? '?'+query : ''}`, {headers:{Authorization:`Bearer ${token}`},credentials:'omit',cache:'no-store',signal});
+      if(response.status!==503 || attempt===delays.length)break;
+      let failure;
+      try {failure=await response.json();} catch {break;}
+      if(failure?.error!=='query_capacity')break;
+      await new Promise((resolve,reject)=>{
+        if(signal?.aborted) {reject(signal.reason);return;}
+        const abort=()=>{clearTimeout(timer);reject(signal.reason);};
+        const timer=setTimeout(()=>{signal?.removeEventListener('abort',abort);resolve();},delays[attempt]);
+        signal?.addEventListener('abort',abort,{once:true});
+      });
+    }
     if (response.status === 401 || response.status === 403) unauthorized(response.status);
     if (!response.ok) throw new Error(`The ${shape} request failed (HTTP ${response.status}). No missing values have been replaced with zero.`);
     const answer=await response.json();
