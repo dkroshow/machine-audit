@@ -89,6 +89,23 @@ class LinuxScannerTests(unittest.TestCase):
         row = MapQuery(self.data / 'scanner.sqlite').query('volumes', volume_id=volume)['rows'][0]
         self.assertEqual((row['status'], row['valid'], row['gaps']), ('observed', True, ['physical_residual_not_computed']))
 
+    def test_a_mapped_volume_that_turns_denied_keeps_its_map_age_and_waits(self):
+        # Review: a denied attempt overwrote the published map's observed time.
+        volume = self.scan()['volumes'][0]['volume_id']
+        db = sqlite3.connect(self.data / 'scanner.sqlite')
+        with db:  # a map old enough that every hourly run would walk it again
+            db.execute('UPDATE volumes SET full_ns=full_ns-?', (41 * 3600 * 10**9,))
+        db.close()
+        before = MapQuery(self.data / 'scanner.sqlite').query('volumes')['rows'][0]['observed_ns']
+        os.chmod(self.root, 0o311)
+        try:
+            self.assertEqual(self.scan()['volumes'][0]['status'], 'denied')
+            self.assertEqual(self.scan()['volumes'][0]['status'], 'current')  # not retried the next hour
+        finally:
+            os.chmod(self.root, 0o755)
+        row = MapQuery(self.data / 'scanner.sqlite').query('volumes', volume_id=volume)['rows'][0]
+        self.assertEqual((row['status'], row['observed_ns']), ('denied', before))
+
     def test_hourly_runs_walk_in_full_only_at_night_once_a_day(self):
         self.scan()
         later = time.time_ns() + 21 * 3600 * 10**9

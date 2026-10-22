@@ -56,6 +56,20 @@ class CoreTests(unittest.TestCase):
         gaps=[g for g in Query(self.store).coverage(0,600*S)["gaps"] if g.get("signal")=="network.ping_rtt"]
         self.assertEqual([(g["reads"],g["start_ns"],g["end_ns"]) for g in gaps],[(60,0,295*S),(59,305*S,595*S)])
 
+    def test_a_field_absent_from_its_readings_ends_its_coverage_row(self):
+        # Review probe: unobserved 0-55 s, absent from the readings for 600 s, unobserved
+        # 660-715 s gave one row 0-715 s.
+        records=[]
+        for n,t in enumerate(range(0,720,5)):
+            c=Clock(t*S,t*S,t*S)
+            fields=[Field("network.dns",5,"ns")]
+            if t<60 or t>=660:
+                fields.append(Field("network.ping_rtt",None,"ns",status="unobserved",entity="router",scope="router"))
+            records.append(Record(Reading("synthetic.probes","network",c,c,tuple(fields)),"boot","run",n+1,c.wall_ns,c))
+        self.store.append(records)
+        gaps=[g for g in Query(self.store).coverage(0,720*S)["gaps"] if g.get("signal")=="network.ping_rtt"]
+        self.assertEqual([(g["reads"],g["start_ns"],g["end_ns"]) for g in gaps],[(12,0,55*S),(12,660*S,715*S)])
+
     def test_hour_only_scope_writes_no_minute_summaries(self):
         # Per-scope summary resolution: Linux unit limits (scope unit_detail) were 10% of the first
         # Ubuntu run's summary payload while changing rarely.

@@ -326,11 +326,17 @@ class Query:
                 yield from points([record],previous)
                 previous[record.reading.source]=record
         # A field missing read after read (a closed ICMP path, an absent sensor) is one gap
-        # row spanning those reads, with their count; any good read of it ends the row.
-        open_rows={}
+        # row spanning those reads, with their count. A good read of it, or a reading of its
+        # source that does not carry it, ends the row.
+        open_rows={};record=None;carried=set()
         for p in derived if derived is not None else streamed_points():
-            if p["end_ns"]<start_ns or p["start_ns"]>end_ns:continue
             key=(p["run_id"],p["source"],p["signal"],p["entity"])
+            if (p["run_id"],p["sequence"])!=record:
+                if record:
+                    for stale in [k for k in open_rows if k[:2]==(record[0],source) and k not in carried]:del open_rows[stale]
+                record,source,carried=(p["run_id"],p["sequence"]),p["source"],set()
+            carried.add(key)
+            if p["end_ns"]<start_ns or p["start_ns"]>end_ns:continue
             if p["status"] not in GOOD or p["sleep_s"]:
                 status=p["status"] if not p["sleep_s"] else "unobserved"
                 reason=p.get("reason","window_contains_sleep" if p["sleep_s"] else "source_status")

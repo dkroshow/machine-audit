@@ -77,8 +77,9 @@ def run_scan(data_dir, *, full=False, grain='files', roots=None, exclusions=(), 
                 now = time.time_ns()
                 # A root the service user cannot read is retried on the same schedule as a full walk,
                 # counted from the last denied attempt, not every hourly run.
-                denied = not has_root and old and old['status'] == 'denied' and old['observed_ns']
-                age = now - old['full_ns'] if has_root else now - old['observed_ns'] if denied else None
+                denied = old and old['status'] == 'denied' and store.db.execute(
+                    'SELECT observed_ns FROM denied WHERE volume=?', (volume.id,)).fetchone()
+                age = now - denied[0] if denied else now - old['full_ns'] if has_root else None
                 # Full when there is no map, when an operator forces one, at night or on request once
                 # a day, or when nights were missed.
                 night = time.localtime(now / 1e9).tm_hour in NIGHT_HOURS
@@ -105,8 +106,8 @@ def run_scan(data_dir, *, full=False, grain='files', roots=None, exclusions=(), 
                         store.buffer.clear()
                         store.buffer_bytes = 0
                         store.observe_unscanned(volume, 'denied', lean=False)
-                        with store.write():
-                            store.db.execute('UPDATE volumes SET observed_ns=? WHERE id=?', (time.time_ns(), volume.id))
+                        with store.write():  # the attempt, apart from any published map's age
+                            store.db.execute('INSERT OR REPLACE INTO denied VALUES(?,?)', (volume.id, time.time_ns()))
                         results.append({'volume_id': volume.id, 'status': 'denied', 'action': action})
                         continue
                     if not walker.listed:

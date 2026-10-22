@@ -67,6 +67,8 @@ CREATE TABLE IF NOT EXISTS hierarchy_nodes(
  volume TEXT NOT NULL,version TEXT NOT NULL,id TEXT NOT NULL,parent TEXT,label TEXT,present INTEGER NOT NULL,
  rank INTEGER NOT NULL,first_rank INTEGER NOT NULL,PRIMARY KEY(volume,version,rank),UNIQUE(volume,version,id)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS dirty(volume TEXT,id TEXT,due_ns INTEGER,PRIMARY KEY(volume,id)) WITHOUT ROWID;
+-- The last time a volume's root was refused, kept apart from its published map's times.
+CREATE TABLE IF NOT EXISTS denied(volume TEXT PRIMARY KEY,observed_ns INTEGER NOT NULL) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS runs(
  id TEXT PRIMARY KEY,started_ns INTEGER NOT NULL,updated_ns INTEGER NOT NULL,ended_ns INTEGER,
  pid INTEGER NOT NULL,pid_start TEXT,status TEXT NOT NULL,entries INTEGER NOT NULL DEFAULT 0,cpu_ns INTEGER NOT NULL,
