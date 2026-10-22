@@ -158,8 +158,9 @@ not do, and never fills a gap with zero.
 
 ## Permissions, private data, and dashboard access
 
-- **Normal-user baseline.** Optional privileged sources, including a Mac helper,
-  have separate disclosed access decisions. Linux scheduler statistics are never
+- **Normal-user baseline.** The optional Mac administrator helper is not shipped
+  yet. Future privileged sources require separate disclosed access decisions.
+  Linux scheduler statistics are never
   enabled silently. Without helper access, other users' CPU is a labelled
   remainder; their memory is uncovered, never subtracted. No remediation path exists.
 - **Private data directory**, mode 0700, holds the database, WAL, shared-memory

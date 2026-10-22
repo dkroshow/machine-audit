@@ -7,6 +7,7 @@ while making its own operating cost visible. Humans use a dashboard; agents
 use a query interface backed by the same evidence.
 
 Built for my own workflow. One maintainer, best effort.
+Developed privately since 2026.
 
 The first Mac, nicknamed Big Mac, is in an installation trial. Native collection,
 permissions, operating cost and folder accounting are still being validated;
@@ -64,8 +65,9 @@ Other query commands are `catalog`, `status`, `series`, `who`, `coverage`,
 
 State on disk: recordings and config live in `~/.local/share/machine-audit`.
 Setup states a 10 GB storage limit, with a warning from 5 GB. The dashboard
-server binds to `127.0.0.1:8765` by default with a per-run token. Optional
-Tailscale Serve access requires configuration in setup.
+server binds to `127.0.0.1:8765` by default with a per-run token. You configure
+any proxy yourself; Tailscale Serve is one option. Setup's optional Tailscale
+hostname only adds that hostname to the allowed Host/Origin values.
 
 ## Network activity
 

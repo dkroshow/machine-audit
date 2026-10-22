@@ -14,14 +14,12 @@ product guidance, adapted and verified by the agent on each machine.
 | Target | Known inventory | Evidence still needed |
 | --- | --- | --- |
 | Big Mac | Intel Mac Pro 2019; 384 GiB RAM; AMD Radeon Pro W5500X, 8 GB VRAM | The new Python implementation's correctness and operating cost |
-| Ubuntu AWS instance | Supplied inventory: EC2 t3a.large, x86-64, AMD EPYC 7571, 2 vCPUs, 8 GiB RAM, 3 GiB swap; 107 GB EBS disk with ext4; Ubuntu 26.04 LTS, kernel 7.0.0-1009-aws; framebuffer display, no GPU reported | Current configuration, exposed sources, permissions and cost |
-| Ubuntu physical workstation | Physical machine running Ubuntu; Tailscale already present | Hardware, OS/kernel, GPU/driver and available sources, discovered during implementation |
+| Ubuntu cloud instance | Ubuntu cloud instance, 2 vCPU class, no GPU | Current configuration, exposed sources, permissions and cost |
+| Ubuntu physical workstation | Physical machine running Ubuntu | Hardware, OS/kernel, GPU/driver and available sources, discovered during implementation |
 
-The AWS values came from user-supplied command output on October 20, 2026.
-They are an example-device inventory, not a Machine-audit validation result.
-Both Ubuntu machines and Big Mac already use Tailscale. Network membership does
-not imply that every device may view every dashboard; access follows the owner's
-Tailscale policy and the application's authentication.
+The Ubuntu rows describe planned target classes, not validated installations.
+Network membership does not imply that every device may view every dashboard;
+access follows the user's network policy and the application's authentication.
 
 All seven components are in the first Big Mac trial: CPU, memory, GPU, storage,
 network, power and heat. The dashboard and agent interface must expose their
@@ -121,7 +119,7 @@ The scanner and full process workload require their own native measurements.
 4. Verify every component, live and historical views, agent queries, dashboard access,
    and the [budget and failure behavior](architecture.md#failure-behavior). Measure
    collector and scanner cost under real workloads; retain the results and gaps.
-5. If rollback is needed, stop Machine-audit's collector, scanner and optional helper,
+5. If rollback is needed, stop Machine-audit's collector and scanner,
    restore the prior dashboard route if changed, and resume the prior recorder's
    services. Preserve Machine-audit's trial data for investigation.
 
@@ -132,11 +130,11 @@ Readable old history remains in the predecessor's own store.
 
 ## Dashboard access
 
-Assume Tailscale for the initial machines. The application remains bound to
-loopback; [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve)
-provides a private HTTPS address for the dashboard. The installer configures the
-one permitted hostname, verifies the intended viewers' access, and returns the
-browser URL through the authenticated opening flow in the
+The dashboard binds to loopback (`127.0.0.1:8765` by default). You can front it
+with a proxy of your choice; [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve)
+is one example. Configure the proxy and verify viewers' access yourself.
+Setup's optional Tailscale hostname only adds that one hostname to the allowed
+Host/Origin values; it does not configure Tailscale or a proxy. See the
 [architecture](architecture.md#permissions-private-data-and-dashboard-access).
 Keep the per-run application token requirement through the proxy; do not place
 credentials in logs, ordinary query strings or shared setup notes.
@@ -146,3 +144,21 @@ services or broaden access to make a connection work. Validate Host/Origin check
 permitted and denied requests, and reopening after a restart. Public exposure via
 Funnel is outside this rollout. The [Cloudflare log and feedback path](storage-approach.md#remote-retrieval)
 serves recorded-data transfer and remains separate from live dashboard access.
+
+## Uninstall
+
+There is no uninstall command. Stop the two launch agents, then remove the CLI,
+application files and job definitions:
+
+```sh
+machine-audit stop
+rm ~/.local/bin/machine-audit
+rm -r ~/Library/Application\ Support/machine-audit
+rm ~/Library/LaunchAgents/local.machine-audit.collector.plist
+rm ~/Library/LaunchAgents/local.machine-audit.scanner.plist
+```
+
+Keep `~/.local/share/machine-audit` unless you choose to delete it separately.
+It contains recordings, config, the API token and identity salt. If you granted
+Full Disk Access, you can remove the "Machine-audit Scanner" entry in System
+Settings.

@@ -49,7 +49,7 @@ exposes; matching cadence does not make different signals equivalent.
 | CPU usage and runnable demand | 1 s | macOS host CPU ticks and processor-set load; Ubuntu `/proc/stat` and supported host contention counters |
 | Machine memory, swap and pressure | 1 s | macOS VM page classes/counters, swap usage, pressure level and swap-housekeeping counters; Ubuntu `meminfo`, `vmstat`, host memory PSI |
 | User-process CPU, memory, writes and wake-ups | 10 s | macOS `proc_pid_rusage` plus `TASK_VM_INFO` memory effects, graphics footprint and limit headroom; Ubuntu process CPU and `status` memory fields, other counters where available |
-| System-process CPU and memory via Mac helper | About 60 s | Separate privileged source; not an idle setting |
+| System-process CPU and memory via Mac helper | About 60 s (planned) | Helper not shipped yet; separate privileged source, not an idle setting |
 | Ubuntu workload-group memory | 10 s | cgroup usage, movement, PSI and event counters; use one non-overlapping level for totals |
 | GPU device activity and memory | 5 s | Per GPU; IORegistry on macOS, supported driver interfaces on Ubuntu; include exposed engines, memory classes, clocks and limits |
 | GPU client/process attribution | 10 s | macOS client time; Ubuntu driver client/engine time and memory where available |
@@ -57,7 +57,7 @@ exposes; matching cadence does not make different signals equivalent.
 | Main temperatures, reported power, CPU speed limit, battery | 5 s | Available device/sensor readings |
 | Full temperature-sensor sweep | 60 s | Available sensors |
 | Fans | 5 s | Keep the prototype's cost-based 60 s fallback for slow sensor reads |
-| CPU-package power and frequency via optional helper | 30 s | Existing Mac helper source, when available |
+| CPU-package power and frequency via optional helper | 30 s (planned) | Helper not shipped yet |
 | Network traffic and Wi-Fi link | 10 s | Interface counters and available link fields |
 | Router/internet latency and loss | 5 s | Existing alternating internet targets each receive a probe every 10 s |
 | DNS and connection probes | 60 s | Existing bounded probes |

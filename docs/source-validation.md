@@ -1,9 +1,9 @@
 # Sources and scanner: implementation and evidence
 
-Python 3.12 and the standard library are required. There are no added packages
-or compiled helpers. Imports do not start collection. All seven component
-adapters are implemented for the initial Intel Mac target; optional access and
-untested hardware remain explicit gaps.
+The Mac trial is running; Linux support is being built. Python 3.12 and the
+standard library are required, and installation compiles a native scanner
+launcher. Imports do not start collection. Optional access and untested
+hardware remain explicit gaps.
 
 ## Evidence ledger
 
@@ -97,9 +97,10 @@ accumulators retain their raw values with unobserved interval coverage. No rate
 is invented from the dictionary-call duration. Driver percentages retain an
 unknown window. Driver creator text contributes only a numeric PID.
 
-Optional root sources report `not_enabled/shipped_helper_required`; the old
-helper is not invoked. Integration needs the owner's shipped, narrow helper
-protocol for raw rusage/task-VM records and bounded package-power samples.
+Optional root sources report `not_enabled/shipped_helper_required`; no
+administrator helper is shipped yet, and the old helper is not invoked.
+Future integration needs a narrow helper protocol for raw rusage/task-VM
+records and bounded package-power samples.
 There is no configurable executable/command bridge.
 
 Network latency is kernel-receive time minus send time. Router and internet

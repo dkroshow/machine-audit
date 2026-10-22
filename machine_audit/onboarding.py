@@ -82,7 +82,7 @@ def inspect(config: Config) -> dict:
             if name == "scanner":
                 actions.append("Grant Full Disk Access to the installed scanner, then confirm access through that scanner.")
             else:
-                actions.append("Complete the optional helper installation, then confirm its authenticated connection.")
+                actions.append("The optional helper is not shipped yet; your choice is recorded for later.")
     collector = runtime.get("collector") or {}
     source_states = collector.get("sources", [])
     gpu_status = next((s.get('status') for s in source_states if s.get('source') == 'macos.gpu'), 'unobserved')
@@ -169,7 +169,7 @@ def setup(config: Config, *, json_output: bool = False) -> int:
             "Include protected disk areas? Requires Full Disk Access for the scanner.",
             bool(config.source_options.get("scan_protected_requested", False)))
         proposed.source_options["helper_requested"] = _yes_no(
-            "Include system process and package power detail? Requires an optional administrator-installed helper.",
+            "Record interest in system process and package power detail for later? The optional helper is not shipped yet.",
             bool(config.source_options.get("helper_requested", False)))
         proposed.enabled['scanner'] = True
         proposed.enabled['gpu'] = _yes_no(
@@ -181,7 +181,7 @@ def setup(config: Config, *, json_output: bool = False) -> int:
         proposed.validate()
         print(f"Dashboard: {proposed.tailscale_host or 'this machine only'}")
         print(f"Private recordings: {proposed.root}")
-        print("Access choices are requests. The running scanner and helper must confirm permission.")
+        print("Access choices are requests. The running scanner must confirm permission; the helper is not shipped yet, so its choice is recorded for later.")
         if not _yes_no("Save these choices?", True):
             print("Cancelled; no settings changed.")
             return 1
