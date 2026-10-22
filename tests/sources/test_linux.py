@@ -155,7 +155,9 @@ class LinuxSourceTests(unittest.TestCase):
         self.edit('sys/fs/cgroup/system.slice/ssh.service/cpu.stat', 'usage_usec 600000', 'usage_usec 900000')
         collector.ingest(ReadSource('linux.workloads', 'cpu', 10, self.host.workloads).read())
         try:
-            rows = Query(store, collector).who(start - 10**9, Clock.now().wall_ns + 10**9, component='cpu')['rows']
+            query, end = Query(store, collector), Clock.now().wall_ns + 10**9
+            rows = query.who(start - 10**9, end, component='cpu')['rows']
+            memory_rows = query.who(start - 10**9, end, component='memory')['rows']
         finally:
             store.close()
         signals = {r['signal'] for r in rows}
@@ -168,6 +170,12 @@ class LinuxSourceTests(unittest.TestCase):
         # Each workload ranks once, by its total; user and system time need --signal.
         self.assertEqual(len(rows), len({r['entity'] for r in rows}), signals)
         self.assertLessEqual(signals, {'unit.cpu.stat.usage_usec', 'process.cpu'})
+        # Memory ranks each unit once, by its charge; breakdowns and process resident sets need --signal.
+        memory = [r for r in memory_rows if r['kind'] != 'state']
+        self.assertTrue(memory)
+        self.assertEqual({r['signal'] for r in memory}, {'unit.memory.current'})
+        self.assertEqual(len(memory), len({r['entity'] for r in memory}))
+
         self.assertFalse(signals & {'unit.cpu.weight', 'unit.cpu.max.quota', 'unit.processes', 'unit.cpu.pressure.some',
                                     'unit.cpu.stat.nr_periods'})
 

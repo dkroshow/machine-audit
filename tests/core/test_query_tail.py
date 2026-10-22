@@ -123,8 +123,9 @@ class QueryTailTests(unittest.TestCase):
         # First Ubuntu run: an 8-row page showed 4 consumers, each as its total and its user time.
         # The Mac-shaped pass showed the same, with system, child, runnable and wakeup rows too.
         self.populate(count=8)
-        for component, total in (('cpu', 'process.cpu'), ('storage', 'process.diskio_byteswritten')):
-            rows = [r for r in self.query.who(0, 20*S, component=component, limit=75)['rows'] if r['additive']]
+        for component, total in (('cpu', 'process.cpu'), ('storage', 'process.diskio_byteswritten'),
+                                 ('memory', 'process.phys_footprint')):
+            rows = [r for r in self.query.who(0, 20*S, component=component, limit=75)['rows'] if r['kind'] != 'state']
             self.assertEqual({r['signal'] for r in rows}, {total}, component)
             self.assertEqual(len(rows), len({r['entity'] for r in rows}), component)
 

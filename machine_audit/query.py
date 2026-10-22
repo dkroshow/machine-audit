@@ -12,10 +12,12 @@ from .derive import points, rollups, summarize, merge_summaries, GOOD, BUSY
 from .store import MINUTE, HOUR, unpack_summaries
 from .model import Record, field_component, is_process_evidence, is_series
 
-# Without a named signal, each workload ranks once, by its component total. CPU components,
-# child time and wakeups, and read bytes, need an explicit signal.
+# Without a named signal, each workload ranks once, by its component total: CPU time, written
+# bytes, and the memory view's footprint (Mac footprint; a Linux unit's charge, which already
+# holds its processes' resident sets). Components need an explicit signal.
 WHO_TOTALS = {"cpu": {"process.cpu", "unit.cpu.stat.usage_usec"},
-              "storage": {"process.diskio_byteswritten", "unit.io.stat.wbytes"}}
+              "storage": {"process.diskio_byteswritten", "unit.io.stat.wbytes"},
+              "memory": {"process.phys_footprint", "unit.memory.current"}}
 
 MAX_ROWS = 2000
 MAX_SCAN = 20000
@@ -444,7 +446,8 @@ class Query:
             heap=[];count=0;attributed=None;lo=None;hi=None;partial=False;boundary=False
             for r in candidates:
                 if not self._who_row(r):continue
-                if signal is None and r["additive"] and r["signal"] not in WHO_TOTALS.get(r["component"],(r["signal"],)):continue
+                # States and events (failed reads, identities) remain evidence.
+                if signal is None and r["kind"] not in ("state","event") and r["signal"] not in WHO_TOTALS.get(r["component"],(r["signal"],)):continue
                 count+=1;lo=r["start_ns"] if lo is None else min(lo,r["start_ns"]);hi=r["end_ns"] if hi is None else max(hi,r["end_ns"])
                 partial=partial or r.get("partial_members",False);boundary=boundary or r.get("partial_boundary",False)
                 if signal=="process.cpu" and r["total"] is not None:attributed=(attributed or 0)+r["total"]*r["scale"]
