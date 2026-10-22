@@ -39,6 +39,12 @@ permissions, or contact an external server. Temporary HTTP servers bind an
 assigned loopback port and shut down within the test. While editing, run only
 the affected suite, for example `python3.12 -m unittest discover -s tests/core -v`.
 
+To see where query time goes on a real store, run
+`python3 scripts/profile_queries.py [readings.sqlite] [limit]` on the box that
+holds it. It opens the store read-only, runs coverage, series and who over the
+last hour, and prints each answer's time and size with the top functions by
+file name. The output holds no row content and is safe to share.
+
 Test scratch directories live inside the checkout (`tests/<suite>/.tmp`).
 Budget admits a SQLite write only when the filesystem has free space for the
 unused part of the cap plus a 64 MiB margin. With the default 10 GB cap, a filesystem with

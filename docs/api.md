@@ -296,7 +296,10 @@ with reason `summary_status` (or `window_contains_sleep`), `reads` counting thos
 samples and `summary_resolution`. Read-level reasons such as `baseline` appear
 in coverage of ten minutes or less and in `who`. A source that reports a status
 without fields (for example `unavailable` with `no_devices`) keeps its reason in
-saved coverage, so that gap row appears at every window length.
+saved coverage, so that gap row appears at every window length. A summary row
+whose stored payload cannot be decoded (damage on disk) is skipped and reported
+as a gap with status `unreadable` and reason `summary_damaged`, naming the
+source, bucket and `summary_resolution`; the rest of the answer is unaffected.
 
 Summary selection uses aligned bucket identities. An observed counter window
 may cross a requested edge; it is retained whole and marked `partial_boundary`.

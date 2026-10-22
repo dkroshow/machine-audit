@@ -6,6 +6,7 @@ import json
 import time
 import threading
 import math
+import zlib
 import heapq
 from dataclasses import replace
 from itertools import chain, groupby
@@ -78,6 +79,8 @@ class Query:
         if getattr(self._local,"snapshot",None) is not None:
             yield self._local.snapshot
             return
+        # Damaged summary payloads met by this query; coverage reports them.
+        self._local.damaged=set()
         if self.collector:
             with self.collector.lock:
                 captured=self.collector.snapshot(start_ns,end_ns)
@@ -189,10 +192,15 @@ class Query:
         if program_only:clause+=" AND entity LIKE 'program:%'"
         # Sort compact row identities, never compressed payloads. The snapshot
         # keeps these lookups stable while a writer replaces cumulative rows.
-        cursor=db.execute("SELECT id,bucket_ns,resolution FROM summaries WHERE "+clause+" ORDER BY source,entity,bucket_ns",args)
-        for identifier,bucket,res in cursor:
+        cursor=db.execute("SELECT id,bucket_ns,resolution,source FROM summaries WHERE "+clause+" ORDER BY source,entity,bucket_ns",args)
+        for identifier,bucket,res,source in cursor:
             payload=db.execute("SELECT payload FROM summaries WHERE id=?",(identifier,)).fetchone()[0]
-            for row in unpack_summaries(payload):
+            try:rows=unpack_summaries(payload)
+            except (zlib.error,ValueError):
+                # A payload damaged on disk (crash, recovery) is a reported gap,
+                # not a failed answer for every window that contains it.
+                self._local.damaged.add((source,bucket,res));continue
+            for row in rows:
                 if series_only and not is_series(row["component"],row["entity"],row["scope"]):continue
                 if signals and row["signal"] not in signals:continue
                 if row["start_ns"] >= end_ns or row["end_ns"] < start_ns:continue
@@ -391,6 +399,9 @@ class Query:
                     gap={"source":source,"status":status,"reason":reason,"start_ns":max(start_ns,row_start),"end_ns":min(end_ns,row_end),"reads":count,"run_id":run_id}
                     saved_gaps[(source,status,reason)]=gap;gaps.append(gap)
         for gap in saved_gaps.values():del gap["run_id"]
+        for source,bucket,res in sorted(getattr(self._local,"damaged",())):
+            gaps.append({"status":"unreadable","reason":"summary_damaged","source":source,"start_ns":max(start_ns,bucket),
+                         "end_ns":min(end_ns,bucket+WIDTHS[res]),"summary_resolution":res})
         if captured:
             for record in captured["tail"]:
                 if start_ns<=record.end_ns<=end_ns and record.matches(component):

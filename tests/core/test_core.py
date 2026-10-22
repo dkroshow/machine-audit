@@ -325,6 +325,19 @@ class CoreTests(unittest.TestCase):
             self.assertEqual([(g['reason'],g['status']) for g in gaps],[('no_devices','unavailable')])
             self.assertEqual((gaps[0]['start_ns'],gaps[0]['end_ns']),(0,3590*S))
 
+    def test_damaged_summary_payload_is_a_reported_gap_not_a_failed_answer(self):
+        """A store recovered after a crash held hour rows zlib could not decode; every
+        day-window query then failed. The damaged row is skipped and named in coverage."""
+        rows=[Record(reading(s,s,name='cpu.busy'),'boot','run',1+i,s*S,Clock(s*S,s*S,s*S)) for i,s in enumerate(range(60,7260,60))]
+        self.store.append(rows)
+        self.store.db.execute("UPDATE summaries SET payload=X'78da0300' WHERE resolution='hour' AND bucket_ns=?",(3600*S,))
+        query=Query(self.store)
+        for answer in (query.series(0,7260*S,component='cpu',limit=2),query.coverage(0,7260*S)):
+            damaged=[g for g in answer['gaps'] if g['reason']=='summary_damaged']
+            self.assertEqual([(g['status'],g['source'],g['start_ns'],g['end_ns'],g['summary_resolution']) for g in damaged],
+                             [('unreadable','synthetic',3600*S,7200*S,'hour')])
+        self.assertTrue(query.series(0,7260*S,component='cpu',limit=2)['rows'])
+
     def test_memory_from_bundled_cpu_pass_is_queryable_without_another_read(self):
         c=Clock(10*S,10*S,10*S)
         fields=(Field("process.phys_footprint",100,"bytes",entity="process:1",label="Editor",scope="footprint",component="memory"),)
