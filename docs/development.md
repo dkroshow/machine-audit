@@ -28,6 +28,14 @@ permissions, or contact an external server. Temporary HTTP servers bind an
 assigned loopback port and shut down within the test. While editing, run only
 the affected suite, for example `python3.12 -m unittest discover -s tests/core -v`.
 
+Test scratch directories live inside the checkout (`tests/<suite>/.tmp`).
+Budget admits a SQLite write only when the filesystem has free space for the
+unused part of the cap plus a 64 MiB margin. With the default 10 GB cap, a filesystem with
+less free space refuses every write as `free_space_margin`. A test that writes
+through a store should pass a small `limit_bytes`, as the core tests do. Setup
+refuses a data directory on such a filesystem, and doctor shows the free bytes
+required and available.
+
 The integrated implementation of the October 21 trial build passed 141 Python tests and eight Node
 checks, including headless Chrome across all dashboard views, with no skips.
 These synthetic checks remain separate from the native trial observations below.

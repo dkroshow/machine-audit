@@ -9,10 +9,24 @@ import shutil
 import threading
 
 GB = 1_000_000_000
+LIMIT_BYTES = 10 * GB
+FREE_MARGIN_BYTES = 64 * 1024**2
 
 
 class BudgetExceeded(RuntimeError):
     pass
+
+
+def free_space(root: str | Path) -> dict:
+    """Free bytes the default cap needs at its worst sqlite_write peak, and free bytes now.
+
+    Managed files already on disk hold their share. Reads only; root may not exist yet.
+    """
+    root = Path(root)
+    used = sum(p.stat().st_size for p in root.iterdir() if p.is_file()) if root.is_dir() else 0
+    existing = next(p for p in (root, *root.parents) if p.exists())
+    return {"required_free_bytes": max(0, LIMIT_BYTES + FREE_MARGIN_BYTES - used),
+            "free_bytes": shutil.disk_usage(existing).free}
 
 
 class Budget:
@@ -21,8 +35,8 @@ class Budget:
     Writers reserve a conservative peak, including SQLite journal growth. All
     managed files live directly in root. Never write outside this protocol.
     """
-    def __init__(self, root: str | Path, limit_bytes: int = 10 * GB,
-                 warning_bytes: int = 5 * GB, free_margin_bytes: int = 64 * 1024**2):
+    def __init__(self, root: str | Path, limit_bytes: int = LIMIT_BYTES,
+                 warning_bytes: int = 5 * GB, free_margin_bytes: int = FREE_MARGIN_BYTES):
         self.root = Path(root)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         if self.root.is_symlink():

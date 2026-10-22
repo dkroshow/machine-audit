@@ -2,6 +2,7 @@
 from contextlib import redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -9,6 +10,14 @@ from unittest.mock import patch
 
 from machine_audit.config import Config
 from machine_audit.onboarding import _permission, doctor, setup
+
+# The default 10 GB cap plus Budget's 64 MiB free-space margin.
+REQUIRED_FREE = 10_000_000_000 + 64 * 1024**2
+
+
+def free_bytes(free):
+    """The data directory's filesystem reports this many available bytes."""
+    return patch("os.statvfs", return_value=os.statvfs_result((4096, 1, 10**13, free, free, 0, 0, 0, 0, 255)))
 
 
 class SetupTests(unittest.TestCase):
@@ -47,11 +56,24 @@ class SetupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as parent:
             config = Config(data_dir=str(Path(parent) / "private"))
             output = io.StringIO()
-            with redirect_stdout(output):
+            with redirect_stdout(output), free_bytes(3_900_000_000):
                 self.assertEqual(doctor(config, json_output=True), 1)
             report = json.loads(output.getvalue())
             self.assertFalse(report["ready"])
             self.assertEqual(report["collector"], "not_running")
+            self.assertEqual(report["storage"], {"required_free_bytes": REQUIRED_FREE, "free_bytes": 3_900_000_000})
+            self.assertFalse(config.root.exists())
+
+    def test_setup_refuses_a_filesystem_too_small_for_the_cap_and_names_both_numbers(self):
+        # Budget would refuse every write there with only 'free_space_margin'.
+        with tempfile.TemporaryDirectory() as parent:
+            config = Config(data_dir=str(Path(parent) / "private"))
+            output = io.StringIO()
+            with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=["no", "no", "no", "", "yes"]), \
+                 redirect_stdout(output), free_bytes(3_900_000_000):
+                self.assertEqual(setup(config), 2)
+            self.assertIn(f"{REQUIRED_FREE:,} bytes required", output.getvalue())
+            self.assertIn("3,900,000,000 available", output.getvalue())
             self.assertFalse(config.root.exists())
 
     def test_cancel_preserves_existing_choices(self):
@@ -59,7 +81,8 @@ class SetupTests(unittest.TestCase):
             config = Config(data_dir=parent)
             config.save()
             before = config.path.read_bytes()
-            with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=["yes", "yes", "no", "host.example.ts.net", "no"]), redirect_stdout(io.StringIO()):
+            with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=["yes", "yes", "no", "host.example.ts.net", "no"]), \
+                 redirect_stdout(io.StringIO()), free_bytes(REQUIRED_FREE):
                 self.assertEqual(setup(config), 1)
             self.assertEqual(config.path.read_bytes(), before)
             self.assertEqual(config.source_options, {})
@@ -102,7 +125,8 @@ class SetupTests(unittest.TestCase):
     def test_confirmed_choices_persist_privately_without_claiming_grants(self):
         with tempfile.TemporaryDirectory() as parent:
             config = Config(data_dir=str(Path(parent) / "private"))
-            with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=["yes", "no", "yes", "host.example.ts.net", "yes"]), redirect_stdout(io.StringIO()):
+            with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=["yes", "no", "yes", "host.example.ts.net", "yes"]), \
+                 redirect_stdout(io.StringIO()), free_bytes(REQUIRED_FREE):
                 self.assertEqual(setup(config), 0)
             saved = Config.load(config.path)
             self.assertTrue(saved.source_options["scan_protected_requested"])
