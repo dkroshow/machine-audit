@@ -492,7 +492,9 @@ class Query:
     def coverage(self,start_ns,end_ns,component=None,limit=600):
         self._bounds(start_ns,end_ns,limit)
         with self._snapshot(start_ns,end_ns) as (db,captured):
-            records,overflow=self._raw(db,captured,start_ns,end_ns,component)
+            # Whole process passes cost a derived point per field; their saved
+            # status counts stay in coverage and per-process gaps stay in who.
+            records,overflow=self._raw(db,captured,start_ns,end_ns,component,series_only=True)
             coverage=self._coverage(db,captured,start_ns,end_ns,records,component)
         result=self._base("coverage")
         result.update(requested={"start_ns":start_ns,"end_ns":end_ns},coverage=coverage,gaps=coverage["gaps"],truncated=overflow)

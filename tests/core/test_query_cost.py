@@ -1,4 +1,5 @@
 """Repeated query-work regressions with small, source-shaped synthetic records."""
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 import tempfile
@@ -8,7 +9,7 @@ from unittest.mock import patch
 from machine_audit.budget import Budget
 from machine_audit.collector import Collector
 from machine_audit.derive import points
-from machine_audit.model import Clock, Field, Reading
+from machine_audit.model import Clock, Field, Reading, Record
 from machine_audit.query import Query
 from machine_audit.store import Store
 from tests.core.test_query_tail import process_pass, host, S
@@ -46,6 +47,24 @@ class QueryCostTests(unittest.TestCase):
 
     def tearDown(self):
         self.store.close();self.tmp.cleanup()
+
+    def test_window_coverage_work_does_not_grow_with_older_history(self):
+        # Big Mac: each window reading's component check scanned every stored
+        # reading, so a short window cost more as history grew.
+        def work(older):
+            with tempfile.TemporaryDirectory(dir=Path(self.tmp.name).parent) as temp:
+                store=Store(Path(temp)/'readings.sqlite',Budget(temp,limit_bytes=20_000_000,free_margin_bytes=0))
+                store.append([Record(host(t),'boot','run',t+1,t*S,Clock(t*S,t*S,t*S)) for t in range(older+10)])
+                ticks=[0];read=store.read
+                @contextmanager
+                def counted():
+                    with read() as db:
+                        db.set_progress_handler(lambda:ticks.__setitem__(0,ticks[0]+1),10);yield db
+                store.read=counted
+                Query(store).coverage(older*S,(older+10)*S)
+                store.close()
+                return ticks[0]
+        self.assertLess(work(2000),2*work(200))
 
     def test_short_who_reuses_derivation_and_keeps_reset_sleep_and_status_gaps(self):
         with patch('machine_audit.query.points',wraps=points) as derive:
