@@ -102,6 +102,26 @@ Unit programs were about 55 of 83 labels, so 184 × 55/83 ≈ 122 rows went.
 scale factors are its 90 units and 450 processes against Target A's 57 and
 280; to be checked against a measured run.
 
+Raw records, measured options not taken. On c8adc93 Target A grew 1.07 MB a
+minute; the raw `linux.workloads` record was 25.7 KB a pass (48% of readings
+payload). Packed with our encoder, `unit_detail` is 39 of 50 fields a unit
+and about 55% of that record's bytes. The cadence row is decided against the
+first user's 24 h growth figure, with Kenny if the contract moves.
+
+- **A: `unit_detail` at 60 s** in the existing unit source; the 10 s pass
+  keeps CPU time, `memory.current`, `io.stat` and sampled processes. Raw
+  workloads payload: Target A about 154 to 85 KB a minute, Target B about
+  254 to 146; Target A file growth about 1.07 to 1.0 MB a minute (−7%).
+  Loses sub-minute timing of unit PSI, movement and events; their counters
+  keep exact per-minute totals. It changes the accepted storage-approach row
+  (workload-group usage, movement, PSI and events at 10 s).
+- **C: lossless no-change encoding** of the packed record, which the
+  storage contract allows. The Mac's bundled process record would gain too.
+  Core format work; its gain needs real data.
+
+The Mac's bundled `macos.process` record carries every own-user process, about
+20 fields each, every 10 s, with no split. Linux per-process fields match it.
+
 ## Devices and network
 
 - Disks: rows of `/proc/diskstats` whose `/sys/block/<name>/device` exists,
