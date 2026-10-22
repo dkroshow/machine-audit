@@ -221,7 +221,6 @@ test('original folder growth stays visible through real HTTP and cursor pages',{
   const scratch=process.env.MACHINE_AUDIT_TEST_ROOT ?? join(root,'replay/.scratch');
   const {mkdirSync}=await import('node:fs');mkdirSync(scratch,{recursive:true});
   const directory=mkdtempSync(join(scratch,'growth-browser-'));
-  t.after(()=>rmSync(directory,{recursive:true,force:true}));
   const ready=join(directory,'ready.json');
   const python=process.env.MACHINE_AUDIT_PYTHON ?? 'python3.12';
   const preview=spawn(python,['-m','replay.preview','--ready-file',ready,'--storage-state','growth'],
@@ -230,6 +229,7 @@ test('original folder growth stays visible through real HTTP and cursor pages',{
   t.after(()=>stop(preview));
   const connection=await until(()=>{try{return JSON.parse(readFileSync(ready,'utf8'));}catch{return null;}},Boolean,`Growth replay did not start: ${startupError}`);
   const {send,run,errors,on}=await browser(t,directory);
+  t.after(()=>rmSync(directory,{recursive:true,force:true}));
   await send('Emulation.setTimezoneOverride',{timezoneId:'UTC'});
   const requests=[];
   // Use tiny real API pages without changing the application or manufacturing answers.
@@ -339,7 +339,6 @@ test('overview coverage and cost containment survive a crowded catalog',{timeout
   const scratch=process.env.MACHINE_AUDIT_TEST_ROOT ?? join(root,'replay/.scratch');
   const {mkdirSync}=await import('node:fs');mkdirSync(scratch,{recursive:true});
   const directory=mkdtempSync(join(scratch,'coverage-browser-'));
-  t.after(()=>rmSync(directory,{recursive:true,force:true}));
   const ready=join(directory,'ready.json');
   const preview=spawn(process.env.MACHINE_AUDIT_PYTHON ?? 'python3.12',
     ['-m','replay.preview','--ready-file',ready,'--dashboard-state','crowded'],
@@ -356,6 +355,7 @@ test('overview coverage and cost containment survive a crowded catalog',{timeout
   assert.equal(generic.truncated,false);
   assert.ok(generic.rows.some(row=>row.component==='memory'&&row.status==='observed'),'The bounded generic answer keeps memory');
   const {send,run,errors,on}=await browser(t,directory);
+  t.after(()=>rmSync(directory,{recursive:true,force:true}));
   const requests=[],active=new Set();let peak=0;
   on('Network.requestWillBeSent',({requestId,request})=>{
     const url=new URL(request.url);
