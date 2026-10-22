@@ -103,7 +103,8 @@ class SetupTests(unittest.TestCase):
                                  ("", []), ("https://dash.example.org", None)):
             with self.subTest(answer=answer), tempfile.TemporaryDirectory() as parent:
                 config = Config(data_dir=parent)
-                with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=["no", "no", "no", answer, "yes"]), redirect_stdout(io.StringIO()):
+                with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=["no", "no", "no", answer, "yes"]), \
+                     redirect_stdout(io.StringIO()), free_bytes(REQUIRED_FREE):
                     result = setup(config)
                 self.assertEqual(result, 2 if expected is None else 0)
                 self.assertEqual(config.path.exists(), expected is not None)
