@@ -188,6 +188,41 @@ class CompactMapTests(unittest.TestCase):
         second=MapQuery(self.store.path).query()['rows'][0]
         self.assertEqual((second['listed'],second['uses']),(8*GB,6*GB))
 
+    def test_parent_lookups_use_index_through_staged_moves_and_path_resolution(self):
+        # Hourly replay repeatedly resolved paths by scanning every directory
+        # in the generation: SELECT * picked the primary-key prefix instead.
+        self.store.prepare(self.volume)
+        self.node('root',None);self.node('branch','root')
+        self.node('leaf','branch');self.node('other','root')
+        self.store.finish_volume(self.volume,Blocks(),[],full=True,lean=True)
+
+        def check_lookups(branches,moved=False):
+            cases=[('parent IS NULL',(),{'root'}),
+                   ('parent=?',(inode_key('root'),),{'other'} if moved else {'branch','other'}),
+                   ('parent=? AND label=?',(inode_key('other' if moved else 'root'),
+                                            'renamed' if moved else 'branch'),{'branch'})]
+            for where,args,expected in cases:
+                statements=[]
+                self.store.db.set_trace_callback(statements.append)
+                try:rows=list(self.store._rows('nodes',where,args))
+                finally:self.store.db.set_trace_callback(None)
+                self.assertEqual({source_id(row['id']) for row in rows},expected)
+                plan=[row['detail'] for row in self.store.db.execute('EXPLAIN QUERY PLAN '+statements[0])]
+                with self.subTest(branches=branches,where=where):
+                    self.assertEqual(sum('USING INDEX node_parent ' in detail for detail in plan),branches,plan)
+
+        check_lookups(1)
+        self.assertEqual(self.store.find_path('/synthetic/branch/leaf')['id'],'leaf')
+        self.store.prepare(self.volume,full=False)
+        self.assertTrue(self.store.relocate('branch','other','renamed','/synthetic/other/renamed',False))
+        self.store.flush();check_lookups(2,True)
+        self.assertIsNone(self.store.find_path('/synthetic/branch'))
+        self.assertEqual(self.store.find_path('/synthetic/other/renamed/leaf')['id'],'leaf')
+        self.assertEqual({source_id(key) for key in self.store._subtree(inode_key('other'))},
+                         {'other','branch','leaf'})
+        published=MapQuery(self.store.path).query('children',volume_id='v',parent_id='root')['rows']
+        self.assertEqual({row['id'] for row in published},{'branch','other'})
+
     def test_baseline_growth_preserves_small_change_without_global_claim(self):
         for at,extra in ((1_000_000_000,0),(2_000_000_000,50_000_000)):
             self.store.prepare(self.volume)

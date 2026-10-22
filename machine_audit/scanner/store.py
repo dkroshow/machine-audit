@@ -225,8 +225,10 @@ class MapStore:
         identity={'nodes':'id','files':'parent','holders':'dir','charges':'stream','listings':'id'}[table]
         removed='removed_charges' if table=='charges' else 'removed'
         # SQLite otherwise prefers the volume-wide primary-key prefix for
-        # these SELECT * lookups, scanning every holder per stream or file.
+        # these SELECT * lookups, scanning every row per parent/stream/file.
         index={'stream=?':'holder_stream','file_id=?':'holder_file'}.get(where) if table=='holders' else None
+        if table=='nodes' and where in ('parent IS NULL','parent=?','parent=? AND label=?'):
+            index='node_parent'
         hint=f' INDEXED BY {index}' if index else ''
         staged=f'SELECT * FROM {table}{hint} WHERE generation=? AND volume=? AND {where}'
         params=[self.generation,self.vid,*args]
