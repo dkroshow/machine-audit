@@ -71,6 +71,7 @@ class Walker:
         stack = [(root, parent_id, inherited_private,recursive)]
         while stack:
             path, parent, hidden, descend_all = stack.pop()
+            st = None
             try:
                 st = os.stat(path, follow_symlinks=False)
                 if not stat.S_ISDIR(st.st_mode) or st.st_dev != rootstat.st_dev:
@@ -183,8 +184,11 @@ class Walker:
                     os.close(fd)
             except PermissionError:
                 self.gaps.add('denied')
-                self.sink.directory(Node(str(st.st_ino), parent, None if hidden else os.path.basename(path),
-                                         'directory', 0, 0, 'denied', None if hidden else path, st.st_mtime_ns))
+                # A failed stat supplies no identity. Never reuse the previous
+                # directory's inode: it could become its own parent.
+                if st is not None:
+                    self.sink.directory(Node(str(st.st_ino), parent, None if hidden else os.path.basename(path),
+                                             'directory', 0, 0, 'denied', None if hidden else path, st.st_mtime_ns))
             except OSError:
                 self.gaps.add('directory_unreadable')
         return root_listed

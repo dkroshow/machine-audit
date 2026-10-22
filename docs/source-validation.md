@@ -373,3 +373,17 @@ Deferred folder refreshes leave `dirty` only when the matching staged listing
 publishes. Admission failure or transaction rollback keeps the refresh pending;
 unobserved folders are not cleared. Cleanup joins each dirty identity to the
 listing primary key and counts the deletions in the publication reservation.
+
+Failed-volume recovery: an explicit full request retries a failed attempt even
+inside the successful map's daily cooldown. Access checks still run first;
+published map times, points and hierarchy change only on successful publication.
+Unreadable root attempts now save their safe reason in `volumes.status`, while
+invariant exceptions already save their specific code there. A partial run at
+stage `complete` means a root/relist was unreadable, not an uncaught invariant.
+
+A disposable tree reproduced `cyclic_directory_ancestry` when `stat()` denied a
+queued child: the old handler reused the previous directory's inode and stored
+a self-parent. Each iteration now starts without an inode; failed metadata reads
+record the denied gap without inventing identity. Separate synthetic cloud,
+other-account and own-store exclusions publish without breaking ancestry. This
+does not prove which exception caused the historical Big Mac failure.

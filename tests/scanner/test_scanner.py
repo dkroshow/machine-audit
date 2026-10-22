@@ -19,6 +19,45 @@ SCRATCH.mkdir(exist_ok=True)
 
 
 class ScannerTests(unittest.TestCase):
+    def test_denied_queued_directory_stat_does_not_reuse_parent_identity(self):
+        # A denial before st is assigned used the prior directory's stat,
+        # overwrote that node with itself as parent, and broke aggregation.
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
+            data=Path(temp)/'data';tree=Path(temp)/'tree';data.mkdir();tree.mkdir()
+            child=tree/'child';child.mkdir()
+            store=MapStore(data/'scanner.sqlite',Budget(data,free_margin_bytes=0))
+            self.addCleanup(store.close)
+            volume=Volume('v','Volume',str(tree),'hfs',1,10**9,1,1,10**8)
+            store.prepare(volume)
+            walker=Walker(volume,Policy(home=temp,homes=[]),store,Blocks())
+            original=os.stat
+            def denied(path,*args,**kwargs):
+                if path==str(child):raise PermissionError(13,'synthetic denial')
+                return original(path,*args,**kwargs)
+            with patch('machine_audit.scanner.walker.os.stat',side_effect=denied):
+                self.assertTrue(walker.walk())
+            result=store.finish_volume(volume,walker.blocks,walker.gaps,full=True,lean=True)
+            self.assertTrue(result['valid'])
+            self.assertIn('denied',walker.gaps)
+            self.assertEqual([tuple(row) for row in store.db.execute('SELECT parent,status FROM nodes')],[(None,'observed')])
+
+    def test_cloud_other_account_and_own_store_gaps_do_not_break_ancestry(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
+            data=Path(temp)/'data';tree=Path(temp)/'tree';data.mkdir();tree.mkdir()
+            home=tree/'Users'/'tester'
+            (home/'Library'/'CloudStorage'/'unvisited').mkdir(parents=True)
+            (tree/'Users'/'another'/'unvisited').mkdir(parents=True)
+            own=tree/'state';(own/'unvisited').mkdir(parents=True)
+            store=MapStore(data/'scanner.sqlite',Budget(data,free_margin_bytes=0))
+            self.addCleanup(store.close)
+            volume=Volume('v','Volume',str(tree),'hfs',1,10**9,1,1,10**8)
+            store.prepare(volume)
+            walker=Walker(volume,Policy(home=str(home),homes=[str(home)],data_root=str(own)),store,Blocks())
+            self.assertTrue(walker.walk())
+            result=store.finish_volume(volume,walker.blocks,walker.gaps,full=True,lean=True)
+            self.assertTrue(result['valid'])
+            self.assertEqual(walker.gaps,{'cloud','other_account','own_store'})
+
     def test_shared_partial_extents_go_to_oldest_stream_once(self):
         b=Blocks()
         b.add(Stream(10,'a',8192,None,False),[(0,8192)])

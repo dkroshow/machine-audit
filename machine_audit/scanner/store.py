@@ -665,12 +665,13 @@ class MapStore:
                 if last and (last['size'] is not None or last['status']!='not_observed'):
                     self.db.execute('INSERT INTO points VALUES(?,?,?,?,?,?,?)',(self.volume,tracked['id'],now,last['label'],metric,None,'not_observed'))
 
-    def mark_failed(self,status):
+    def mark_failed(self,status,*,end_run=True):
         self.buffer.clear();self.buffer_bytes=0;self.pending_resets.clear()
         # End the run before attempting a separate volume-status write. A
         # failure of that second admission must not leave the run "running".
-        self.progress(status=status)
-        with self.write(rows=1):self.db.execute('UPDATE volumes SET status=? WHERE id=?',(status,self.volume))
+        if end_run:self.progress(status=status)
+        with self.write(rows=1,payload_bytes=len(status.encode())):
+            self.db.execute('UPDATE volumes SET status=? WHERE id=?',(status,self.volume))
 
     def close(self):self.db.close()
 

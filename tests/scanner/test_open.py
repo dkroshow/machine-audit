@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 from machine_audit.budget import Budget, BudgetExceeded
 from machine_audit.scanner.accounting import Blocks
 from machine_audit.scanner.events import Replay
+from machine_audit.scanner.errors import ScanError
 from machine_audit.scanner.native import Volume
 from machine_audit.scanner.policy import Policy
 from machine_audit.scanner.runner import run_scan
@@ -99,7 +100,10 @@ class RootPublicationTests(unittest.TestCase):
 
     def published(self):
         with sqlite3.connect(self.data / 'scanner.sqlite') as db:
-            volume = db.execute("SELECT * FROM volumes WHERE id='v'").fetchone()
+            cursor = db.execute("SELECT * FROM volumes WHERE id='v'")
+            volume = dict(zip((column[0] for column in cursor.description),cursor.fetchone()))
+            # Attempt status can change without changing the published map.
+            volume.pop('status')
             generation = db.execute("SELECT generation FROM volumes WHERE id='v'").fetchone()[0]
             nodes = db.execute('SELECT * FROM nodes WHERE generation=? ORDER BY id', (generation,)).fetchall()
             points = db.execute("SELECT * FROM points WHERE volume='v' ORDER BY id,observed_ns").fetchall()
@@ -107,6 +111,7 @@ class RootPublicationTests(unittest.TestCase):
             hierarchy = db.execute("SELECT * FROM hierarchy_nodes WHERE volume='v' ORDER BY version,id").fetchall()
             state = db.execute('SELECT status FROM generations WHERE id=?', (generation,)).fetchone()
         children = MapQuery(self.data / 'scanner.sqlite').query('children', volume_id='v')
+        children.pop('status')  # Last attempt status is checked separately.
         return volume, nodes, points, epochs, hierarchy, state, children
 
     def scan(self, volumes, policy=None, events=None):
@@ -150,6 +155,8 @@ class RootPublicationTests(unittest.TestCase):
                 self.assertEqual((result['status'], status), ('root_unreadable', 'root_unreadable'))
                 self.assertEqual(result['volumes'][0]['status'], 'root_unreadable')
                 self.assertTrue(result['volumes'][0]['gaps'])
+                with sqlite3.connect(self.data/'scanner.sqlite') as db:
+                    self.assertEqual(db.execute('SELECT status FROM volumes').fetchone()[0],result['volumes'][0]['reason'])
 
     def test_readable_empty_root_still_publishes_with_zero_entries(self):
         before = self.published()
@@ -195,6 +202,25 @@ class RootPublicationTests(unittest.TestCase):
             row = db.execute('SELECT volume_id,action,trigger,stage FROM runs ORDER BY started_ns DESC LIMIT 1').fetchone()
         self.assertEqual(row, expected)
         self.assertNotIn('absent synthetic identity', repr(result))
+
+    def test_failed_volume_retries_requested_full_before_successful_map_cooldown(self):
+        with sqlite3.connect(self.data/'scanner.sqlite') as db:
+            db.execute("UPDATE volumes SET status='invalid_scan_state'")
+        before=self.published()
+        with patch.object(MapStore,'_aggregate_full',side_effect=ScanError('missing_directory_ancestor')), \
+             patch('machine_audit.scanner.runner.time.time_ns',return_value=110*10**9):
+            result,status=self.scan([self.volume])
+        self.assertEqual(result['action'],'full')
+        self.assertEqual(result['trigger'],'failed_volume_retry')
+        self.assertEqual(status,'missing_directory_ancestor_ScanError')
+        with sqlite3.connect(self.data/'scanner.sqlite') as db:
+            self.assertEqual(db.execute('SELECT status FROM volumes').fetchone()[0],status)
+        self.assertEqual(self.published(),before)
+        with patch('machine_audit.scanner.runner.time.time_ns',return_value=120*10**9):
+            result,status=self.scan([self.volume])
+        self.assertEqual((result['action'],result['trigger'],status),('full','failed_volume_retry','complete'))
+        with sqlite3.connect(self.data/'scanner.sqlite') as db:
+            self.assertEqual(db.execute('SELECT status,full_ns FROM volumes').fetchone(),('observed',120*10**9))
 
     def test_root_must_scan_uses_full_writer_and_records_its_trigger(self):
         events = SimpleNamespace(uuid=lambda device:'events', current_id=lambda:30,

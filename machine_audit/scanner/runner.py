@@ -156,6 +156,11 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                 action,trigger=next_decision(now_ns=now,full_ns=old['full_ns'] if has_root else None,
                     update_ns=old['observed_ns'] if old else None,bookmark=old['bookmark'] if old else None,
                     no_progress=old['no_progress'] if old else 0,requested_full=full)
+                # The daily limit applies to completed maps. An explicit full
+                # request must retry an unsuccessful attempt, keeping the old
+                # map's observation times intact until publication succeeds.
+                if full and old and old['status'] not in ('observed','partial','invalid','unavailable'):
+                    action,trigger='full','failed_volume_retry'
                 if action=='wait':
                     store.phase('complete',action=action,trigger=trigger)
                     results.append({'volume_id':volume.id,'status':'current','action':action,'trigger':trigger})
@@ -194,9 +199,10 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     if not walker.listed:
                         root_failed=True
                         processed+=walker.entries
-                        store.buffer.clear();store.buffer_bytes=0
+                        reason='root_unreadable'+''.join('_'+gap for gap in sorted(walker.gaps-{'root_unreadable'}))
+                        store.mark_failed(reason,end_run=False)
                         results.append({'volume_id':volume.id,'status':'root_unreadable','action':action,'trigger':trigger,
-                                        'entries':walker.entries,'gaps':sorted(walker.gaps)})
+                                        'reason':reason,'entries':walker.entries,'gaps':sorted(walker.gaps)})
                         continue
                 else:
                     complete=relist(store,walker,policy,volume,now,
@@ -205,7 +211,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     if not complete:
                         root_failed=True
                         processed+=walker.entries
-                        store.buffer.clear();store.buffer_bytes=0
+                        store.mark_failed('update_unreadable',end_run=False)
                         results.append({'volume_id':volume.id,'status':'update_unreadable','action':action,
                                         'trigger':trigger,'entries':walker.entries,'gaps':sorted(walker.gaps)})
                         continue
