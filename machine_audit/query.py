@@ -25,6 +25,9 @@ BRIEF_TOP = 5
 # A series without a component or signals answers this many host signals per component
 # when the component has no host totals.
 SERIES_HOST_SIGNALS = 2
+# Brief now ranks only workload totals; from a process pass it derives just these fields
+# (process.cpu comes from its user and system time).
+BRIEF_PASS_FIELDS = frozenset().union(*WHO_TOTALS.values(), {"process.user_time", "process.system_time"})
 BRIEF_FIELDS = ("source", "signal", "entity", "label", "kind", "value", "mean", "mean_rate", "total", "peak_rate",
                 "unit", "rate_unit", "status")
 
@@ -74,6 +77,7 @@ class Query:
         self.storage = storage
         self.config = config
         self._local = threading.local()
+        self._now_cache = {}
 
     @staticmethod
     def _base(shape, status="observed"):
@@ -367,19 +371,17 @@ class Query:
     def now(self,component=None,limit=600,brief=False):
         if not 1<=limit<=MAX_ROWS:raise ValueError("limit must be 1..2000")
         groups=self.collector.recent_records(component) if self.collector else []
-        latest=[];trail=[];sources=[];raw_remaining=limit;truncated=False
+        latest=[];trail=[];sources=[];raw_remaining=limit;truncated=False;stale_sources=set()
         statuses=defaultdict(lambda:defaultdict(int))
         groups.sort(key=lambda group:any(f.entity.startswith("process:") for f in group[2][-1].reading.fields))
         for source,stale,records in groups:
             process_pass=any(f.entity.startswith("process:") for f in records[-1].reading.fields)
-            history=records[-2:] if process_pass else records
-            selected=[replace(r,reading=replace(r.reading,fields=tuple(f for f in r.reading.fields if not component or field_component(f,r.reading.component)==component))) for r in history]
-            derived=points(selected)
-            for p in derived:
-                p["stale"]=stale
-                if p["sequence"]==records[-1].sequence:latest.append(p)
-                if not process_pass and not p["entity"].startswith("cpu:"):trail.append(p)
-            raw_latest=selected[-1]
+            pass_latest,pass_trail=self._now_points(source,records,process_pass,brief)
+            latest.extend(p for p in pass_latest if not component or p["component"]==component)
+            trail.extend(p for p in pass_trail if not component or p["component"]==component)
+            if stale:stale_sources.add(source)
+            raw_latest=records[-1]
+            if component:raw_latest=replace(raw_latest,reading=replace(raw_latest.reading,fields=tuple(f for f in raw_latest.reading.fields if field_component(f,raw_latest.reading.component)==component)))
             if brief:
                 statuses[source][raw_latest.reading.status]+=1
                 for f in raw_latest.reading.fields:
@@ -392,7 +394,6 @@ class Query:
                                 stale=stale,latest=raw,trail=[],field_count=available,truncated=len(fields)<available,
                                 trail_mode="derived-trail-rows"))
             truncated=truncated or len(fields)<available
-        latest.sort(key=lambda p:(p["entity"].startswith(("process:","program:")),p["signal"]!="process.cpu",-(p["value"] if isinstance(p["value"],(int,float)) else 0)))
         result=self._base("now","observed" if sources else "unavailable")
         if brief:
             # Each component's top workloads, chosen as who chooses them, and host totals.
@@ -405,13 +406,34 @@ class Query:
                 if top or host:components[part]={"top":self._brief_rows(top),"host":self._brief_rows(host)}
             result.update(brief=True,components=components,
                           coverage={"mode":"live_cache" if self.collector else "store_only","sources":{k:dict(v) for k,v in statuses.items()},
-                                    "gap_count":sum(p["status"] not in GOOD or p["stale"] for p in latest)})
+                                    "gap_count":sum(p["status"] not in GOOD or p["source"] in stale_sources for p in latest)})
             return result
-        result.update(rows=latest[:limit],trail_rows=trail[-limit:],sources=sources,
+        latest.sort(key=lambda p:(p["entity"].startswith(("process:","program:")),p["signal"]!="process.cpu",-(p["value"] if isinstance(p["value"],(int,float)) else 0)))
+        # Cached points are shared between requests; a request marks staleness on copies.
+        stamp=lambda rows:[dict(p,stale=p["source"] in stale_sources) for p in rows]
+        result.update(rows=stamp(latest[:limit]),trail_rows=stamp(trail[-limit:]),sources=sources,
                       truncated=truncated or len(latest)>limit or len(trail)>limit,
                       coverage={"mode":"live_cache" if self.collector else "store_only","reason":None if sources else "no_recent_readings",
                                 "process_trail":"latest pass only; interval detail through who"})
         return result
+
+    def _now_points(self,source,records,process_pass,brief):
+        """A source's newest derived pass (all components) and its trail, derived once per
+        new reading and shared by every now request until the next one: at most a full and
+        a brief entry per source. A process pass derives from its last two readings, other
+        sources from their cached trail; brief keeps only its fields of a process pass."""
+        history=records[-2:] if process_pass else records
+        key=(records[-1].run_id,history[0].sequence,history[-1].sequence,len(history))
+        cached=self._now_cache.get((source,brief))
+        if cached and cached[0]==key:return cached[1],cached[2]
+        if brief and process_pass:
+            history=[replace(r,reading=replace(r.reading,fields=tuple(f for f in r.reading.fields if f.name in BRIEF_PASS_FIELDS))) for r in history]
+        latest=[];trail=[]
+        for p in points(history):
+            if p["sequence"]==records[-1].sequence:latest.append(p)
+            if not process_pass and not p["entity"].startswith("cpu:"):trail.append(p)
+        self._now_cache[(source,brief)]=(key,latest,trail)
+        return latest,trail
 
     @measured
     def catalog(self):

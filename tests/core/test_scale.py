@@ -164,13 +164,14 @@ class ScaleTests(unittest.TestCase):
 
     def test_brief_now_gives_each_components_top_five_and_host_totals_under_20_kb(self):
         # A first user's agent read `now` at 833 KB; brief gives a few hundred tokens.
-        procs=process_records(2000,2)
-        collector=Collector(self.store,run_id='live',boot_id='boot',clock=lambda:procs[-1].reading.end)
-        for p in procs:
-            c0,c=p.reading.start,p.reading.end
+        procs=process_records(2000,3);now=[procs[0].reading.end]
+        collector=Collector(self.store,run_id='live',boot_id='boot',clock=lambda:now[0])
+        def ingest(p,installed):
+            c0,c=p.reading.start,p.reading.end;now[0]=c
             collector.ingest(Reading('synthetic.cpu','cpu',c0,c,(Field('cpu.busy',float(c.awake_ns//S),'seconds','counter'),)))
-            collector.ingest(Reading('synthetic.memory','memory',c0,c,(Field('memory.installed',16*10**9,'bytes'),)))
+            collector.ingest(Reading('synthetic.memory','memory',c0,c,(Field('memory.installed',installed,'bytes'),)))
             collector.ingest(p.reading)
+        for p in procs[:2]:ingest(p,16*10**9)
         query=Query(self.store,collector)
         self.assertGreater(len(json.dumps(query.now(limit=600),separators=(',',':'))),20_000)
         brief=query.now(brief=True)
@@ -182,6 +183,16 @@ class ScaleTests(unittest.TestCase):
         self.assertEqual({r['signal'] for r in brief['components']['cpu']['host']},{'cpu.busy'})
         self.assertTrue(brief['components']['cpu']['top'][0]['entity'].startswith('program:'))
         self.assertEqual(set(brief['coverage']['sources']),{'synthetic.cpu','synthetic.memory','macos.process'})
+        # Big Mac's brief now took 0.76 s re-deriving 2,000 processes per request. A derived
+        # pass is kept until the next one; a new pass replaces it, and the first brief after
+        # it derives only the fields brief ranks.
+        ingest(procs[2],32*10**9)
+        began=time.thread_time();brief=query.now(brief=True)
+        self.assertLess(time.thread_time()-began,0.3)
+        self.assertEqual([r['value'] for r in brief['components']['memory']['host']],[32*10**9])
+        fresh=Query(self.store,collector)
+        self.assertEqual(brief,fresh.now(brief=True))
+        self.assertEqual(query.now(limit=600),fresh.now(limit=600))
 
     def test_2000_process_minutes_keep_top_consumers_and_15_minute_rows_keep_all(self):
         # Big Mac grew 11.3 MB/min, half of it per-instance minute rows. Minute rows keep each
