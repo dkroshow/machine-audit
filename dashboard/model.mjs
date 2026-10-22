@@ -95,16 +95,20 @@ export function chartRuns(rows) {
 export function readToken(location, history) {
   const fragment=location.hash.slice(1), params=new URLSearchParams(fragment);
   const token=params.get('token');
-  if (token !== null) history.replaceState(null,'',location.pathname+location.search+'#overview');
-  return token || null;
+  if (token !== null) {
+    const view=params.get('view');
+    history.replaceState(null,'',location.pathname+location.search+'#'+(Object.hasOwn(views,view) ? view : 'overview'));
+  }
+  return token;
 }
+const unauthorizedMessage='This session is not authorized. Open the dashboard link again with its #token=... fragment; the operator finds the current link with machine-audit open on the machine.';
 export function makeApi(token, fetcher=fetch) {
   return async (shape, parameters={}, signal) => {
-    if (!token) throw new Error('Open this page with machine-audit open to start an authenticated session.');
+    if (!token) throw new Error(unauthorizedMessage);
     const query=new URLSearchParams();
     for (const [key,value] of Object.entries(parameters)) if (value !== undefined && value !== null) query.set(key,Array.isArray(value) ? value.join(',') : String(value));
     const response=await fetcher(`/api/${shape}${query.size ? '?'+query : ''}`, {headers:{Authorization:`Bearer ${token}`},credentials:'omit',cache:'no-store',signal});
-    if (response.status === 401 || response.status === 403) throw new Error('This session is not authorized. Run machine-audit open for a fresh link.');
+    if (response.status === 401 || response.status === 403) throw new Error(unauthorizedMessage);
     if (!response.ok) throw new Error(`The ${shape} request failed (HTTP ${response.status}). No missing values have been replaced with zero.`);
     return response.json();
   };

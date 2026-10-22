@@ -2,7 +2,7 @@ import {views,label,time,format,readToken,makeApi,seriesGroups,rowValue,rowUnit,
 import {el,card,empty,metric,signalsView,liveView,whoView,coverageView,statusView,intervalEvidence} from './render.mjs';
 import {storageView} from './storage.mjs';
 const $=id=>document.getElementById(id);
-const api=makeApi(readToken(window.location,window.history));
+let api=makeApi(readToken(window.location,window.history));
 const state={mode:'history',view:'overview',span:3600,range:null,abort:null,timer:null,catalog:null,whoSignal:null};
 const sections={
   cpu:[['Usage and capacity',/busy|capacity|cpu_count|user|system|idle|steal|logical|physical/],['Demand and constraints',/runnable|wait|pressure|thrott|quota|limit/]],
@@ -141,7 +141,11 @@ async function load() {
   }
 }
 $('refresh').addEventListener('click',()=>{state.catalog=null;load();});
-window.addEventListener('hashchange',()=>{state.whoSignal=null;load();});
+window.addEventListener('hashchange',()=>{
+  const token=readToken(window.location,window.history);
+  if(token!==null)api=makeApi(token);
+  state.whoSignal=null;load();
+});
 $('span').addEventListener('change',()=>{const custom=$('span').value==='custom';$('custom-range').hidden=!custom;if(!custom){state.span=Number($('span').value);state.range=null;load();}});
 $('interval').addEventListener('submit',event=>{event.preventDefault();const start=Date.parse($('from').value)/1000,end=Date.parse($('to').value)/1000;if(!Number.isFinite(start)||!Number.isFinite(end)||end<=start){message('error','Choose a start and end time, with the end after the start.');return;}state.range={start,end};load();});
 for(const mode of ['history','live'])$(mode+'-mode').addEventListener('click',()=>{state.mode=mode;for(const m of ['history','live'])$(m+'-mode').setAttribute('aria-pressed',String(m===mode));$('span').disabled=mode==='live';$('custom-range').hidden=mode==='live'||$('span').value!=='custom';load();});

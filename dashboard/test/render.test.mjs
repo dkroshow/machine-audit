@@ -47,7 +47,6 @@ test('all dashboard views render real stored replay without leaked tokens or fak
   const scratch=process.env.MACHINE_AUDIT_TEST_ROOT ?? join(root,'replay/.scratch');
   const {mkdirSync}=await import('node:fs');mkdirSync(scratch,{recursive:true});
   const directory=mkdtempSync(join(scratch,'browser-'));
-  t.after(()=>rmSync(directory,{recursive:true,force:true}));
   const ready=join(directory,'ready.json');
   const python=process.env.MACHINE_AUDIT_PYTHON ?? 'python3.12';
   const preview=spawn(python,['-m','replay.preview','--ready-file',ready],{cwd:root,env:{...process.env,MACHINE_AUDIT_TEST_ROOT:directory},stdio:['ignore','ignore','pipe']});
@@ -55,12 +54,19 @@ test('all dashboard views render real stored replay without leaked tokens or fak
   t.after(()=>stop(preview));
   const connection=await until(()=>{try{return JSON.parse(readFileSync(ready,'utf8'));}catch{return null;}},Boolean,`Preview did not start: ${startupError}`);
   const {send,run,errors}=await browser(t,directory);
+  t.after(()=>rmSync(directory,{recursive:true,force:true}));
   const settled=()=>until(()=>run("document.querySelector('#view').getAttribute('aria-busy')"),value=>value==='false','Page did not finish its query');
-  await send('Page.navigate',{url:`${connection.origin}/#token=${encodeURIComponent(connection.token)}`});
+  await send('Page.navigate',{url:connection.origin});
   await until(()=>run('document.querySelectorAll("[data-view]").length'),count=>count===10,'Page did not load');
   await settled();
+  assert.equal(await run("document.querySelector('#error').hidden"),false,'A missing token must show the authorization message');
+  assert.equal(await run("document.querySelector('#error').textContent"),'This session is not authorized. Open the dashboard link again with its #token=... fragment; the operator finds the current link with machine-audit open on the machine.');
+  await run(`location.hash='#token=${encodeURIComponent(connection.token)}'`);await pause(100);await settled();
+  assert.equal(await run("document.querySelector('#error').hidden"),true,'A token supplied after load must authorize the dashboard');
+  assert.ok((await run("document.querySelector('#view').innerText")).length>50,'A token supplied after load must load data');
   assert.equal(await run('location.hash'),'#overview');
   assert.equal(await run('localStorage.length'),0);
+  assert.equal(await run('sessionStorage.length'),0);
   assert.match(await run("document.querySelector('#notice').textContent"),/Synthetic replay/);
   await run("document.querySelector('#span').value='300';document.querySelector('#span').dispatchEvent(new Event('change'))");await settled();
   for(const view of ['overview','cpu','memory','gpu','storage','network','power','heat','cost','coverage']) {

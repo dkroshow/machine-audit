@@ -7,6 +7,8 @@ test('fragment bootstrap removes the secret before navigation and API uses a hea
   let replaced;
   const token=readToken(location,{replaceState(...args){replaced=args;}});
   assert.equal(token,'synthetic+secret');assert.equal(replaced[2],'/#overview');
+  assert.equal(readToken({...location,hash:'#token=synthetic&view=storage'},{replaceState(...args){replaced=args;}}),'synthetic');
+  assert.equal(replaced[2],'/#storage');
   const calls=[];const api=makeApi(token,async(...args)=>{calls.push(args);return {ok:true,status:200,json:async()=>({rows:[]})};});
   await api('series',{start:1,end:2,component:'memory'});
   assert.equal(calls[0][0],'/api/series?start=1&end=2&component=memory');
@@ -17,7 +19,9 @@ test('fragment bootstrap removes the secret before navigation and API uses a hea
 
 test('missing authentication does not make an unauthenticated API request',async()=>{
   let calls=0;const api=makeApi(null,()=>{calls++;});
-  await assert.rejects(api('now'),/machine-audit open/);assert.equal(calls,0);
+  const message='This session is not authorized. Open the dashboard link again with its #token=... fragment; the operator finds the current link with machine-audit open on the machine.';
+  await assert.rejects(api('now'),{message});assert.equal(calls,0);
+  for(const status of [401,403])await assert.rejects(makeApi('synthetic',async()=>({status}))('now'),{message});
 });
 
 test('chart splits denied and absent intervals but preserves a measured zero',()=>{
