@@ -51,7 +51,10 @@ class Walker:
             return None
         try:
             info=os.fstat(fd)
-            return str(info.st_ino) if info.st_dev==self.volume.device else None
+            root_device=os.stat(self.volume.mount,follow_symlinks=False).st_dev
+            return str(info.st_ino) if info.st_dev==root_device else None
+        except OSError:
+            self.gaps.add('directory_unreadable');return None
         finally:os.close(fd)
 
     def walk(self, root=None, parent_id=None, inherited_private=False, recursive=True):

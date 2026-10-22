@@ -1,5 +1,6 @@
 """Event replay must not turn ordinary missing paths into subtree walks."""
 from pathlib import Path
+from dataclasses import replace
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -57,6 +58,12 @@ class RelistTests(unittest.TestCase):
         self.baseline()
         with patch.object(Walker,'directory_identity',side_effect=AssertionError('protected open')):
             self.assertEqual(self.update(self.tree/'Desktop'/'event').entries,0)
+
+    def test_inode_lookup_uses_the_walk_root_device_not_the_event_device_id(self):
+        # Native volume.device comes from statfs/FSEvents, while a walk compares st_dev.
+        volume=replace(self.volume,device=self.volume.device+1)
+        walker=Walker(volume,self.policy,self.store,Blocks())
+        self.assertEqual(walker.directory_identity(str(self.tree)),str(self.tree.stat().st_ino))
 
     def test_private_event_updates_only_its_known_private_directory(self):
         private=self.tree/'browser';(private/'inner').mkdir(parents=True)
