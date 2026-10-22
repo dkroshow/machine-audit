@@ -115,6 +115,10 @@ swap memory, by platform). Rows keep `source`, `signal`, `entity`, `label`,
 `gap_count`; there are no gap rows and no per-lane rows.
 `around` returns nested series/who/coverage plus events. `/api/status` reports
 collector/source health, budget and measured operation cost; no tokens.
+`collector.operations.queries` breaks query cost down per query method (`series`,
+`who`, ...): `count`, `elapsed_s` and `cpu_s`, beside the totals. Every query
+answer carries a `Server-Timing` header, `query;dur=<ms>, cpu;dur=<ms>`: its own
+elapsed and CPU milliseconds, with no tokens or row content.
 
 Self-cost uses ordinary `self.*` fields and the same shapes. Operation durations
 are elapsed seconds, never CPU. Process CPU/memory and scanner costs are recorded

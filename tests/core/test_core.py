@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import json
 import os
+import re
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -598,6 +599,23 @@ class CoreTests(unittest.TestCase):
             self.assertEqual([status(q) for q in ("who?start=0&end=20&brief=1","now?brief=1","series?start=0&end=20&brief=1","who?start=0&end=20&brief=yes")],
                              [(200,True),(200,True),(400,None),(400,None)])
         finally:server.shutdown();server.server_close();thread.join()
+
+    def test_status_breaks_query_cost_down_by_method_and_answers_carry_server_timing(self):
+        # A served series cost three times its offline CPU and status showed only totals.
+        self.store.append([record(0,0,1),record(10,7,2)])
+        query=Query(self.store,Collector(self.store,run_id="run",boot_id="boot"))
+        server=make_server(query,"a"*32,port=0)
+        thread=threading.Thread(target=server.serve_forever);thread.start()
+        try:
+            timings=[]
+            for route in ("series","series","who"):
+                with urlopen(Request(f"http://127.0.0.1:{server.server_port}/api/{route}?start=0&end=20",headers={"Authorization":"Bearer "+"a"*32})) as response:
+                    timings.append(response.headers["Server-Timing"])
+        finally:server.shutdown();server.server_close();thread.join()
+        self.assertTrue(all(re.fullmatch(r"query;dur=\d+\.\d, cpu;dur=\d+\.\d",t) for t in timings),timings)
+        queries=query.status()["collector"]["operations"]["queries"]
+        self.assertEqual({name:op["count"] for name,op in queries.items()},{"series":2,"who":1})
+        self.assertTrue(all(op["elapsed_s"]>=0 and op["cpu_s"]>=0 for op in queries.values()))
 
     def test_http_admits_only_loopback_and_configured_hosts_and_origins(self):
         # Proxies send https Origins and tunnels http; anything else stays refused.

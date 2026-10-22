@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import secrets
 import threading
+import time
 from urllib.parse import parse_qs, unquote, urlsplit
 
 
@@ -23,7 +24,7 @@ def make_server(query, token: str, port=8765, dashboard=None, allowed_hosts=()):
         def log_message(self,*args):
             pass
 
-        def _send(self,status,payload,kind="application/json; charset=utf-8"):
+        def _send(self,status,payload,kind="application/json; charset=utf-8",timing=None):
             body=payload if isinstance(payload,bytes) else json.dumps(payload,separators=(",",":"),allow_nan=False).encode()
             self.send_response(status)
             self.send_header("Content-Type",kind)
@@ -32,6 +33,7 @@ def make_server(query, token: str, port=8765, dashboard=None, allowed_hosts=()):
             self.send_header("X-Content-Type-Options","nosniff")
             self.send_header("Referrer-Policy","no-referrer")
             self.send_header("Content-Security-Policy","default-src 'self'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+            if timing:self.send_header("Server-Timing",timing)
             self.end_headers()
             self.wfile.write(body)
             if query.collector:
@@ -81,6 +83,7 @@ def make_server(query, token: str, port=8765, dashboard=None, allowed_hosts=()):
                     brief=brief=="1"
                     if route in {"series","who","coverage"}:
                         bounds=(int(float(args["start"])*1e9),int(float(args["end"])*1e9))
+                    began,cpu=time.monotonic(),time.thread_time()
                     if route=="now": result=query.now(component,limit,brief)
                     elif route=="catalog": result=query.catalog()
                     elif route=="status": result=query.status()
@@ -90,7 +93,9 @@ def make_server(query, token: str, port=8765, dashboard=None, allowed_hosts=()):
                     elif route=="around": result=query.around(int(float(args["at"])*1e9),int(float(args.get("span",60))*1e9),component,signals,limit)
                     elif route=="storage": result=query.storage_query(**args)
                     else: return self._send(404,{"error":"route_not_found"})
-                    return self._send(200,result)
+                    # The answer's own elapsed and CPU milliseconds; nothing else.
+                    timing=f"query;dur={(time.monotonic()-began)*1000:.1f}, cpu;dur={(time.thread_time()-cpu)*1000:.1f}"
+                    return self._send(200,result,timing=timing)
                 except (ValueError,KeyError,TypeError,OverflowError):
                     return self._send(400,{"error":"invalid_query"})
                 except Exception:

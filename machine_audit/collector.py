@@ -100,6 +100,9 @@ class Collector:
         self.last_save_error = None
         self.last_save_ns = None
         self.operations = {"flush_count":0,"flush_elapsed_s":0.0,"query_count":0,"query_elapsed_s":0.0,"http_sent_bytes":0}
+        # Per query method: count, elapsed and CPU. Kept apart from operations, whose
+        # entries the collector also records as self.* fields.
+        self.query_operations = {}
         self._started = False
         self._instance_fd = None
         self._paused_since = None
@@ -332,7 +335,7 @@ class Collector:
                     "unsaved_since_ns":self.tail[0][0].start_ns if self.tail else None,
                     "buffer_suspended_since_ns":self._paused_since,"save_error":self.last_save_error,
                     "last_save_ns":self.last_save_ns,"sources":self.source_status(),
-                    "operations":dict(self.operations)}
+                    "operations":dict(self.operations,queries={name:dict(op) for name,op in self.query_operations.items()})}
 
     def run(self):
         self.start()

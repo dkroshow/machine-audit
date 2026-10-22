@@ -53,11 +53,14 @@ def measured(function):
         finally:
             self._local.measure_depth=depth
             if depth==0 and self.collector:
+                elapsed,used=time.monotonic()-began,time.thread_time()-cpu
                 with self.collector.lock:
                     ops=self.collector.operations
                     ops["query_count"]=ops.get("query_count",0)+1
-                    ops["query_elapsed_s"]=ops.get("query_elapsed_s",0)+time.monotonic()-began
-                    ops["query_cpu_s"]=ops.get("query_cpu_s",0)+time.thread_time()-cpu
+                    ops["query_elapsed_s"]=ops.get("query_elapsed_s",0)+elapsed
+                    ops["query_cpu_s"]=ops.get("query_cpu_s",0)+used
+                    op=self.collector.query_operations.setdefault(function.__name__,{"count":0,"elapsed_s":0.0,"cpu_s":0.0})
+                    op["count"]+=1;op["elapsed_s"]+=elapsed;op["cpu_s"]+=used
     return call
 
 
