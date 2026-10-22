@@ -137,6 +137,65 @@ The Intel Mac restart recorded a one-off walk peak RSS of 1.2 GB after pruning
 a 13.6 M-entry abandoned generation, versus 462 MB on a clean store; this
 lifetime peak includes startup work and is not the walk's current resident memory.
 
+### First Linux validation (dev box, October 22, 2026)
+
+Revision 614fb7f on our own dev box: AWS t3a.large (2 vCPU, 8 GiB, 40 GB), Ubuntu
+24.04.5, kernel 7.0 (the AWS kernel, not 6.8), Python 3.12.3, systemd 255,
+cgroup v2 with only `cpu memory pids` delegated at the root, ping sockets closed.
+31 unit cgroups and 120 processes.
+
+**Run.** As an unprivileged user, a fresh clone passed `python3.12
+scripts/check.py` end to end in 1 min 51 s. That covered core 68, sources 23,
+scanner 53 (11 Darwin skips), onboarding 35 (5 Mac skips), replay 9,
+compileall, dashboard node 6 of 9 (3 skipped: no Chrome) and `git diff
+--check`. Node 22 was unpacked in that user's home for the dashboard tests.
+Then the "Linux (Ubuntu) install" sequence, exactly: `useradd`, a clone as the
+service user, `setup --non-interactive` with one test exclusion,
+`install --yes`, the two printed root commands and `start`. All exited 0;
+`doctor` reported ready with `Map timer: active, next run …`.
+
+**Ten minutes under the units** (05:50–06:00 UTC, nothing else running):
+
+| Measure | Dev box | First user's Target A |
+| --- | --- | --- |
+| Collector CPU (cgroup) | 26.6 s, 4.4% of a core | about 5% |
+| Collector memory peak (cgroup) | 88.8 MB | 122 MB |
+| Data directory growth | 7.14 MB, 0.71 MB a minute | 1.07 MB a minute |
+| Units and processes | 31, 120 | 57, 280 |
+
+Sources: 21 observed. These were gaps, each named: no cpufreq, fans, thermal
+zones, hwmon power, RAPL or GPU (`no_devices`), `icmp_not_permitted` (internet
+probe by TCP connect), other users' process I/O and GPU clients
+(`not_enabled`). The one hwmon temperature is a driver sentinel and reads
+unavailable. The resolver is the systemd-resolved stub (5.6 ms lookup).
+`who` ranked one row per workload: CPU by unit and process totals, memory by
+unit `memory.current`. Storage showed only our own process: other users' I/O
+is denied, and with no `io` controller delegated no unit has `io.stat`.
+Coverage listed 3,833 gaps in ten minutes, 1,687 of them from sources that read
+`no_devices` every 5 s.
+
+**Scanner.** `scan --full` as the service user walked 97,285 entries in 9.4 s
+wall, 4.2 s CPU, `peak_rss_bytes` 35.7 MB (`/usr/bin/time` agreed: 34.8 MB).
+Root and `/boot` are observed with uses equal to listed and
+`physical_residual_not_computed`. The EFI volume is a `denied` gap and the run
+completed. The test exclusion and `/tmp` show only as `excluded_roots: 2`,
+unnamed. The watcher held 6 folders. A file touched in a watched test folder
+put that folder's inode into `scanner-dirty.json` (mode 0600, 67 bytes,
+numbers only). The next `scan` was an update of 728 entries and consumed the
+file. The hourly timer's own run was also an update, exit 0.
+
+**Restart.** The OS's unattended-upgrades upgraded `liblzma5` at 06:03 and
+needrestart restarted the collector. It wrote a clean stop marker (last save 2 s
+before) and a new run began a second later. A manual `stop` and `start` gave
+the same. After the queries above, systemd recorded a 337 MB collector peak at
+that stop: the ten-minute `who` and coverage answers are computed inside the
+collector. `install --upgrade --yes` to the installed revision refused with
+`revision_already_installed`.
+
+**Not run:** the browser dashboard and access through Tailscale, a night-window
+full walk under the timer, growth beyond ten minutes, and any hardware sensor,
+GPU or ICMP path (absent here).
+
 ## Review regressions and scale measurements
 
 Run the portable boundary checks in a complete source checkout with Python 3.12:
