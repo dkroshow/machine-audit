@@ -91,7 +91,8 @@ Final saves do not prune: at the storage limit, pruning until a save fits can
 outlast any stop deadline. A final save is checked against the limit before it
 merges its summary rows (about 15 s at 2,000 processes), so a refusal is quick.
 The final saves also give up 2 s before the stop deadline (`close()`, 10 s by
-default): merging a 2,000-process save takes about 15 s. If the limit refuses
+default): merging a 2,000-process save takes about 15 s. A deadline of 2 s or
+less leaves no time to spill, so saving then continues in the background. If the limit refuses
 a final save, or it runs out of time, the collector
 writes the unsaved readings and the held minute to its own private spill file
 in the data directory (`unsaved-<run>-<time>.json`, mode 0600, created

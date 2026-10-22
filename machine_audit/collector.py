@@ -351,8 +351,9 @@ class Collector:
         release it after all old native reads and the writer have completed.
         """
         self.stop_event.set()
-        # The final saves give up in time to spill what they could not save.
-        deadline=time.monotonic()+timeout_s-SPILL_MARGIN_S
+        # The final saves give up in time to spill what they could not save. A deadline
+        # too short to spill cannot end clean anyway; then saving continues as before.
+        deadline=time.monotonic()+timeout_s-SPILL_MARGIN_S if timeout_s>SPILL_MARGIN_S else None
         with self.lock:
             if self._closer is None or (not self._closer.is_alive() and not self._close_result):
                 def finish():
