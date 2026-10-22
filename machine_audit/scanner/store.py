@@ -115,7 +115,7 @@ class MapStore:
     def write(self,growth=None):
         # Ask for the admissible range, not a payload multiplier. Budget still
         # clamps DB/WAL/SHM under its conservative cross-process hard bound.
-        with self.budget.sqlite_write(self.db,self.path,self.budget.limit_bytes if growth is None else growth):
+        with self.budget.sqlite_write(self.db,self.path,max_growth_bytes=growth):
             self.db.execute('BEGIN IMMEDIATE')
             try:
                 yield
@@ -332,6 +332,18 @@ class MapStore:
     def _sharing(self,blocks,full):
         charges=blocks.charges();complete=not blocks.estimated
         affected=set(self.changed)
+        pending=[]
+        def save_charges():
+            if not pending:return
+            if full:
+                # Only this unpublished generation changes. Bound each write;
+                # no transaction or reservation spans the stream lookup loop.
+                with self.write(growth=16*1024**2):
+                    self.db.executemany('INSERT OR REPLACE INTO charges VALUES(?,?,?,?,?,?,?,?)',pending)
+                self.progress()
+            else:
+                self.db.executemany('INSERT OR REPLACE INTO charges VALUES(?,?,?,?,?,?,?,?)',pending)
+            pending.clear()
         if full:
             streams=[r[0] for r in self.db.execute('SELECT DISTINCT stream FROM holders WHERE generation=? AND volume=?',(self.generation,self.vid))]
         else:
@@ -352,8 +364,9 @@ class MapStore:
             elif not full and owner['partial']:
                 amount=owner['private'] or 0;complete=False
             else:amount=charges.get(int(source_id(stream)),owner['private'] or 0 if owner['partial'] else owner['allocated'])
-            self.db.execute('INSERT OR REPLACE INTO charges VALUES(?,?,?,?,?,?,?,?)',
-                (self.generation,self.vid,stream,amount,owner['allocated'],owner['private'],owner['partial'],owner['dir']))
+            pending.append((self.generation,self.vid,stream,amount,owner['allocated'],owner['private'],owner['partial'],owner['dir']))
+            if len(pending)>=4096:save_charges()
+        save_charges()
         return affected,complete
 
     def _own(self,node,homes):
@@ -467,7 +480,7 @@ class MapStore:
     def finish_volume(self,volume,blocks,gaps,*,full,lean,bookmark=None,event_uuid=None,complete=True):
         self.flush();old=self.db.execute('SELECT * FROM volumes WHERE id=?',(self.volume,)).fetchone()
         if full:
-            with self.write():affected,sharing_complete=self._sharing(blocks,True)
+            affected,sharing_complete=self._sharing(blocks,True)
             self._aggregate_full(affected)
         with self.write():
             if not full:

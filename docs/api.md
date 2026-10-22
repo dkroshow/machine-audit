@@ -260,9 +260,27 @@ Callers should account for this difference when comparing resolutions.
 `Budget.sqlite_write` retains the conservative database + full possible WAL +
 SHM + checkpoint bound. `growth_bytes` is accepted for existing callers but does
 not impose a guessed payload-to-pages ceiling. SQLite can allocate any pages
-that fit the shared hard bound. Callers still own BEGIN/COMMIT/ROLLBACK. This can
+that fit the shared hard bound. Optional `max_growth_bytes` imposes an explicit
+additional page-count ceiling for bounded transactions; it is a hard limit,
+not an estimate of payload expansion. Callers still own BEGIN/COMMIT/ROLLBACK. This can
 leave close to half the managed limit unavailable for retained database pages;
 it does not establish that a full-volume scanner map fits.
+
+Admission holds `.budget.lock` only while checking and updating reservations.
+Each active reservation has a 512-byte private record and its own liveness lock.
+Other writers include its remaining peak allowance, subtracting bytes already
+present for the same SQLite database. Generic reservations keep their entire
+allowance until they finish. SQLite work, checkpoints, and waits run without the
+shared lock. Temporary reservation contention retries outside that lock; actual
+storage exhaustion still raises `BudgetExceeded`. A dead writer's unlocked
+reservation is reclaimed, while its database/WAL bytes remain counted. There
+is no PID-based liveness inference.
+
+The scanner computes full-scan sharing outside a transaction and commits charges
+in batches of at most 4,096 rows with a 16 MiB additional page ceiling. These rows
+belong to the unpublished generation; final publication remains atomic. Both
+collector and scanner must use this reservation protocol together. Do not run
+an older writer concurrently: it cannot account for active reservation records.
 
 Shutdown waits at most ten seconds total, including readers and the final save.
 If that deadline expires, it returns failure and keeps the instance lock. A

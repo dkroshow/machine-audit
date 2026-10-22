@@ -33,7 +33,9 @@ class StartupBudgetTests(unittest.TestCase):
 
     def test_schema_budget_failure_closes_the_opened_connection(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
-            budget=Budget(temp,limit_bytes=256*1024,free_margin_bytes=0)
+            # Include the live reservation record so startup reaches schema
+            # allocation; the schema still exceeds this hard limit.
+            budget=Budget(temp,limit_bytes=256*1024+512,free_margin_bytes=0)
             connections=[];connect=sqlite3.connect
             def capture(*args,**kwargs):
                 db=connect(*args,**kwargs);connections.append(db);return db
@@ -193,6 +195,32 @@ class CompactMapTests(unittest.TestCase):
         self.assertEqual(MapQuery(self.store.path).query()['rows'][0]['uses'],38*GB)
         last=self.store.db.execute("SELECT status FROM points WHERE id='2' ORDER BY observed_ns DESC LIMIT 1").fetchone()
         self.assertEqual(last['status'],'not_observed')
+
+    def test_full_sharing_commits_bounded_unpublished_batches(self):
+        self.store.prepare(self.volume);self.node('old',None,2*GB)
+        self.store.finish_volume(self.volume,Blocks(),[],full=True,lean=True)
+        before=MapQuery(self.store.path).query()
+        self.store.prepare(self.volume)
+        self.node('replacement',None,4097*4096)
+        for identity in range(4097):self.store.holder(identity,'replacement',identity,4096,None,False)
+        self.store.flush()
+        batches=[];current=0
+        def trace(sql):
+            nonlocal current
+            if sql.startswith('INSERT OR REPLACE INTO charges'):current+=1
+            if sql=='COMMIT' and current:batches.append(current);current=0
+        self.store.db.set_trace_callback(trace)
+        try:
+            # A later construction failure must retain the published map even
+            # though completed charge batches exist in the building generation.
+            with patch.object(self.store,'_aggregate_full',side_effect=RuntimeError('synthetic failure')):
+                with self.assertRaises(RuntimeError):
+                    self.store.finish_volume(self.volume,Blocks(),[],full=True,lean=True)
+        finally:self.store.db.set_trace_callback(None)
+        self.assertEqual(batches,[4096,1])
+        self.assertEqual(MapQuery(self.store.path).query(),before)
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM charges WHERE generation=?',
+                                              (self.store.generation,)).fetchone()[0],4097)
 
     def test_failure_after_applying_staged_rows_rolls_back_map_and_points(self):
         self.seed();query=MapQuery(self.store.path)
