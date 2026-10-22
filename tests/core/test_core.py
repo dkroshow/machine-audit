@@ -70,6 +70,22 @@ class CoreTests(unittest.TestCase):
         gaps=[g for g in Query(self.store).coverage(0,720*S)["gaps"] if g.get("signal")=="network.ping_rtt"]
         self.assertEqual([(g["reads"],g["start_ns"],g["end_ns"]) for g in gaps],[(12,0,55*S),(12,660*S,715*S)])
 
+    def test_hour_series_keeps_minute_rows_and_names_the_signal_with_only_hour_rows(self):
+        # Board #630: a Last hour view answered one hour row while the overview, over the
+        # same window, answered minutes. Each signal takes the finest rows it has.
+        records=[]
+        for t in range(0,70*60,10):
+            for name in ("cpu.counter","cpu.other"):
+                records.append(record(t,t,len(records)+1,name=name,source="synthetic."+name.split(".")[1]))
+        self.store.append(records)
+        # As pruning leaves the oldest rows of one source: hour rows only.
+        self.store.db.execute("DELETE FROM summaries WHERE source='synthetic.other' AND resolution!='hour'")
+        answer=Query(self.store).series(10*60*S,70*60*S,limit=600)
+        measured=[r for r in answer["rows"] if r["status"]=="observed"]
+        self.assertEqual(answer["resolution"],"minute")
+        self.assertEqual({(r["signal"],r["summary_resolution"]) for r in measured},{("cpu.counter","minute"),("cpu.other","hour")})
+        self.assertGreater(sum(r["signal"]=="cpu.counter" for r in measured),30)
+
     def test_hour_only_scope_writes_no_minute_summaries(self):
         # Per-scope summary resolution: Linux unit limits (scope unit_detail) were 10% of the first
         # Ubuntu run's summary payload while changing rarely.

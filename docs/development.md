@@ -129,12 +129,15 @@ that same function for catalog and summary selection; stored raw candidates
 also receive a bounded field-level check for older permissive indexes.
 Short `who` answers reuse their exact derived points for gap coverage. Longer
 answers select non-CPU signals before deriving pending readings; CPU keeps the
-full pass to preserve existing rank ties. Coverage derives host and device passes
-in order, the same selection series uses, carrying each source's prior reading
-and preserving all gap counts before output truncation. Process sources keep
-their saved status counts; their per-process baseline, reset and sleep gaps
-appear in `who`. Deriving every field of 2,000-process passes made a one-hour
-coverage answer take about 30 seconds and still truncate.
+full pass to preserve existing rank ties. Coverage of ten minutes or less derives
+host and device passes in order, the same selection series uses, carrying each
+source's prior reading and preserving all gap counts before output truncation.
+Longer coverage takes its gap rows from host-series summaries and decodes no
+pass: deriving an hour of one-second Linux host passes took 4-10 seconds.
+Process sources keep their saved status counts; their per-process baseline,
+reset and sleep gaps appear in `who`. Deriving every field of 2,000-process
+passes made a one-hour coverage answer take about 30 seconds and still truncate.
+Answers of an hour or more decode no unsaved pass while summaries cover them.
 A record index on `reading_components` keeps each window reading's component
 check from scanning older history; the first writable open after upgrading
 builds it once.

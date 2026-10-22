@@ -11,7 +11,7 @@ from dataclasses import replace
 from itertools import chain, groupby
 from .derive import points, rollups, summarize, merge_summaries, GOOD, BUSY
 from .store import MINUTE, QUARTER, HOUR, WIDTHS, unpack_summaries
-from .model import Record, field_component, is_process_evidence, is_series
+from .model import PROCESS_ENTITIES, Record, field_component, is_process_evidence, is_series
 
 # Without a named signal, each workload ranks once, by its component total: CPU time, written
 # bytes, and the memory view's footprint (Mac footprint; a Linux unit's charge, which already
@@ -23,6 +23,7 @@ WHO_TOTALS = {"cpu": {"process.cpu", "unit.cpu.stat.usage_usec"},
 MAX_ROWS = 2000
 MAX_SCAN = 20000
 MAX_QUERY_BYTES = 32*1024**2
+RESOLUTIONS = tuple(WIDTHS)
 
 def bounded_payloads(cursor):
     result=[];size=0
@@ -180,6 +181,10 @@ class Query:
             clause+=" AND source IN (SELECT source FROM signal_catalog WHERE signal IN ("+",".join("?" for _ in signals)+"))"
             args.extend(signals)
         if series_only:
+            # Process entities fail is_series by name alone; skip them before the per-row
+            # catalog check, which calls back into Python for every catalog signal.
+            clause+=" AND (summaries.component='self' OR ("+" AND ".join("summaries.entity NOT LIKE ?" for _ in PROCESS_ENTITIES)+"))"
+            args.extend(prefix+"%" for prefix in PROCESS_ENTITIES)
             clause+=" AND EXISTS(SELECT 1 FROM signal_catalog sc WHERE sc.source=summaries.source AND sc.component=summaries.component AND is_series(sc.component,summaries.entity,sc.scope))"
         if program_only:clause+=" AND entity LIKE 'program:%'"
         # Sort compact row identities, never compressed payloads. The snapshot
@@ -197,19 +202,44 @@ class Query:
                 row["partial_boundary"]=row["start_ns"]<start_ns or row["end_ns"]>end_ns
                 yield row
 
-    def _summary(self,db,captured,start_ns,end_ns,resolution,signals=None,component=None,program_only=False,series_only=False):
-        result=[];size=0;overflow=False
-        for row in self._iter_summaries(db,captured,start_ns,end_ns,resolution,signals,component,program_only,series_only):
-            size+=len(json.dumps(row,separators=(",",":")))
-            if len(result)>=MAX_SCAN or size>MAX_QUERY_BYTES:
-                overflow=True;break
-            result.append(row)
-        if captured and captured["tail"]:
-            raw,more=self._raw(db,captured,max(start_ns,min(r.end_ns for r in captured["tail"])),end_ns,component,series_only)
+    @staticmethod
+    def _saved(db,start_ns,end_ns):
+        """Whether a save covers part of the window. An hour or longer answers from saved
+        summaries; until a save covers it, the unsaved tail answers."""
+        return db.execute("SELECT 1 FROM summaries WHERE resolution='hour' AND bucket_ns>? AND bucket_ns<? LIMIT 1",(start_ns-HOUR,end_ns)).fetchone() is not None
+
+    @staticmethod
+    def _lane(row):
+        return (row["source"],row["signal"],row["entity"],row["unit"],row["scale"])
+
+    def _summary(self,db,captured,start_ns,end_ns,resolution,signals=None,component=None):
+        """Host-series rows, each lane at the finest stored resolution it has from
+        `resolution` up (pruning can leave a source only hour rows). The unsaved tail joins
+        windows under an hour, and longer ones that no save covers yet."""
+        result=[];size=0;overflow=False;lanes=set();finest=None
+        for res in RESOLUTIONS[RESOLUTIONS.index(resolution):]:
+            found=[]
+            for row in self._iter_summaries(db,captured,start_ns,end_ns,res,signals,component,series_only=True):
+                if component and row["component"]!=component or self._lane(row) in lanes:continue
+                size+=len(json.dumps(row,separators=(",",":")))
+                if len(result)+len(found)>=MAX_SCAN or size>MAX_QUERY_BYTES:
+                    overflow=True;break
+                found.append(row)
+            finest=finest or (res if found else None)
+            lanes.update(self._lane(r) for r in found);result.extend(found)
+            if overflow:break
+        if captured and captured["tail"] and (end_ns-start_ns<HOUR or not self._saved(db,start_ns,end_ns)):
+            raw,more=self._raw(db,captured,max(start_ns,min(r.end_ns for r in captured["tail"])),end_ns,component,True)
             overflow=overflow or more
             tail_points=[p for p in points(raw) if p["run_id"]==captured["run_id"] and p["sequence"]>captured["committed"] and (not signals or p["signal"] in signals)]
-            result.extend(r for _,r in rollups(tail_points,WIDTHS[resolution]) if r["start_ns"]<end_ns and r["end_ns"]>=start_ns)
-        return result,overflow
+            result.extend(r for _,r in rollups(tail_points,WIDTHS[finest or resolution]) if r["start_ns"]<end_ns and r["end_ns"]>=start_ns)
+        # With nothing stored, every resolution down to hour was tried.
+        return result,overflow,finest or (resolution if result else RESOLUTIONS[-1])
+
+    @staticmethod
+    def _resolution(start_ns,end_ns,limit):
+        """The finest stored resolution whose rows per lane fit the requested limit."""
+        return next((r for r in RESOLUTIONS[:-1] if -(-(end_ns-start_ns)//WIDTHS[r])<=limit),"hour")
 
     def _who_summaries(self,db,captured,start_ns,end_ns,signal,component):
         # Full interior hours; 15-minute and minute rows only for the sides. No
@@ -235,6 +265,7 @@ class Query:
                 row["summary_resolution"]=max(edges.get(key,{"hour"}),key=WIDTHS.get)
                 yield row
         for row in rows:
+            if signal is None and not self._ranks(row):continue  # who drops it; skip the merge
             row["partial_boundary"]=row["start_ns"]<start_ns or row["end_ns"]>end_ns
             entity=(row["source"],row["entity"])
             if current is not None and entity!=current:
@@ -310,8 +341,32 @@ class Query:
         result.update(signals=sorted(fields.values(),key=lambda p:(p["component"],p["signal"])),components=sorted({p["component"] for p in fields.values()}))
         return result
 
-    def _coverage(self,db,captured,start_ns,end_ns,records=(),component=None,derived=None):
-        """Reuse derived points only when they came from this exact record selection."""
+    @staticmethod
+    def _summary_gaps(rows,start_ns,end_ns):
+        """A lane's consecutive summary rows with the same unmeasured status, or with
+        sleep, form one gap row; `reads` counts those samples."""
+        gaps=[];open_rows={}
+        for row in sorted(rows,key=lambda r:r["summary_bucket_start_ns"]):
+            key=Query._lane(row)
+            bad={s:n for s,n in row["statuses"].items() if s not in GOOD}
+            if not bad and not row["sleep_s"]:
+                open_rows.pop(key,None);continue
+            status=max(bad,key=bad.get) if bad else "unobserved"
+            reason="summary_status" if bad else "window_contains_sleep"
+            gap,bucket_end=open_rows.get(key,(None,None))
+            if gap and (gap["status"],gap["reason"])==(status,reason) and bucket_end==row["summary_bucket_start_ns"]:
+                gap["end_ns"]=min(end_ns,row["end_ns"]);gap["reads"]+=sum(bad.values());gap["sleep_s"]+=row["sleep_s"]
+            else:
+                gap={"status":status,"reason":reason,"start_ns":max(start_ns,row["start_ns"]),"end_ns":min(end_ns,row["end_ns"]),
+                     "source":row["source"],"signal":row["signal"],"entity":row["entity"],"sleep_s":row["sleep_s"],
+                     "reads":sum(bad.values()),"summary_resolution":row["summary_resolution"]}
+                gaps.append(gap)
+            open_rows[key]=(gap,row["summary_bucket_end_ns"])
+        return gaps
+
+    def _coverage(self,db,captured,start_ns,end_ns,records=(),component=None,derived=None,summaries=None):
+        """Reuse derived points only when they came from this exact record selection.
+        Gap rows come from `summaries` instead when the window was answered from them."""
         retention=[dict(r) for r in db.execute("SELECT * FROM retention WHERE end_ns>? AND start_ns<? LIMIT 2001",(start_ns,end_ns))]
         states=defaultdict(lambda:defaultdict(int))
         args=["minute" if end_ns-start_ns<=HOUR else "hour",start_ns,end_ns]
@@ -347,6 +402,7 @@ class Query:
             cursor=max(cursor,effective_stop if not stopped else min(stopped,end_ns))
         if cursor<end_ns:gaps.append(dict(status="unobserved",reason="no_collector",start_ns=cursor,end_ns=end_ns))
         gaps.extend(dict(r,status="pruned") for r in retention if r['kind']!='raw_preserved')
+        if summaries is not None:gaps.extend(self._summary_gaps(summaries,start_ns,end_ns))
         def streamed_points():
             previous={}
             for record in records:
@@ -388,24 +444,21 @@ class Query:
         signals=list(signals or [])
         if len(signals)>32:
             raise ValueError("at most 32 signals")
-        width=1_000_000_000 if end_ns-start_ns<=10*MINUTE else MINUTE if end_ns-start_ns<=48*HOUR else HOUR
-        resolution="raw" if width<MINUTE else "minute" if width==MINUTE else "hour"
+        resolution="raw" if end_ns-start_ns<=10*MINUTE else self._resolution(start_ns,end_ns,limit)
         with self._snapshot(start_ns,end_ns) as (db,captured):
-            records=[]
+            records=[];rows=[]
             if resolution=="raw":
+                width=1_000_000_000
                 records,overflow=self._raw(db,captured,start_ns,end_ns,component,series_only=True)
                 selected=[replace(r,reading=replace(r.reading,fields=tuple(f for f in r.reading.fields if is_series(field_component(f,r.reading.component),f.entity,f.scope) and (not component or field_component(f,r.reading.component)==component)))) for r in records]
                 derived=[p for p in points(selected) if p["start_ns"]>=start_ns and p["end_ns"]<=end_ns]
-                rows=[r for _,r in rollups(derived,width)]
-            else:
-                rows,overflow=self._summary(db,captured,start_ns,end_ns,resolution,signals,component,series_only=True)
-            rows=[r for r in rows if (not component or r["component"]==component) and is_series(r["component"],r["entity"],r["scope"]) and (not signals or r["signal"] in signals)]
-            # Raw history may have been pruned; use retained summaries, explicitly.
-            for finer,coarser in (("raw","minute"),("minute","15-minute"),("15-minute","hour")):
-                if not rows and resolution==finer:
-                    rows,overflow=self._summary(db,captured,start_ns,end_ns,coarser,signals,component,series_only=True)
-                    resolution=coarser;width=WIDTHS[coarser]
-            lanes={(r["source"],r["signal"],r["entity"],r["unit"],r["scale"]):r for r in rows}
+                rows=[r for _,r in rollups(derived,width) if not signals or r["signal"] in signals]
+                # Raw history may have been pruned; use retained summaries, explicitly.
+                if not rows:resolution="minute"
+            if resolution!="raw":
+                rows,overflow,resolution=self._summary(db,captured,start_ns,end_ns,resolution,signals,component)
+                width=WIDTHS[resolution]
+            lanes={self._lane(r):r for r in rows}
             for requested in signals:
                 if not any(key[1]==requested for key in lanes):
                     lanes[("unknown",requested,"host",None,1.0)]=dict(source="unknown",signal=requested,entity="host",component=component,kind=None,unit=None)
@@ -430,6 +483,10 @@ class Query:
                     if not items:row.update(start_ns=start_ns+bucket*width,end_ns=min(end_ns,start_ns+(bucket+1)*width),status="unobserved",count=0,total=None,mean=None,min=None,max=None,last=None,covered_s=0)
                     row["bucket_start_ns"]=start_ns+bucket*width
                     row["bucket_end_ns"]=min(end_ns,start_ns+(bucket+1)*width)
+                    # A bin is one entity's merged rows: drop merge state, grouping fields and
+                    # the first stored bucket's identity; bucket_start/end_ns name the bin.
+                    for key in ("covered_windows","members","instance_count","partial_members","summary_bucket_start_ns","summary_bucket_end_ns"):
+                        row.pop(key,None)
                     merged.append(row)
             coverage=self._coverage(db,captured,start_ns,end_ns,records,component)
         truncated=overflow or len(merged)>limit
@@ -464,7 +521,7 @@ class Query:
                 resolution="summary";overflow=False
                 # Tail fragments remain in the same source/instance aggregation.
                 tail={}
-                if captured and captured["tail"]:
+                if captured and captured["tail"] and (end_ns-start_ns<HOUR or not self._saved(db,start_ns,end_ns)):
                     lo=max(start_ns,min(r.end_ns for r in captured["tail"]))
                     pending,more=self._raw(db,captured,lo,end_ns,component)
                     overflow=overflow or more
@@ -490,8 +547,7 @@ class Query:
             heap=[];count=0;attributed=None;lo=None;hi=None;partial=False;boundary=False
             for r in candidates:
                 if not self._who_row(r):continue
-                # States and events (failed reads, identities) remain evidence.
-                if signal is None and r["kind"] not in ("state","event") and r["signal"] not in WHO_TOTALS.get(r["component"],(r["signal"],)):continue
+                if signal is None and not self._ranks(r):continue
                 count+=1;lo=r["start_ns"] if lo is None else min(lo,r["start_ns"]);hi=r["end_ns"] if hi is None else max(hi,r["end_ns"])
                 partial=partial or r.get("partial_members",False);boundary=boundary or r.get("partial_boundary",False)
                 if signal=="process.cpu" and r["total"] is not None:attributed=(attributed or 0)+r["total"]*r["scale"]
@@ -529,6 +585,12 @@ class Query:
         return [replace(r,reading=replace(r.reading,fields=tuple(f for f in r.reading.fields if f.name in wanted))) for r in records]
 
     @staticmethod
+    def _ranks(row):
+        """Without a named signal: the component total, plus states and events (failed
+        reads, identities), which remain evidence."""
+        return row["kind"] in ("state","event") or row["signal"] in WHO_TOTALS.get(row["component"],(row["signal"],))
+
+    @staticmethod
     def _who_row(row):
         return is_process_evidence(row["entity"],row["scope"]) and row["scope"]!="unit_detail" and (row["entity"].startswith("program:") or not row["additive"] or row["component"]=="self" or row["scope"]=="unit")
 
@@ -536,10 +598,17 @@ class Query:
     def coverage(self,start_ns,end_ns,component=None,limit=600):
         self._bounds(start_ns,end_ns,limit)
         with self._snapshot(start_ns,end_ns) as (db,captured):
-            # Whole process passes cost a derived point per field; their saved
-            # status counts stay in coverage and per-process gaps stay in who.
-            records,overflow=self._raw(db,captured,start_ns,end_ns,component,series_only=True)
-            coverage=self._coverage(db,captured,start_ns,end_ns,records,component)
+            if end_ns-start_ns>10*MINUTE and self._saved(db,start_ns,end_ns):
+                # Longer windows take gap rows from host-series summaries and decode no
+                # pass; the unsaved tail still adds its status counts.
+                saved=dict(captured,tail=[]) if captured else None
+                summaries,overflow,_=self._summary(db,saved,start_ns,end_ns,self._resolution(start_ns,end_ns,limit),component=component)
+                coverage=self._coverage(db,captured,start_ns,end_ns,component=component,summaries=summaries)
+            else:
+                # Whole process passes cost a derived point per field; their saved
+                # status counts stay in coverage and per-process gaps stay in who.
+                records,overflow=self._raw(db,captured,start_ns,end_ns,component,series_only=True)
+                coverage=self._coverage(db,captured,start_ns,end_ns,records,component)
         result=self._base("coverage")
         result.update(requested={"start_ns":start_ns,"end_ns":end_ns},coverage=coverage,gaps=coverage["gaps"],truncated=overflow)
         return result

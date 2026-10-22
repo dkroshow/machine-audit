@@ -258,6 +258,28 @@ programs, which keep only each minute's top consumers), `15-minute` and `hour`
 rows carry `summary_resolution`; in `who` it names the coarsest resolution that
 set the row's edges.
 
+`series` uses raw readings for ten minutes or less. Longer windows use the finest
+stored resolution with no more rows per signal than `limit`: minute up to 10 hours
+at the default 600, then 15-minute, then hour. Each signal answers at the finest
+resolution it has from there up, so one with only hour rows (for example after
+pruning) keeps them and its rows say `summary_resolution: hour`, while the others
+keep minute rows; `resolution` names the finest used. Rows then merge into equal
+bins: with `n` signals each gets `limit // n` bins over the window, and a bin
+merges the summary rows that end in it the way hour rows merge minutes (totals
+add, peaks keep their original values and times). So a series answer has at most
+`limit` rows. Bin rows name their edges in `bucket_start_ns`/`bucket_end_ns` and
+omit stored-bucket identities, merge state and `who` grouping fields.
+
+Answers of an hour or more come from summaries. The unsaved tail (at most the
+minute since the last save) is decoded only when no save covers the window yet,
+so `covered.end_ns` can stop at the last save. Once a save covers it, coverage
+of more than ten minutes takes its gap rows from host-series summaries without
+decoding readings; the tail still adds its status counts. One
+row per signal spans consecutive summary rows with the same unmeasured status,
+with reason `summary_status` (or `window_contains_sleep`), `reads` counting those
+samples and `summary_resolution`. Read-level reasons such as `baseline` appear
+in coverage of ten minutes or less and in `who`.
+
 Summary selection uses aligned bucket identities. An observed counter window
 may cross a requested edge; it is retained whole and marked `partial_boundary`.
 `start_ns`/`end_ns` remain actual observations. `summary_bucket_start_ns` and

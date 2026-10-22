@@ -15,13 +15,14 @@ import unittest
 from unittest.mock import patch
 
 from machine_audit.budget import Budget
+from machine_audit.collector import Collector
 from machine_audit.model import Clock,Field,Reading,Record
 from machine_audit.query import Query
 from machine_audit.store import Store, unpack_summaries
 
 S=10**9
 
-def process_records(count,passes):
+def process_records(count,passes,step=10*S):
     from machine_audit.sources.native import RUsage4,TaskVM
     from machine_audit.sources.macos import MacOS,ReadSource
     class Native:
@@ -42,7 +43,7 @@ def process_records(count,passes):
     mac.clock=clock;source=ReadSource('macos.process','cpu',10,mac.processes,clock)
     records=[]
     for seq in range(1,passes+1):
-        native.tick+=1;r=source.read();records.append(Record(r,'boot','run',seq,r.end.wall_ns,r.end));t[0]+=10*S
+        native.tick+=1;r=source.read();records.append(Record(r,'boot','run',seq,r.end.wall_ns,r.end));t[0]+=step
     return records
 
 
@@ -91,26 +92,42 @@ class ScaleTests(unittest.TestCase):
             answer=Query(self.store).who(lo,hi,signal=signal,component=component,limit=2000)
             self.assertTrue(answer['rows'],signal);self.assertTrue(answer['totals_complete'])
 
-    def test_hour_coverage_with_2000_process_passes_skips_their_fields_and_is_complete(self):
-        # Big Mac took 30 s: coverage derived every field of every pass until the
-        # decode cap, so a 1 h answer was slow and truncated. A 4 MiB cap stands in
-        # for the 25 passes that fill the real 32 MiB one.
-        procs=process_records(2000,6);records=[]
-        for p in procs:
-            c=p.reading.end
-            records.append(Record(Reading('synthetic.cpu','cpu',p.reading.start,c,(Field('cpu.busy',float(len(records)),'seconds','counter'),)),'boot','run',len(records)+1,c.wall_ns,c))
-            records.append(Record(p.reading,'boot','run',len(records)+1,c.wall_ns,c))
-        self.store.append(records)
-        decoded=[]
+    def test_hour_answers_with_2000_process_passes_come_from_summaries_within_bounds(self):
+        # Big Mac and a Linux box took 4-34 s per hour view and a 5 MB series: answers
+        # decoded process passes (stored and unsaved) and carried every gauge sample's
+        # instant as covered time. Hour windows answer from summaries.
+        procs=process_records(2000,7,step=12*60*S);base=procs[0].reading.end.wall_ns
+        host=['synthetic.cpu','synthetic.memory','synthetic.disk','synthetic.net','synthetic.power','synthetic.heat','synthetic.gpu','synthetic.probe']
+        sequence=0
+        for minute in range(73):
+            t=base+minute*60*S;a=t-10**18+S  # the adapter's clock: wall 10**18 ahead of awake
+            c0=Clock(t-60*S,a-60*S,a-60*S);c=Clock(t,a,a);batch=[]
+            for source in host:
+                sequence+=1;fields=(Field(source[10:]+'.work',float(minute),'seconds','counter'),Field(source[10:]+'.level',float(minute),'bytes'))
+                batch.append(Record(Reading(source,'cpu',c0,c,fields),'boot','run',sequence,t,c))
+            for p in procs[:-1]:
+                if t-60*S<p.reading.end.wall_ns<=t:sequence+=1;batch.append(Record(p.reading,'boot','run',sequence,t,c))
+            self.store.append(batch)
+        end=procs[-1].reading.end.wall_ns
+        collector=Collector(self.store,run_id='tail',boot_id='boot',clock=lambda:procs[-1].reading.end)
+        collector.ingest(procs[-1].reading)  # an unsaved pass ending the window
+        query=Query(self.store,collector)
         unpack=Record.unpack
         def counting(payload):
             record=unpack(payload);decoded.append(len(record.reading.fields));return record
-        end=procs[-1].reading.end.wall_ns
-        with patch('machine_audit.query.MAX_QUERY_BYTES',4*1024**2),patch.object(Record,'unpack',side_effect=counting):
-            answer=Query(self.store).coverage(end-3600*S,end)
-        self.assertFalse(answer['truncated'] or answer['coverage']['truncated'])
-        self.assertTrue(answer['coverage']['sources']['macos.process']['observed'])  # saved counts remain
-        self.assertLess(sum(decoded),100)  # host passes only, no 42,000-field process pass
+        for name,call,seconds in (('series',lambda:query.series(end-3600*S,end,limit=600),0.5),
+                                  ('who',lambda:query.who(end-3600*S,end,'process.cpu','cpu',limit=75),1.0),
+                                  ('coverage',lambda:query.coverage(end-3600*S,end),0.5)):
+            began=time.thread_time();decoded=[]
+            with patch.object(Record,'unpack',side_effect=counting):answer=call()
+            self.assertLess(time.thread_time()-began,seconds,name)
+            self.assertFalse(answer['truncated'],name)
+            self.assertTrue(answer['rows'] if name!='coverage' else answer['coverage']['sources'],name)
+            self.assertEqual(decoded,[],name)  # no pass, stored or unsaved
+        self.assertEqual(answer['coverage']['truncated'],False)
+        series=query.series(end-3600*S,end,limit=600)
+        self.assertEqual(series['resolution'],'minute')
+        self.assertLess(len(json.dumps(series,separators=(',',':'))),500_000)
 
     def test_2000_process_minutes_keep_top_consumers_and_15_minute_rows_keep_all(self):
         # Big Mac grew 11.3 MB/min, half of it per-instance minute rows. Minute rows keep each

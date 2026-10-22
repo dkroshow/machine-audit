@@ -239,11 +239,14 @@ def field_component(field: Field, default: str) -> str:
     return default
 
 
+PROCESS_ENTITIES = ("process:", "program:")
+
+
 def is_process_evidence(entity: str, scope: str) -> bool:
     """Failed PID reads retain process scope even without a process identity.
     Linux unit cgroups are workload groups, not host series: `unit` fields rank like
     programs and `unit_detail` fields (limits, breakdowns, pressure) describe them."""
-    return scope in ("process", "unit", "unit_detail") or entity.startswith(("process:", "program:"))
+    return scope in ("process", "unit", "unit_detail") or entity.startswith(PROCESS_ENTITIES)
 
 
 def is_series(component: str, entity: str, scope: str) -> bool:

@@ -49,8 +49,9 @@ def source_fields(reading):
 
 
 def union_ns(intervals):
+    # A gauge sample is an instant: it adds no covered time, only list length.
     merged=[]
-    for start,end in sorted(intervals):
+    for start,end in sorted(i for i in intervals if i[1]>i[0]):
         if merged and start <= merged[-1][1]:
             merged[-1][1]=max(merged[-1][1],end)
         else:
