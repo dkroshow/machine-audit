@@ -90,7 +90,7 @@ class Devices:
                 yield field('storage.capacity', None, 'bytes', status=error_status(exc),
                             entity='device:' + volume.device, scope='volume')
                 continue
-            entity = f'volume:{s.f_fsid:x}'  # derived from the filesystem UUID on ext4 and btrfs
+            entity = self.hashed('volume', f'{s.f_fsid:x}')  # f_fsid derives from the filesystem UUID on ext4
             if entity in entities:
                 continue
             entities.add(entity)
@@ -139,7 +139,7 @@ class Devices:
         yield from self.sensor_fields('fan', 'gauge', 'heat.fan_rpm', 'rpm', limits=('min', 'max'))
 
     def power(self):
-        # power*_average is the driver's own average; power*_input is instantaneous; both microwatts.
+        # power*_average is the driver's own average and power*_input instantaneous; microwatts, stored as watts.
         for chip, identity, directory, suspended in self.hwmon():
             for n in sorted({int(m[1]) for m in (re.fullmatch(r'power(\d+)_(?:average|input|cap)', p.name)
                                                  for p in directory.iterdir()) if m}):
@@ -150,12 +150,12 @@ class Devices:
                     if not path.exists():
                         continue
                     if suspended:
-                        yield field('power.' + kind, None, 'uW', status='unobserved', **kw)
+                        yield field('power.' + kind, None, 'watts', status='unobserved', **kw)
                         continue
                     try:
-                        yield field('power.' + kind, int(path.read_text()), 'uW', **kw)
+                        yield field('power.' + kind, int(path.read_text()) / 1e6, 'watts', **kw)
                     except OSError as exc:
-                        yield field('power.' + kind, None, 'uW', status=gap_status(exc), **kw)
+                        yield field('power.' + kind, None, 'watts', status=gap_status(exc), **kw)
 
     def thermal_zones(self):
         base = self.root / 'sys/class/thermal'

@@ -148,6 +148,9 @@ class LinuxSourceTests(unittest.TestCase):
         self.assertEqual(first['disk.read'].value, 80000 * 512)  # diskstats sectors are 512 bytes
         self.assertEqual((first['disk.flush_operations'].value, first['disk.in_progress'].kind), (9, 'gauge'))
         self.assertEqual(by_name(disks)['io.pressure.full'].value, 41000)
+        volume = next(f.entity for f in Devices(self.root, b'0' * 64).capacity() if f.status == 'observed')
+        self.assertRegex(volume, r'\Avolume:[0-9a-f]{16}\Z')
+        self.assertNotIn(f'{os.statvfs(self.root).f_fsid:x}', volume)  # the filesystem id is salted
         ssh = by_name(f for f in self.host.workloads() if f.label == 'ssh.service')
         self.assertEqual((ssh['unit.io.stat.rbytes'].value, ssh['unit.io.pressure.some'].component), (4096, 'storage'))
 
@@ -179,7 +182,7 @@ class LinuxSourceTests(unittest.TestCase):
         tctl = next(f for f in temperatures if f.label == 'k10temp Tctl')
         self.assertEqual((tctl.value, tctl.unit), (45.125, 'degC'))  # hwmon millidegrees
         power = by_name(devices.power())['power.average']
-        self.assertEqual((power.label, power.value, power.unit), ('amdgpu PPT', 12345000, 'uW'))
+        self.assertEqual((power.label, power.value, power.unit), ('amdgpu PPT', 12.345, 'watts'))  # hwmon microwatts
         gpu = by_name(devices.gpu())
         self.assertEqual((gpu['gpu.utilization'].value, gpu['gpu.vram_used'].value), (7, 536870912))
         for status in ('sys/class/drm/card1/device/power/runtime_status', 'sys/class/hwmon/hwmon1/device/power/runtime_status'):

@@ -20,7 +20,7 @@ UNITS = frozenset({
     "seconds", "ms", "us", "ns", "unix_ns", "ticks", "mach_ticks", "minutes",
     "percent", "level", "boolean", "state", "integer", "version", "uuid", "sha256", "git_commit",
     "cpus", "CPUs", "logical CPUs", "LOAD_SCALE_1000", "Hz", "MHz", "Mbps",
-    "degC", "watts", "uW", "rpm", "dB", "dBm", "source_units", "driver_units", "unknown_units",
+    "degC", "watts", "rpm", "dB", "dBm", "source_units", "driver_units", "unknown_units",
 })
 _CODE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
 _LABEL = re.compile(r"[\w .()+-]{1,80}\Z", re.UNICODE)

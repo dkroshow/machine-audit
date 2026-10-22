@@ -81,7 +81,8 @@ measure growth on the target before trimming anything.
   `io.stat` sums physical disks only, because a request through LVM is also
   counted on its dm device.
 - Volumes: local disk filesystems from mountinfo, once per device, entity
-  `volume:<statvfs f_fsid>` (derived from the filesystem UUID on ext4).
+  `volume:` + HMAC(salt, statvfs `f_fsid`)[:16]; `f_fsid` derives from the
+  filesystem UUID on ext4.
 - Interfaces: entity `interface:<ifindex>`; loopback is skipped. A down link
   is `network.link_state` = `down`, not a failure. `network.physical` marks
   interfaces with a device; bridges, veth and tunnels repeat that traffic.
@@ -96,8 +97,8 @@ measure growth on the target before trimming anything.
   configurable if the first user asks.
 - Sensors: entity is a salted hash of the hwmon device path and channel;
   label is chip plus channel label (`k10temp Tctl`, `nvme Composite`).
-  Temperatures are millidegrees, stored as °C. Power stays in microwatts:
-  `uW` joined `UNITS` because hwmon `power*` files report microwatts.
+  Temperatures are millidegrees, stored as °C; power is microwatts, stored
+  as watts, as on the Mac.
 - GPU: amdgpu cards only, read by default because sysfs reads reset no
   counters (the Mac gates its GPU for that reason). Entity: a salted hash of
   the PCI slot. A card whose
