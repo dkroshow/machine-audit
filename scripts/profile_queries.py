@@ -30,6 +30,7 @@ cases = {
     "series 1h cpu": lambda: query.series(start, end, component="cpu", limit=limit),
     "who 1h cpu": lambda: query.who(start, end, component="cpu", limit=limit),
     "who 1h memory": lambda: query.who(start, end, component="memory", limit=limit),
+    "who 24h cpu": lambda: query.who(end - 24 * 3600 * 10**9, end, component="cpu", limit=limit),
 }
 for name, call in cases.items():
     call()  # warm the page cache once; the profiled run is the warm one

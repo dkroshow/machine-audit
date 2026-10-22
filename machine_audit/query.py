@@ -165,7 +165,9 @@ class Query:
         return sorted(unique.values(),key=lambda r:(r.reading.end.wall_ns,r.sequence)),overflow
 
     def _iter_summaries(self,db,captured,start_ns,end_ns,resolution,signals=None,
-                        component=None,program_only=False,series_only=False,spans=None):
+                        component=None,program_only=False,series_only=False,spans=None,stored=None):
+        """Matching summary rows in source, entity, bucket order. `stored`, a one-item
+        list, accumulates the stored payload bytes read, for callers that bound them."""
         width = WIDTHS[resolution]
         spans = spans or [(resolution,start_ns//width*width,end_ns)]
         args=[];parts=[]
@@ -190,25 +192,29 @@ class Query:
             args.extend(prefix+"%" for prefix in PROCESS_ENTITIES)
             clause+=" AND EXISTS(SELECT 1 FROM signal_catalog sc WHERE sc.source=summaries.source AND sc.component=summaries.component AND is_series(sc.component,summaries.entity,sc.scope))"
         if program_only:clause+=" AND entity LIKE 'program:%'"
-        # Sort compact row identities, never compressed payloads. The snapshot
-        # keeps these lookups stable while a writer replaces cumulative rows.
-        cursor=db.execute("SELECT id,bucket_ns,resolution,source FROM summaries WHERE "+clause+" ORDER BY source,entity,bucket_ns",args)
-        for identifier,bucket,res,source in cursor:
-            payload=db.execute("SELECT payload FROM summaries WHERE id=?",(identifier,)).fetchone()[0]
-            try:rows=unpack_summaries(payload)
-            except (zlib.error,ValueError):
-                # A payload damaged on disk (crash, recovery) is a reported gap,
-                # not a failed answer for every window that contains it.
-                self._local.damaged.add((source,bucket,res));continue
-            for row in rows:
-                if series_only and not is_series(row["component"],row["entity"],row["scope"]):continue
-                if signals and row["signal"] not in signals:continue
-                if row["start_ns"] >= end_ns or row["end_ns"] < start_ns:continue
-                row["summary_bucket_start_ns"]=bucket
-                row["summary_bucket_end_ns"]=bucket+WIDTHS[res]
-                row["summary_resolution"]=res
-                row["partial_boundary"]=row["start_ns"]<start_ns or row["end_ns"]>end_ns
-                yield row
+        # Sort compact row identities, never compressed payloads, then fetch payloads
+        # in batches. The snapshot keeps them stable while a writer replaces rows.
+        selected=db.execute("SELECT id,bucket_ns,resolution,source FROM summaries WHERE "+clause+" ORDER BY source,entity,bucket_ns",args).fetchall()
+        for lo in range(0,len(selected),500):
+            batch=selected[lo:lo+500]
+            payloads=dict(db.execute("SELECT id,payload FROM summaries WHERE id IN ("+",".join("?"*len(batch))+")",[b[0] for b in batch]))
+            for identifier,bucket,res,source in batch:
+                payload=payloads[identifier]
+                if stored is not None:stored[0]+=len(payload)
+                try:rows=unpack_summaries(payload)
+                except (zlib.error,ValueError):
+                    # A payload damaged on disk (crash, recovery) is a reported gap,
+                    # not a failed answer for every window that contains it.
+                    self._local.damaged.add((source,bucket,res));continue
+                for row in rows:
+                    if series_only and not is_series(row["component"],row["entity"],row["scope"]):continue
+                    if signals and row["signal"] not in signals:continue
+                    if row["start_ns"] >= end_ns or row["end_ns"] < start_ns:continue
+                    row["summary_bucket_start_ns"]=bucket
+                    row["summary_bucket_end_ns"]=bucket+WIDTHS[res]
+                    row["summary_resolution"]=res
+                    row["partial_boundary"]=row["start_ns"]<start_ns or row["end_ns"]>end_ns
+                    yield row
 
     @staticmethod
     def _saved(db,start_ns,end_ns):
@@ -224,13 +230,13 @@ class Query:
         """Host-series rows, each lane at the finest stored resolution it has from
         `resolution` up (pruning can leave a source only hour rows). The unsaved tail joins
         windows under an hour, and longer ones that no save covers yet."""
-        result=[];size=0;overflow=False;lanes=set();finest=None
+        result=[];stored=[0];overflow=False;lanes=set();finest=None
         for res in RESOLUTIONS[RESOLUTIONS.index(resolution):]:
             found=[]
-            for row in self._iter_summaries(db,captured,start_ns,end_ns,res,signals,component,series_only=True):
+            for row in self._iter_summaries(db,captured,start_ns,end_ns,res,signals,component,series_only=True,stored=stored):
                 if component and row["component"]!=component or self._lane(row) in lanes:continue
-                size+=len(json.dumps(row,separators=(",",":")))
-                if len(result)+len(found)>=MAX_SCAN or size>MAX_QUERY_BYTES:
+                # Bounded by the stored payload bytes read, not by re-encoding each row.
+                if len(result)+len(found)>=MAX_SCAN or stored[0]>MAX_QUERY_BYTES:
                     overflow=True;break
                 found.append(row)
             finest=finest or (res if found else None)
