@@ -112,7 +112,7 @@ def inspect(config: Config) -> dict:
         "startup": startup,
         "port": port,
         "permissions": permissions,
-        "dashboard": {"access": "tailscale" if config.tailscale_host else "local", "configured": config.tailscale_host is not None},
+        "dashboard": {"access": config.allowed_hosts or "local"},
         "budget": runtime.get("budget"),
         "next_actions": actions,
     }
@@ -156,7 +156,7 @@ def setup(config: Config, *, json_output: bool = False) -> int:
     """Save choices only after confirmation. Installing is a separate explicit action."""
     if json_output or not sys.stdin.isatty():
         result = {"status": "decisions_needed", "saved": False,
-                  "decisions": ["protected_disk_areas", "optional_helper", "exclusive_gpu_reader", "tailscale_hostname"],
+                  "decisions": ["protected_disk_areas", "optional_helper", "exclusive_gpu_reader", "dashboard_hosts"],
                   "next_action": "Run machine-audit setup in a terminal to choose access and confirm settings."}
         print(json.dumps(result, indent=2) if json_output else result["next_action"])
         return 2
@@ -175,11 +175,10 @@ def setup(config: Config, *, json_output: bool = False) -> int:
         proposed.enabled['gpu'] = _yes_no(
             "Read GPU statistics? Other GPU recorders must be paused before starting.",
             bool(config.enabled.get('gpu', False)))
-        current_host = config.tailscale_host or ""
-        answer = input(f"Tailscale hostname [{current_host or 'local dashboard only'}]; '-' for local only: ").strip()
-        proposed.tailscale_host = None if answer == "-" else (answer or current_host or None)
+        answer = input("Hostnames you will reach the dashboard through (comma-separated, blank for this machine only): ")
+        proposed.allowed_hosts = [h.strip().lower() for h in answer.split(",") if h.strip()]
         proposed.validate()
-        print(f"Dashboard: {proposed.tailscale_host or 'this machine only'}")
+        print(f"Dashboard: {', '.join(proposed.allowed_hosts) or 'this machine only'}")
         print(f"Private recordings: {proposed.root}")
         print("Access choices are requests. The running scanner must confirm permission; the helper is not shipped yet, so its choice is recorded for later.")
         if not _yes_no("Save these choices?", True):
@@ -189,7 +188,7 @@ def setup(config: Config, *, json_output: bool = False) -> int:
         print("\nCancelled; no settings changed.")
         return 1
     except ValueError:
-        print("Invalid settings. Use a bare Tailscale hostname ending in .ts.net; nothing was saved.")
+        print("Invalid settings. Use host or host:port names without a scheme or path; nothing was saved.")
         return 2
     proposed.save()
     # The caller may continue with the same validated configuration instance.

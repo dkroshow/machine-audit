@@ -56,7 +56,7 @@ flowchart LR
   Q --> H[Loopback HTTP + JSON]
   H --> D[Dashboard<br/>HTML/CSS/JS]
   H --> A[Agents · CLI --json]
-  H --> TS[Tailscale Serve]
+  H --> TS[Optional front<br/>e.g. Tailscale Serve]
   TS --> R[Authorized remote browser]
   Q -. no server: CLI, store only .-> A
 ```
@@ -165,16 +165,18 @@ not do, and never fills a gap with zero.
   remainder; their memory is uncovered, never subtracted. No remediation path exists.
 - **Private data directory**, mode 0700, holds the database, WAL, shared-memory
   sidecars and secrets. The scanner's separate store keeps its own name boundary.
-- **Dashboard transport.** The application binds to 127.0.0.1. Initial remote
-  access uses Tailscale Serve as described in [installation](installation.md#dashboard-access).
-  Admit loopback hosts and the one configured Tailscale hostname, with their exact
-  permitted Origins; reject others. Tailscale provides private network access, while
-  application authentication applies to both local and proxied API requests.
+- **Dashboard transport.** The application binds to 127.0.0.1 and admits only
+  loopback hosts by default. Remote access goes through an operator-chosen front,
+  such as Tailscale Serve, a reverse proxy or an ssh tunnel, as described in
+  [installation](installation.md#dashboard-access). Admit loopback hosts and the
+  configured `allowed_hosts`, with their exact permitted Origins; reject others.
+  The front provides network access, while application authentication applies to
+  both local and proxied API requests.
 - **Authentication, working design.** Every API request carries a per-run token
   in an authorization header, read by the CLI from a 0600 file. Locally,
   `machine-audit open` launches the dashboard with the token in the URL fragment;
   the page keeps it in memory and removes it from the address bar. Remote opening
-  needs an authenticated URL for the configured Tailscale origin, obtained through
+  needs an authenticated URL for a configured origin, obtained through
   authorized machine access. The builder validates that bootstrap and token renewal
   after a restart. Tokens never enter logs, stores or telemetry. This does not
   protect against a malicious process running as the same user; no unauthenticated

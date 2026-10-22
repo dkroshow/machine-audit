@@ -75,6 +75,30 @@ class SetupTests(unittest.TestCase):
             path.write_text(json.dumps({"data_dir": parent, "scanner_exclusions": ["/srv/private/", "/srv/private2"]}))
             self.assertEqual(Config.load(path).scanner_exclusions, ["/srv/private", "/srv/private2"])
 
+    def test_dashboard_hosts_accept_proxy_and_tunnel_names_and_refuse_a_scheme(self):
+        for answer, expected in (("dash.example.org", ["dash.example.org"]), ("localhost:9000, dash.example.org", ["localhost:9000", "dash.example.org"]),
+                                 ("", []), ("https://dash.example.org", None)):
+            with self.subTest(answer=answer), tempfile.TemporaryDirectory() as parent:
+                config = Config(data_dir=parent)
+                with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=["no", "no", "no", answer, "yes"]), redirect_stdout(io.StringIO()):
+                    result = setup(config)
+                self.assertEqual(result, 2 if expected is None else 0)
+                self.assertEqual(config.path.exists(), expected is not None)
+                if expected is not None:
+                    self.assertEqual(Config.load(config.path).allowed_hosts, expected)
+
+    def test_old_tailscale_host_loads_as_allowed_hosts_without_rewriting(self):
+        with tempfile.TemporaryDirectory() as parent:
+            path = Path(parent) / "config.json"
+            path.write_text(json.dumps({"data_dir": parent, "tailscale_host": "host.example.ts.net"}))
+            before = path.read_bytes()
+            config = Config.load(path)
+            self.assertEqual(config.allowed_hosts, ["host.example.ts.net"])
+            self.assertEqual(path.read_bytes(), before)
+            config.save()
+            self.assertEqual(json.loads(path.read_text())["allowed_hosts"], ["host.example.ts.net"])
+            self.assertNotIn("tailscale_host", json.loads(path.read_text()))
+
     def test_confirmed_choices_persist_privately_without_claiming_grants(self):
         with tempfile.TemporaryDirectory() as parent:
             config = Config(data_dir=str(Path(parent) / "private"))
@@ -85,6 +109,7 @@ class SetupTests(unittest.TestCase):
             self.assertFalse(saved.source_options["helper_requested"])
             self.assertTrue(saved.enabled['scanner'])
             self.assertTrue(saved.enabled['gpu'])
+            self.assertEqual(saved.allowed_hosts, ["host.example.ts.net"])
             self.assertNotIn("full_disk_access", saved.source_options)
             self.assertEqual(saved.path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(saved.root.stat().st_mode & 0o777, 0o700)

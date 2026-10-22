@@ -79,7 +79,7 @@ def _run(config,ready):
         collector.operations=operations
         collector.acquire()
         query=local_query(store,collector,config)
-        server=make_server(query,write_token(config.token_path),config.port,tailscale_host=config.tailscale_host)
+        server=make_server(query,write_token(config.token_path),config.port,allowed_hosts=config.allowed_hosts)
         server_thread=threading.Thread(target=server.serve_forever,daemon=True)
         server_thread.start()
         ready()

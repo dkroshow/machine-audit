@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import json
 import os
+import re
 from pathlib import Path
 import secrets
 import uuid
@@ -16,7 +17,7 @@ def default_data_dir() -> Path:
 class Config:
     data_dir: str = field(default_factory=lambda: str(default_data_dir()))
     port: int = 8765
-    tailscale_host: str | None = None
+    allowed_hosts: list[str] = field(default_factory=list)
     device_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     tail_limit_bytes: int = 64*1024**2
     enabled: dict[str, bool] = field(default_factory=dict)
@@ -63,8 +64,10 @@ class Config:
             raise ValueError("invalid runtime configuration")
         if not self.root.is_absolute():
             raise ValueError("data_dir must be absolute")
-        if self.tailscale_host and (not self.tailscale_host.endswith(".ts.net") or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789-." for c in self.tailscale_host)):
-            raise ValueError("tailscale_host must be a bare lower-case ts.net hostname")
+        if not isinstance(self.allowed_hosts, list) or not all(isinstance(h, str) and re.fullmatch(r"[a-z0-9.-]+(:[0-9]{1,5})?", h) for h in self.allowed_hosts):
+            raise ValueError("allowed_hosts must be lower-case host or host:port values without scheme or path")
+        if len(set(self.allowed_hosts)) != len(self.allowed_hosts):
+            raise ValueError("allowed_hosts must not repeat a host")
         if not isinstance(self.scanner_exclusions, list) or not all(isinstance(p, str) and os.path.isabs(p) for p in self.scanner_exclusions):
             raise ValueError("scanner_exclusions must be a list of absolute paths")
         self.scanner_exclusions = [os.path.normpath(p) for p in self.scanner_exclusions]
@@ -102,7 +105,12 @@ class Config:
         else:
             if path.is_symlink():
                 raise ValueError("config cannot be a symlink")
-            config = cls(**json.loads(path.read_text())).validate()
+            saved = json.loads(path.read_text())
+            # Older files named one Tailscale host. Setup's next save writes the list.
+            if "tailscale_host" in saved:
+                host = saved.pop("tailscale_host")
+                saved.setdefault("allowed_hosts", [host] if host else [])
+            config = cls(**saved).validate()
         if explicit:
             config._loaded_path = path
         return config

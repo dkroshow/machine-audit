@@ -65,9 +65,9 @@ Other query commands are `catalog`, `status`, `series`, `who`, `coverage`,
 
 State on disk: recordings and config live in `~/.local/share/machine-audit`.
 Setup states a 10 GB storage limit, with a warning from 5 GB. The dashboard
-server binds to `127.0.0.1:8765` by default with a per-run token. You configure
-any proxy yourself; Tailscale Serve is one option. Setup's optional Tailscale
-hostname only adds that hostname to the allowed Host/Origin values.
+server binds to `127.0.0.1:8765` by default with a per-run token and admits
+loopback only. You configure any front yourself; Tailscale Serve, a reverse proxy
+or an ssh tunnel all work once setup lists their host names (`allowed_hosts`).
 
 ## Network activity
 

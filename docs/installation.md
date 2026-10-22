@@ -130,11 +130,16 @@ Readable old history remains in the predecessor's own store.
 
 ## Dashboard access
 
-The dashboard binds to loopback (`127.0.0.1:8765` by default). You can front it
-with a proxy of your choice; [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve)
-is one example. Configure the proxy and verify viewers' access yourself.
-Setup's optional Tailscale hostname only adds that one hostname to the allowed
-Host/Origin values; it does not configure Tailscale or a proxy. See the
+The dashboard binds to loopback (`127.0.0.1:8765` by default) and, by default,
+admits only loopback hosts. You can front it with a proxy of your choice and
+verify viewers' access yourself. List each exact `host` or `host:port` the
+browser will use in `allowed_hosts` (setup asks for them): a
+[Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve) name,
+a reverse-proxy virtual host, or an ssh tunnel's local `localhost:port`. Each
+entry is lower-case, without a scheme or path; both its `https://` and `http://`
+Origins are admitted. Setup does not configure the proxy. An older
+`tailscale_host` setting is read as a one-entry list and saved in the new form
+at the next setup. See the
 [architecture](architecture.md#permissions-private-data-and-dashboard-access).
 Keep the per-run application token requirement through the proxy; do not place
 credentials in logs, ordinary query strings or shared setup notes.

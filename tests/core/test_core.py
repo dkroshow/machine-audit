@@ -360,6 +360,24 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(next(r["unit"] for r in result["rows"] if r["total"] is not None),"seconds")
         finally:server.shutdown();server.server_close();thread.join()
 
+    def test_http_admits_only_loopback_and_configured_hosts_and_origins(self):
+        # Proxies send https Origins and tunnels http; anything else stays refused.
+        server=make_server(Query(self.store),"a"*32,port=0,allowed_hosts=["dash.example.org","localhost:9000"])
+        thread=threading.Thread(target=server.serve_forever);thread.start()
+        def get(host,origin=None):
+            headers={"Host":host,"Authorization":"Bearer "+"a"*32,**({"Origin":origin} if origin else {})}
+            try:
+                with urlopen(Request(f"http://127.0.0.1:{server.server_port}/api/catalog",headers=headers)) as response:return response.status
+            except HTTPError as error:
+                with error:return json.load(error)["error"]
+        try:
+            loopback=f"127.0.0.1:{server.server_port}"
+            for host,origin in ((loopback,None),("dash.example.org","https://dash.example.org"),("localhost:9000","http://localhost:9000")):
+                self.assertEqual(get(host,origin),200)
+            self.assertEqual(get("other.example.org"),"host_not_allowed")
+            self.assertEqual(get("dash.example.org","https://other.example.org"),"origin_not_allowed")
+        finally:server.shutdown();server.server_close();thread.join()
+
     def test_cpu_remainder_compares_matching_windows_and_keeps_memory_nonadditive(self):
         records=[];seq=0
         for t in (0,10):

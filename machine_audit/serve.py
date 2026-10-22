@@ -9,7 +9,7 @@ import threading
 from urllib.parse import parse_qs, unquote, urlsplit
 
 
-def make_server(query, token: str, port=8765, dashboard=None, tailscale_host=None):
+def make_server(query, token: str, port=8765, dashboard=None, allowed_hosts=()):
     if len(token)<32:
         raise ValueError("API token is too short")
     slots=threading.BoundedSemaphore(4)
@@ -41,8 +41,9 @@ def make_server(query, token: str, port=8765, dashboard=None, tailscale_host=Non
             port=self.server.server_port
             hosts={f"127.0.0.1:{port}",f"localhost:{port}"}
             origins={f"http://{h}" for h in hosts}
-            if tailscale_host:
-                hosts.add(tailscale_host);origins.add(f"https://{tailscale_host}")
+            # A reverse proxy serves https; an ssh tunnel stays plain http.
+            hosts.update(allowed_hosts)
+            origins.update(f"{scheme}://{h}" for h in allowed_hosts for scheme in ("http","https"))
             if len(self.headers.get_all("Host",[]))!=1 or self.headers["Host"] not in hosts:
                 return self._send(403,{"error":"host_not_allowed"})
             if len(self.headers.get_all("Origin",[]))>1 or self.headers.get("Origin") and self.headers["Origin"] not in origins:
