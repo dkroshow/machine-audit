@@ -84,8 +84,8 @@ retain driver window/weighting when summarizing rates. Client collapse loses
 context and regrouping, so it is a later pruning option, not an initial default.
 
 Validate driver fields, process access and collection cost on the initial devices.
-The supplied [AWS inventory](installation.md#initial-machines) lists a framebuffer
-display, with no GPU reported. The physical Ubuntu workstation's GPU and driver
+The Ubuntu cloud instance in the [initial machines](installation.md#initial-machines)
+has no GPU. The physical Ubuntu workstation's GPU and driver
 remain to be discovered by its implementing agent. Apple silicon awaits later validation. GPU profiling
 and kernel tracing are outside routine collection.
 Naming other users' GPU workloads requires an explicit privacy/access decision;

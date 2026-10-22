@@ -28,7 +28,7 @@ W-3235, 384 GiB RAM, 4 KiB pages, macOS 15.6.1 (24G90, kernel
 8 GB VRAM, PCIe). No Apple silicon Mac was probed.
 
 **Ubuntu sources (documentation only):** no Ubuntu source was probed for this
-note. The supplied AWS inventory and physical workstation target are recorded
+note. The Ubuntu cloud instance and physical workstation targets are listed
 in [installation](../installation.md#initial-machines); inventory is not source
 validation. The source claims below come from documentation and source code.
 Linux sources are pinned to v6.8 (Ubuntu 24.04's release kernel; 24.04.4 offers
