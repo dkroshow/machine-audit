@@ -13,7 +13,8 @@ The first Mac, nicknamed Big Mac, is in an installation trial. Native collection
 permissions, operating cost and folder accounting are still being validated;
 this is not yet a validated release.
 
-Linux is not implemented yet. It is being built with the first external user.
+Linux support is in progress with the first external user: collection and the
+filesystem map run from a checkout; the installer and service unit are next.
 
 Issues and pull requests are welcome.
 
