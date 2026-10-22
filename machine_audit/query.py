@@ -477,7 +477,7 @@ class Query:
 
     @staticmethod
     def _who_row(row):
-        return is_process_evidence(row["entity"],row["scope"]) and (row["entity"].startswith("program:") or not row["additive"] or row["component"]=="self")
+        return is_process_evidence(row["entity"],row["scope"]) and row["scope"]!="unit_detail" and (row["entity"].startswith("program:") or not row["additive"] or row["component"]=="self")
 
     @measured
     def coverage(self,start_ns,end_ns,component=None,limit=600):

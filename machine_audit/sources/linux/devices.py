@@ -39,24 +39,34 @@ def channels(directory, prefix):
 @dataclass(frozen=True)
 class Mount:
     device: str
+    root: str  # the directory of the filesystem this mount shows
     mount: str
     filesystem: str
 
 
+def unescape(text):
+    return re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), text)
+
+
+def within(path, base):
+    return path == base or path.startswith(base.rstrip('/') + '/')
+
+
 def mounts(root):
-    """Every mountinfo line: major:minor, unescaped mount point and filesystem type."""
+    """Every mountinfo line: major:minor, filesystem root, mount point and filesystem type."""
     for line in (root / 'proc/self/mountinfo').read_text().splitlines():
         left, _, right = line.partition(' - ')
         f = left.split()
-        yield Mount(f[2], re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), f[4]), right.split()[0])
+        yield Mount(f[2], unescape(f[3]), unescape(f[4]), right.split()[0])
 
 
 def volumes(root):
-    """Local disk filesystems, once per device; a bind mount repeats a device."""
-    seen = set()
-    for mount in mounts(root):
-        if mount.filesystem in FILESYSTEMS and mount.device not in seen:
-            seen.add(mount.device)
+    """Local disk filesystems. A mount showing part of a tree already listed (a bind mount)
+    is skipped; btrfs subvolumes share a device but show disjoint trees, so each is listed."""
+    seen = {}
+    for mount in sorted((m for m in mounts(root) if m.filesystem in FILESYSTEMS), key=lambda m: len(m.root)):
+        if not any(within(mount.root, other) for other in seen.get(mount.device, ())):
+            seen.setdefault(mount.device, []).append(mount.root)
             yield mount
 
 

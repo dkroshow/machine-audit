@@ -8,15 +8,18 @@ import tempfile
 import unittest
 
 from machine_audit.budget import Budget
+from machine_audit.collector import Collector
 from machine_audit.config import Config
 from machine_audit.derive import points
 from machine_audit.model import Clock, Field, Reading, Record
+from machine_audit.query import Query
 from machine_audit.sources.linux import sources
 from machine_audit.sources.linux.devices import Devices
 from machine_audit.sources.linux.host import LinuxHost
 from machine_audit.sources.linux.network import LinuxNetwork, TcpProber
 from machine_audit.sources.macos import ReadSource
 from machine_audit.sources.self_cost import ManagedProcesses, SelfCost
+from machine_audit.store import Store
 
 BUNDLE = Path(__file__).parent / 'linux' / 'synthetic.txt'
 SECTION = re.compile(r'^==> (/.+) <==\n', re.M)
@@ -58,7 +61,8 @@ class LinuxSourceTests(unittest.TestCase):
         memory = by_name(self.host.memory())
         self.assertEqual(memory['memory.MemTotal'].value, 8140988 * 1024)
         self.assertEqual(memory['memory.Active_anon'].value, 1205312 * 1024)
-        self.assertEqual((memory['memory.HugePages_Total'].unit, memory['memory.HugePages_Total'].value), ('count', 0))
+        self.assertNotIn('memory.SyntheticFutureKey', memory)  # meminfo keeps the documented subset
+        self.assertEqual(memory['memory.Zswap'].status, 'unavailable')  # a kept key this kernel lacks
         self.assertEqual(memory['memory.pgfault'].value, 902211)
         self.assertEqual((memory['memory.pgpgin'].unit, memory['memory.pgpgin'].value), ('bytes', 1048576 * 1024))
         self.assertEqual(memory['memory.zswpin'].status, 'unavailable')
@@ -131,6 +135,27 @@ class LinuxSourceTests(unittest.TestCase):
                   'cpu0 2352 171 305 1849600 1050 2 103 7 4 0')
         self.assertEqual(busy(first, list(self.host.cpu())), 10 + 1 + 5 + 2 + 3)
         self.assertEqual(busy(mac(100, 50, 900, 4), mac(110, 55, 1000, 5)), 10 + 5 + 1)
+
+    def test_who_ranks_unit_consumption_not_limits_coverage_or_pressure(self):
+        # First Linux run: `who --component cpu` ranked unit.cpu.weight and unit.processes first.
+        data = self.root / 'data'
+        data.mkdir()
+        store = Store(data / 'readings.sqlite', Budget(data, free_margin_bytes=0))
+        store.start_run('run', 'boot', 0)
+        collector = Collector(store, run_id='run', boot_id='boot')
+        start = Clock.now().wall_ns
+        collector.ingest(ReadSource('linux.workloads', 'cpu', 10, self.host.workloads).read())
+        collector.ingest(ReadSource('linux.unit_limits', 'memory', 60, self.host.unit_limits).read())
+        self.edit('sys/fs/cgroup/system.slice/ssh.service/cpu.stat', 'usage_usec 600000', 'usage_usec 900000')
+        collector.ingest(ReadSource('linux.workloads', 'cpu', 10, self.host.workloads).read())
+        try:
+            rows = Query(store, collector).who(start - 10**9, Clock.now().wall_ns + 10**9, component='cpu')['rows']
+        finally:
+            store.close()
+        signals = {r['signal'] for r in rows}
+        self.assertIn('unit.cpu.stat.usage_usec', signals)
+        self.assertFalse(signals & {'unit.cpu.weight', 'unit.cpu.max.quota', 'unit.processes', 'unit.cpu.pressure.some',
+                                    'unit.cpu.stat.nr_periods'})
 
     def test_unit_limit_max_means_no_limit_not_a_number(self):
         limits = list(self.host.unit_limits())

@@ -10,7 +10,7 @@ import time
 
 from machine_audit.budget import Budget, BudgetExceeded
 from machine_audit.config import Config
-from machine_audit.sources.linux.devices import mounts, volumes as local_filesystems
+from machine_audit.sources.linux.devices import mounts, volumes as local_filesystems, within
 from machine_audit.sources.linux.files import keyed, salted
 from machine_audit.sources.linux.host import Stat
 from machine_audit.sources.linux.watcher import take_dirty
@@ -28,7 +28,8 @@ NIGHTLY_NS = 20 * 3600 * 10**9
 
 
 def volumes(root, salt):
-    """One volume per local disk filesystem, identified as the capacity source identifies it."""
+    """(volume, its mountinfo line) per local disk filesystem, identified as the capacity
+    source identifies it."""
     seen = set()
     for mount in local_filesystems(root):
         path = under(root, mount.mount)
@@ -40,7 +41,7 @@ def volumes(root, salt):
         if identity not in seen:
             seen.add(identity)
             yield Volume(identity, os.path.basename(mount.mount) or 'Root', path, mount.filesystem, device,
-                         s.f_blocks * s.f_frsize, s.f_bfree * s.f_frsize, s.f_bavail * s.f_frsize, None)
+                         s.f_blocks * s.f_frsize, s.f_bfree * s.f_frsize, s.f_bavail * s.f_frsize, None), mount
 
 
 def run_scan(data_dir, *, full=False, grain='files', roots=None, exclusions=(), root='/'):
@@ -50,7 +51,7 @@ def run_scan(data_dir, *, full=False, grain='files', roots=None, exclusions=(), 
         os.nice(10)
         found = list(volumes(root, Config(data_dir=str(data)).identity_salt()))
         if roots:
-            found = [v for v in found if v.mount in roots]
+            found = [(v, m) for v, m in found if v.mount in roots]
             if len(found) != len(roots):
                 raise ValueError('only_discovered_volume_roots_are_allowed')
         everything = list(mounts(root))
@@ -62,7 +63,7 @@ def run_scan(data_dir, *, full=False, grain='files', roots=None, exclusions=(), 
         store.start('requested_full' if full else 'scheduled')
         processed, published, root_failed, results = 0, 0, False, []
         try:
-            for volume in found:
+            for volume, entry in found:
                 old = store.db.execute('SELECT * FROM volumes WHERE id=?', (volume.id,)).fetchone()
                 has_root = old and store.db.execute('SELECT 1 FROM nodes WHERE generation=? AND volume=? AND parent IS NULL LIMIT 1',
                                                     (old['generation'], old['key'])).fetchone()
@@ -76,11 +77,11 @@ def run_scan(data_dir, *, full=False, grain='files', roots=None, exclusions=(), 
                 if action == 'wait':
                     results.append({'volume_id': volume.id, 'status': 'current'})
                     continue
-                device = f'{os.major(volume.device)}:{os.minor(volume.device)}'
                 policy = Policy(full_disk_access=True, homes=homes,
                                 exclusions=tuple(exclusions) + tuple(under(root, e) for e in EXCLUDED),
                                 data_root=str(data), mounts=[under(root, m.mount) for m in everything
-                                                             if m.device == device and under(root, m.mount) != volume.mount])
+                                                             if m.device == entry.device and m.mount != entry.mount
+                                                             and within(m.root, entry.root)])
                 store.prepare(volume, full=action == 'full', lean=False)
                 blocks = Blocks()
                 walker = Walker(volume, policy, store, blocks, None, grain)
@@ -108,7 +109,7 @@ def run_scan(data_dir, *, full=False, grain='files', roots=None, exclusions=(), 
                 results.append({'volume_id': volume.id, 'status': 'observed', 'action': action,
                                 'entries': walker.entries, 'gaps': sorted(walker.gaps)})
             with store.write():
-                current = {v.id for v in found}
+                current = {v.id for v, _ in found}
                 for row in store.db.execute('SELECT id FROM volumes'):
                     if row[0] not in current:
                         store.db.execute('UPDATE volumes SET mounted=0 WHERE id=?', (row[0],))

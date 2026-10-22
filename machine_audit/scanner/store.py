@@ -77,19 +77,6 @@ STAGE_TABLES=('removed','reset_dirs','removed_charges')
 MAX_ANCESTRY=1024
 
 
-def ancestry_path(node,mount,identity):
-    """A folder's path from stored names; None when an ancestor's name is private."""
-    parts=[];seen=set()
-    for _ in range(MAX_ANCESTRY):
-        if identity in seen:raise ValueError('cyclic_directory_ancestry')
-        seen.add(identity);row=node(identity)
-        if row is None:raise ValueError('missing_directory_ancestor')
-        if row['parent'] is None:return os.path.join(mount,*reversed(parts))
-        if row['label'] is None:return None
-        parts.append(row['label']);identity=row['parent']
-    raise ValueError('directory_ancestry_limit')
-
-
 class MapStore:
     def __init__(self,path,budget=None):
         self.path=Path(path)
@@ -253,7 +240,15 @@ class MapStore:
         return self._rows('nodes','id=?',(identity,)).fetchone()
 
     def path_for(self,identity):
-        return ancestry_path(self._node,self.mount,identity)
+        parts=[];seen=set()
+        for _ in range(MAX_ANCESTRY):
+            if identity in seen:raise ValueError('cyclic_directory_ancestry')
+            seen.add(identity);node=self._node(identity)
+            if node is None:raise ValueError('missing_directory_ancestor')
+            if node['parent'] is None:return os.path.join(self.mount,*reversed(parts))
+            if node['label'] is None:return None
+            parts.append(node['label']);identity=node['parent']
+        raise ValueError('directory_ancestry_limit')
 
     def known_directory(self,identity):
         self.flush();node=self._node(inode_key(identity))
@@ -571,38 +566,43 @@ def _encode_cursor(value):
     return base64.urlsafe_b64encode(json.dumps(value,separators=(',',':')).encode()).decode()
 
 
+HOT_SET=f'''
+WITH hot(volume_id,vkey,generation,mount,id,size) AS (
+  SELECT v.id,v.key,v.generation,v.mount,n.id,n.listed FROM volumes v
+  JOIN nodes n ON n.generation=v.generation AND n.volume=v.key
+  WHERE v.mounted=1 AND n.kind='directory' AND n.listed>=1000000000
+  UNION ALL
+  SELECT v.id,v.key,v.generation,v.mount,f.parent,f.allocated FROM volumes v
+  JOIN files f ON f.generation=v.generation AND f.volume=v.key
+  WHERE v.mounted=1 AND f.allocated>=100000000),
+top AS (SELECT volume_id,vkey,generation,mount,id,max(size) AS size FROM hot
+  GROUP BY vkey,id ORDER BY size DESC LIMIT ?),
+chain(volume_id,generation,vkey,mount,size,start,start_parent,node,rel,depth) AS (
+  SELECT t.volume_id,t.generation,t.vkey,t.mount,t.size,t.id,n.parent,n.parent,
+         CASE WHEN n.parent IS NULL THEN '' ELSE '/'||n.label END,0
+  FROM top t JOIN nodes n ON n.generation=t.generation AND n.volume=t.vkey AND n.id=t.id
+  UNION ALL
+  SELECT c.volume_id,c.generation,c.vkey,c.mount,c.size,c.start,c.start_parent,n.parent,
+         CASE WHEN n.parent IS NULL THEN c.rel ELSE '/'||n.label||c.rel END,c.depth+1
+  FROM chain c JOIN nodes n ON n.generation=c.generation AND n.volume=c.vkey AND n.id=c.node
+  WHERE c.rel IS NOT NULL AND c.depth<{MAX_ANCESTRY})
+SELECT volume_id,start,start_parent,mount,rel FROM chain WHERE node IS NULL AND rel IS NOT NULL ORDER BY size DESC
+'''
+
+
 def hot_set(path,limit):
     """Published folders to watch between full walks, largest first: folders of 1 GB or more and
     folders directly holding a file of 100 MB or more. Returns (volume id, folder id, parent id,
-    path) rows; a folder under a private name has no path and is left out."""
+    path) rows; a folder under a private name has no path and is left out. One statement, so
+    the read holds its WAL snapshot only while it runs."""
     db=sqlite3.connect(Path(path).as_uri()+'?mode=ro',uri=True,timeout=2)
-    db.row_factory=sqlite3.Row
     try:
         if db.execute('PRAGMA user_version').fetchone()[0]!=2:
             raise ValueError('scanner_format_requires_fresh_store')
-        db.execute('BEGIN')
-        found=[]
-        for volume in db.execute('SELECT * FROM volumes WHERE generation IS NOT NULL AND mounted=1').fetchall():
-            where=(volume['generation'],volume['key'])
-            sizes=dict(db.execute("SELECT id,listed FROM nodes WHERE generation=? AND volume=? AND kind='directory' AND listed>=1000000000",where))
-            for parent,size in db.execute('SELECT parent,max(allocated) FROM files WHERE generation=? AND volume=? AND allocated>=100000000 GROUP BY parent',where):
-                sizes.setdefault(parent,size)
-            rows={}
-            def node(key):
-                if key not in rows:
-                    rows[key]=db.execute('SELECT parent,label FROM nodes WHERE generation=? AND volume=? AND id=?',(*where,key)).fetchone()
-                return rows[key]
-            for key,size in sizes.items():
-                try:
-                    folder=ancestry_path(node,volume['mount'],key)
-                except ValueError:
-                    continue  # damaged ancestry: the next full walk rebuilds it
-                if folder is not None:
-                    found.append((size,volume['id'],source_id(key),source_id(node(key)['parent']),folder))
-        found.sort(key=lambda row:row[0],reverse=True)
-        return [row[1:] for row in found[:limit]]
+        rows=db.execute(HOT_SET,(limit,)).fetchall()
     finally:
         db.close()
+    return [(volume,source_id(folder),source_id(parent),os.path.normpath(mount+rel)) for volume,folder,parent,mount,rel in rows]
 
 
 class MapQuery:

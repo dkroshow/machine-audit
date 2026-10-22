@@ -35,14 +35,17 @@ class LinuxScannerTests(unittest.TestCase):
         device = os.stat(self.root).st_dev
         same = f'{os.major(device)}:{os.minor(device)}'
         files = {
-            # /bound mounts part of the root filesystem a second time.
-            'proc/self/mountinfo': f'22 1 {same} / / rw,relatime shared:1 - ext4 /dev/sda2 rw\n'
-                                   f'27 22 {same} /srv /bound rw,relatime shared:1 - ext4 /dev/sda2 rw\n'
+            # Ubuntu's btrfs layout: subvolumes @ and @home share one device but show disjoint
+            # trees; /bound shows part of @ a second time.
+            'proc/self/mountinfo': f'22 1 {same} /@ / rw,relatime shared:1 - btrfs /dev/sda2 rw\n'
+                                   f'23 22 {same} /@home /home rw,relatime shared:2 - btrfs /dev/sda2 rw\n'
+                                   f'27 22 {same} /@/srv /bound rw,relatime shared:1 - btrfs /dev/sda2 rw\n'
                                    '25 22 0:21 / /proc rw,nosuid shared:4 - proc proc rw\n',
             'proc/self/stat': '4242 (python3) S 1 4242 4242 0 -1 4194560 1200 0 3 0 50 10 0 0 20 0 1 0 5000 '
                               + ' '.join(['0'] * 30) + '\n',
             'proc/self/io': 'rchar: 1\nwchar: 2\nsyscr: 3\nsyscw: 4\nread_bytes: 0\nwrite_bytes: 8192\ncancelled_write_bytes: 0\n',
             'a/file': 'x' * 8192, 'srv/kept': 'k' * 4096, 'bound/kept': 'k' * 4096, 'tmp/scratch': 's' * 4096,
+            'home/kept': 'h' * 4096,
         }
         for name, text in files.items():
             (self.root / name).parent.mkdir(parents=True, exist_ok=True)
@@ -55,7 +58,7 @@ class LinuxScannerTests(unittest.TestCase):
         with patch('machine_audit.scanner.linux.os.nice'):
             return run_scan(self.data, root=str(self.root))
 
-    def test_nightly_walk_skips_system_areas_and_a_second_mount_of_the_same_filesystem(self):
+    def test_nightly_walk_skips_system_areas_and_bind_mounts_but_not_btrfs_subvolumes(self):
         result = self.scan()
         self.assertEqual(result['status'], 'observed')
         volume = result['volumes'][0]['volume_id']
@@ -63,7 +66,7 @@ class LinuxScannerTests(unittest.TestCase):
         rows = MapQuery(self.data / 'scanner.sqlite').query('children', volume_id=volume)['rows']
         named = {r['label']: r for r in rows}
         self.assertEqual((named['bound']['status'], named['bound']['listed']), ('bind_mount', 0))
-        self.assertEqual(named['srv']['status'], 'observed')
+        self.assertEqual((named['srv']['status'], named['home']['status']), ('observed', 'observed'))  # @home is not a bind mount
         # /proc and /tmp are excluded by default and, like configured exclusions, stay unnamed.
         self.assertEqual([(r['label'], r['listed']) for r in rows if r['status'] == 'excluded'], [(None, 0), (None, 0)])
         self.assertEqual(self.scan()['volumes'][0]['status'], 'current')  # the same night, nothing changed

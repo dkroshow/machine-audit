@@ -42,8 +42,10 @@ One 10 s pass, `linux.workloads`, reads units and their processes together.
 - A unit is the first non-slice cgroup below the slices: one non-overlapping
   level. Host minus units is the remainder (root cgroup, kernel work).
 - Entity: `cgroup:` + HMAC(salt, path)[:16] + `:` + directory inode, so a
-  restarted unit starts a new counter baseline. Scope `unit` ranks units in
-  `who` like programs, never as host series.
+  restarted unit starts a new counter baseline. Units are never host series.
+  Only consumption (CPU time, `memory.current`, `io.stat`) has scope `unit`
+  and ranks in `who`; limits, breakdowns, pressure and process counts have
+  scope `unit_detail`.
 - Label: the leaf name; a templated unit uses its template name
   (`getty@tty1.service` → `getty.service`), because instances can carry
   private names. Mount, automount and swap units are labelled `mount`,
@@ -67,7 +69,8 @@ One 10 s pass, `linux.workloads`, reads units and their processes together.
 
 Host CPU busy time is user+nice+system+irq+softirq per `cpu-view.md`; iowait,
 steal and guest (already inside user) are kept but not added. `/proc/meminfo`
-`kB` values are stored as bytes (exact ×1024). PSI totals are microsecond
+keeps 22 keys (capacity, availability, page classes, swap, compression, dirty
+data, commitment), stored as bytes (exact ×1024). PSI totals are microsecond
 counters whose rate reads as percent of time stalled. A unit limit of `max`
 is `not_enabled` (no limit), never a number.
 
@@ -82,9 +85,11 @@ measure growth on the target before trimming anything.
   skipped. Sectors are 512 bytes; busy time reads as percent busy. Unit
   `io.stat` sums physical disks only, because a request through LVM is also
   counted on its dm device.
-- Volumes: local disk filesystems from mountinfo, once per device, entity
-  `volume:` + HMAC(salt, statvfs `f_fsid`)[:16]; `f_fsid` derives from the
-  filesystem UUID on ext4.
+- Volumes: local disk filesystems from mountinfo, entity `volume:` +
+  HMAC(salt, statvfs `f_fsid`)[:16]; `f_fsid` derives from the filesystem
+  UUID on ext4. A mount showing part of a tree already listed is a bind
+  mount and is skipped; btrfs subvolumes (`@`, `@home`) share a device but
+  show disjoint trees, so each is a volume reporting the shared pool.
 - Interfaces: entity `interface:<ifindex>`; loopback is skipped. A down link
   is `network.link_state` = `down`, not a failure. `network.physical` marks
   interfaces with a device; bridges, veth and tunnels repeat that traffic.
@@ -99,8 +104,10 @@ measure growth on the target before trimming anything.
   configurable if the first user asks.
 - Sensors: entity is a salted hash of the hwmon device path and channel;
   label is chip plus channel label (`k10temp Tctl`, `nvme Composite`).
-  Temperatures are millidegrees, stored as °C; power is microwatts, stored
-  as watts, as on the Mac.
+  Temperatures are millidegrees, stored as °C; driver sentinels for "no
+  reading" (at or below -273 °C, or 1000 °C and above, such as -273150 and
+  65261850) are unavailable. Power is microwatts, stored as watts, as on
+  the Mac.
 - GPU: amdgpu cards only, read by default because sysfs reads reset no
   counters (the Mac gates its GPU for that reason). Entity: a salted hash of
   the PCI slot. A card whose
@@ -115,9 +122,9 @@ measure growth on the target before trimming anything.
   blocks, so folders report listed bytes and no physical residual.
 - Never entered: `/proc`, `/sys`, `/dev`, `/run`, `/tmp` (counted as
   `excluded`, unnamed like configured exclusions), other users' homes
-  (`other_account`), the data directory (`own_store`), and a second mount
-  of the walked filesystem (`bind_mount`), which would count its contents
-  twice.
+  (`other_account`), the data directory (`own_store`), and a bind mount of
+  the walked filesystem (`bind_mount`: same device, and its mountinfo root
+  inside the walked root), which would count its contents twice.
 - Schedule: a full walk when there is no map, when a run requests one 20 h
   or more after the last (the nightly timer), or after 40 h. Otherwise a run
   re-lists the folders in the dirty file, with the Mac's re-list step
@@ -129,7 +136,10 @@ measure growth on the target before trimming anything.
   into `scanner-dirty.json` (0600, volume and inode numbers only) in one
   short budgeted write. The scanner claims the file by renaming it.
   `self.watched_folders`, `self.watch_dirtied` and `self.watch_overflows`
-  show its work.
+  show its work. The hot set is one SQL statement, so its read holds the
+  WAL snapshot only while it runs. To measure: that statement's time on Big
+  Mac's full map; above a second, the scanner's writes after publication
+  can wait on it.
 - Grain: setup should choose `folders` on Linux (storage-view.md); that is
   slice 4.
 

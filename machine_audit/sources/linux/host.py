@@ -15,6 +15,11 @@ from .devices import physical_disks
 from .files import keyed, kib, optional, pressure, psi
 
 CPU_STATES = ('user', 'nice', 'system', 'idle', 'iowait', 'irq', 'softirq', 'steal', 'guest', 'guest_nice')
+# Capacity, availability, page classes, swap, compression, dirty data and commitment
+# (memory-view.md), all in KiB. The rest of meminfo cost about 33 fields a second.
+MEMINFO = ('MemTotal', 'MemFree', 'MemAvailable', 'Buffers', 'Cached', 'SwapCached', 'Active(anon)',
+           'Inactive(anon)', 'Active(file)', 'Inactive(file)', 'Unevictable', 'Mlocked', 'SwapTotal', 'SwapFree',
+           'Zswap', 'Zswapped', 'Dirty', 'Writeback', 'Shmem', 'SReclaimable', 'SUnreclaim', 'Committed_AS')
 # Movement and limit counters named in memory-view.md. pgpgin/pgpgout are KiB.
 VMSTAT = {'pgpgin': 'bytes', 'pgpgout': 'bytes', 'pswpin': 'pages', 'pswpout': 'pages'}
 VMSTAT.update((k, 'count') for k in (
@@ -101,11 +106,8 @@ class LinuxHost:
 
     def memory(self):
         meminfo = keyed(self.text('proc/meminfo'), ':')
-        for key, value in meminfo.items():
-            name = 'memory.' + re.sub(r'[^A-Za-z0-9_]', '_', key).strip('_')
-            # Unsuffixed meminfo values are huge-page counts.
-            sized = value[1:] == ['kB']
-            yield field(name, kib(meminfo, key) if sized else int(value[0]), 'bytes' if sized else 'count')
+        for key in MEMINFO:
+            yield field('memory.' + re.sub(r'[^A-Za-z0-9_]', '_', key).strip('_'), kib(meminfo, key), 'bytes')
         vmstat = keyed(self.text('proc/vmstat'))
         for key, unit in VMSTAT.items():
             value = vmstat.get(key)
@@ -123,25 +125,29 @@ class LinuxHost:
             yield Path(directory), dict(entity=entity, label=self.label(cgroups.leaf_name(rel)), scope='unit')
 
     def unit_fields(self, directory, kw, disks):
+        # Only consumption (CPU time, memory.current, io.stat) ranks units in `who`; the rest
+        # is detail about a unit, kept out of host series and out of ranking.
+        detail = dict(kw, scope='unit_detail')
         stat = keyed(optional(directory / 'cpu.stat') or '')
         for key, unit in cgroups.CPU_STAT.items():
             if key in stat:
-                rate = dict(scale=1e-6, rate_unit='CPUs') if key in ('usage_usec', 'user_usec', 'system_usec') else {}
-                yield field('unit.cpu.stat.' + key, int(stat[key][0]), unit, 'counter', additive=True, **rate, **kw)
+                used = key in ('usage_usec', 'user_usec', 'system_usec')
+                rate = dict(scale=1e-6, rate_unit='CPUs') if used else {}
+                yield field('unit.cpu.stat.' + key, int(stat[key][0]), unit, 'counter', additive=True, **rate, **(kw if used else detail))
         for name in ('memory.current', 'memory.swap.current'):
             text = optional(directory / name)
             if text is not None:
-                yield field('unit.' + name, int(text), 'bytes', component='memory', **kw)
+                yield field('unit.' + name, int(text), 'bytes', component='memory', **(kw if name == 'memory.current' else detail))
         stat = keyed(optional(directory / 'memory.stat') or '')
         for key, unit in cgroups.MEMORY_STAT.items():
             if key in stat:
                 yield field('unit.memory.stat.' + key, int(stat[key][0]), unit, 'gauge' if unit == 'bytes' else 'counter',
-                            additive=unit == 'count', component='memory', **kw)
+                            additive=unit == 'count', component='memory', **detail)
         events = keyed(optional(directory / 'memory.events') or '')
         for key in cgroups.MEMORY_EVENTS:
             if key in events:
                 yield field('unit.memory.events.' + key, int(events[key][0]), 'count', 'counter', additive=True,
-                            component='memory', **kw)
+                            component='memory', **detail)
         io = optional(directory / 'io.stat')
         if io is not None:
             # Physical disks only: a request through LVM is also counted on its dm device.
@@ -160,11 +166,12 @@ class LinuxHost:
             for kind in ('some', 'full'):
                 if kind in totals:
                     yield field(f'unit.{resource}.pressure.{kind}', totals[kind], 'us', 'counter', scale=1e-4,
-                                rate_unit='percent', component=component, **kw)
+                                rate_unit='percent', component=component, **detail)
 
     def unit_limits(self):
         """Limits in force; 'max' (no limit) is not_enabled, never a number."""
-        for directory, kw in self.each_unit():
+        for directory, unit_kw in self.each_unit():
+            kw = dict(unit_kw, scope='unit_detail')
             for name in ('memory.max', 'memory.high', 'memory.low', 'memory.min', 'memory.swap.max', 'cpu.max', 'cpu.weight'):
                 text = optional(directory / name)
                 if text is None:
@@ -225,8 +232,9 @@ class LinuxHost:
             chosen.update((p.pid, p) for p in sorted(procs, reverse=True, key=lambda p: p.resident_pages)[:TOP_RESIDENT])
             chosen.update((p.pid, p) for p in procs if (p.pid, str(p.start)) in roles)
             sampled = [self.process_fields(p) for p in chosen.values()]
-            unit.append(field('unit.processes', len(listed), 'count', **kw))
-            unit.append(field('unit.processes_sampled', sum(1 for s in sampled if s), 'count', **kw))
+            coverage = dict(kw, scope='unit_detail')
+            unit.append(field('unit.processes', len(listed), 'count', **coverage))
+            unit.append(field('unit.processes_sampled', sum(1 for s in sampled if s), 'count', **coverage))
             ended = Clock.now()
             fields.extend(replace(f, start=observed, end=ended) for f in unit)
             fields.extend(f for s in sampled for f in s)
