@@ -386,10 +386,11 @@ time does not fail the update: its subtree is dropped and its parent re-listed
 shallowly, which records the removal or replacement; a parent gone too is
 recorded by its own ancestor's listing, and only an unlistable parent fails the
 volume (gap `parent_unlistable`, or `parent_unresolved` when no mapped ancestor
-can be found). A changed directory that still exists but cannot be read keeps its last
-map, adds the `directory_unreadable` gap and is deferred an hour; it is never
-cleared first, since anything staged beneath a cleared, unwalked directory
-would have no ancestor. Access checks still run first;
+can be found). A changed directory that still exists but cannot be opened (the
+walker names why: `denied` or `directory_unreadable`) keeps its last map and is
+deferred an hour; it is opened before anything is cleared, since a walk lists
+nothing when its open is denied and anything staged beneath a cleared, unwalked
+directory would have no ancestor. Access checks still run first;
 published map times, points and hierarchy change only on successful publication.
 Each run row also keeps `runs.volumes`: the per-volume outcome codes of that
 run (volume id, status, action, trigger, entries, gap codes, reason), since the

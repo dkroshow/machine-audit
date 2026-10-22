@@ -92,14 +92,16 @@ def relist(store,walker,policy,volume,now,changes):
         chosen.append(path)
         previous=roots_to_update[path]
         recursive=path in recursive_roots
-        try:
-            present=stat.S_ISDIR(os.stat(path,follow_symlinks=False).st_mode)
-        except OSError as exc:
-            if exc.errno not in (errno.ENOENT,errno.ENOTDIR):
-                # Still there but unreadable: its last map stands and it is retried
-                # next hour. Clearing it first would orphan anything staged beneath.
-                walker.gaps.add('directory_unreadable');store.defer(previous['id'],now+3600*10**9);continue
-            present=False
+        # Open it before anything is cleared: a walk lists nothing when the open is
+        # denied, and a cleared, unwalked directory orphans whatever is staged beneath.
+        if walker.directory_identity(path) is None:
+            try:present=stat.S_ISDIR(os.stat(path,follow_symlinks=False).st_mode)
+            except OSError as exc:present=exc.errno not in (errno.ENOENT,errno.ENOTDIR)
+            if present:
+                # Still there but not listable (the walker named why): its last map
+                # stands and it is retried next hour.
+                store.defer(previous['id'],now+3600*10**9);continue
+        else:present=True
         if not present:
             # Gone, or no longer a directory: drop its subtree; its parent's listing
             # records the removal or replacement. A parent gone too is recorded by
