@@ -1,7 +1,9 @@
-"""The kernel's text formats, shared by the Linux sources."""
+"""Shared by the Linux sources and scanner: the kernel's text formats and salted identities."""
 from __future__ import annotations
 
 import errno
+import hashlib
+import hmac
 
 from ..macos import error_status, field
 
@@ -45,3 +47,8 @@ def psi(path, name, **kw):
     for kind in ('some', 'full'):
         # The rate of a microsecond stall counter reads as percent of time stalled.
         yield field(f'{name}.pressure.{kind}', totals.get(kind), 'us', 'counter', scale=1e-4, rate_unit='percent', **kw)
+
+
+def salted(salt, text):
+    """A stable identity that reveals nothing about the path or id it came from."""
+    return hmac.new(salt, text.encode(), hashlib.sha256).hexdigest()[:16]

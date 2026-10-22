@@ -67,7 +67,8 @@ only after the receiving party has read this page.
    names in any field.
 5. The scanner store is the only home for names; nothing from it enters
    readings, exports or feedback. Linux default exclusions: `/proc`, `/sys`,
-   `/dev`, `/run` and other users' homes.
+   `/dev`, `/run`, `/tmp` and other users' homes. The Linux watcher's dirty
+   file holds volume and inode numbers only.
 6. Tests and fixtures use synthetic names and paths only.
 
 Regression tests for the unit, reason and salt rules live in

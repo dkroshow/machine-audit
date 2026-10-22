@@ -5,6 +5,7 @@ import fcntl
 import os
 from pathlib import Path
 import sqlite3
+import sys
 import time
 
 from machine_audit.budget import Budget, BudgetExceeded
@@ -28,9 +29,63 @@ def scan_lock(root):
         os.close(fd)
 
 
+def relist(store,walker,policy,volume,now,changes):
+    """Re-list changed folders, given as (absolute path, recursive), plus deferred ones now due."""
+    roots_to_update={}
+    recursive_roots=set()
+    for due in store.db.execute('SELECT id FROM dirty WHERE volume=? AND due_ns<=?',(volume.id,now)):
+        saved=store.known_directory(due[0])
+        if saved and saved['path']:
+            roots_to_update[saved['path']]=saved
+            recursive_roots.add(saved['path'])
+    for path,recursive in changes:
+        if os.path.commonpath([path,volume.mount])!=volume.mount:
+            continue
+        # Changes inside excluded folders or this store must not re-walk their parent.
+        if policy.decide(shown_path(volume,path)).reason in ('excluded','own_store'):
+            continue
+        # Private descendants have no stored names. Revisit the nearest
+        # visible parent, keeping their names out of the persistent map.
+        event_target=path
+        found=None
+        while path.startswith(volume.mount):
+            found=store.find_path(path)
+            if found:
+                break
+            if path==volume.mount:
+                break
+            path=os.path.dirname(path)
+        if found:
+            # A >20k-entry directory is visited at most daily.
+            listing=store.listing(found['id'])
+            if listing and listing['count']>20_000 and now-listing['listed_ns']<86400*10**9:
+                store.defer(found['id'],listing['listed_ns']+86400*10**9)
+                walker.gaps.add('large_directory_deferred')
+                continue
+            roots_to_update[path]=found
+            if recursive or path!=event_target:recursive_roots.add(path)
+    # The deepest event under an already selected ancestor needs no second walk.
+    paths=sorted(roots_to_update,key=len)
+    chosen=[]
+    for path in paths:
+        if any(path==p or (p in recursive_roots and path.startswith(p+'/')) for p in chosen):
+            continue
+        chosen.append(path)
+        previous=roots_to_update[path]
+        recursive=path in recursive_roots
+        if recursive:store.clear_subtree(previous['id'])
+        walker.walk(path,previous['parent'],previous['kind']=='private',recursive=recursive)
+        if previous['id'] in walker.listed:
+            with store.write():store.db.execute('DELETE FROM dirty WHERE volume=? AND id=?',(volume.id,previous['id']))
+
+
 def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roots=None, access=None, exclusions=()):
     if grain not in ('files','folders'):
         raise ValueError('invalid_scanner_grain')
+    if sys.platform != 'darwin':
+        # Linux has no privacy-prompt boundary, so protected-area access does not apply.
+        from .linux import run_scan as linux
+        return linux(data_dir,full=full,grain=grain,roots=roots,exclusions=exclusions)
     from .permissions import same_process_grant
     full_disk_access=bool(full_disk_access and same_process_grant(access))
     root=Path(data_dir)
@@ -44,7 +99,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
         events=FSEvents(IOKit())
         policy=Policy(full_disk_access=full_disk_access,exclusions=exclusions,data_root=str(root))
         store=MapStore(root/'scanner.sqlite',budget)
-        store.native=native
+        store.written_bytes=lambda:native.process(os.getpid()).diskio_byteswritten
         store.process_start=str(native.process(os.getpid()).proc_start_abstime)
         store.start('requested_full' if full else 'scheduled')
         processed=0
@@ -107,53 +162,9 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                                         'entries':walker.entries,'gaps':sorted(walker.gaps)})
                         continue
                 else:
-                    roots_to_update={}
-                    recursive_roots=set()
-                    for due in store.db.execute('SELECT id FROM dirty WHERE volume=? AND due_ns<=?',(volume.id,now)):
-                        saved=store.known_directory(due[0])
-                        if saved and saved['path']:
-                            roots_to_update[saved['path']]=saved
-                            recursive_roots.add(saved['path'])
-                    for relative,recursive in replay.paths.items():
-                        path=os.path.normpath(os.path.join(volume.mount,relative.lstrip('/')))
-                        if os.path.commonpath([path,volume.mount])!=volume.mount:
-                            continue
-                        # Changes inside excluded folders or this store must not re-walk their parent.
-                        if policy.decide(shown_path(volume,path)).reason in ('excluded','own_store'):
-                            continue
-                        # Private descendants have no stored names. Revisit the nearest
-                        # visible parent, keeping their names out of the persistent map.
-                        event_target=path
-                        found=None
-                        while path.startswith(volume.mount):
-                            found=store.find_path(path)
-                            if found:
-                                break
-                            if path==volume.mount:
-                                break
-                            path=os.path.dirname(path)
-                        if found:
-                            # A >20k-entry directory is visited at most daily.
-                            listing=store.listing(found['id'])
-                            if listing and listing['count']>20_000 and now-listing['listed_ns']<86400*10**9:
-                                store.defer(found['id'],listing['listed_ns']+86400*10**9)
-                                walker.gaps.add('large_directory_deferred')
-                                continue
-                            roots_to_update[path]=found
-                            if recursive or path!=event_target:recursive_roots.add(path)
-                    # The deepest event under an already selected ancestor needs no second walk.
-                    paths=sorted(roots_to_update,key=len)
-                    chosen=[]
-                    for path in paths:
-                        if any(path==p or (p in recursive_roots and path.startswith(p+'/')) for p in chosen):
-                            continue
-                        chosen.append(path)
-                        previous=roots_to_update[path]
-                        recursive=path in recursive_roots
-                        if recursive:store.clear_subtree(previous['id'])
-                        walker.walk(path,previous['parent'],previous['kind']=='private',recursive=recursive)
-                        if previous['id'] in walker.listed:
-                            with store.write():store.db.execute('DELETE FROM dirty WHERE volume=? AND id=?',(volume.id,previous['id']))
+                    relist(store,walker,policy,volume,now,
+                           ((os.path.normpath(os.path.join(volume.mount,relative.lstrip('/'))),recursive)
+                            for relative,recursive in replay.paths.items()))
                 store.finish_volume(volume,blocks,walker.gaps,full=action=='full',lean=not full_disk_access,
                     bookmark=bookmark,event_uuid=event_uuid,complete=walker.sharing_complete and not (replay and replay.interrupted))
                 published+=1
