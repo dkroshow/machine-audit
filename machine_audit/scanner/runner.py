@@ -89,9 +89,7 @@ def relist(store,walker,policy,volume,now,changes):
         previous=roots_to_update[path]
         recursive=path in recursive_roots
         if recursive:store.clear_subtree(previous['id'])
-        if walker.walk(path,previous['parent'],previous['kind']=='private',recursive=recursive):
-            with store.write(rows=1):store.db.execute('DELETE FROM dirty WHERE volume=? AND id=?',(volume.id,previous['id']))
-        else:complete=False
+        if not walker.walk(path,previous['parent'],previous['kind']=='private',recursive=recursive):complete=False
     return complete
 
 

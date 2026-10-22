@@ -368,3 +368,8 @@ verify diagnostic-column migration, saved action/trigger/stage on failure,
 specific invariant codes, and the fact that a partial-stream gap does not
 force an hourly full. These tests cannot identify an old live exception or
 event flag whose diagnostic evidence was never recorded.
+
+Deferred folder refreshes leave `dirty` only when the matching staged listing
+publishes. Admission failure or transaction rollback keeps the refresh pending;
+unobserved folders are not cleared. Cleanup joins each dirty identity to the
+listing primary key and counts the deletions in the publication reservation.

@@ -87,6 +87,24 @@ class RelistTests(unittest.TestCase):
         self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=False,lean=True)
         self.assertEqual([r[0] for r in self.store.db.execute('SELECT label FROM files WHERE generation=?',(self.store.generation,))],['kept'])
 
+    def test_failed_publication_keeps_dirty_refresh_until_successful_retry(self):
+        (self.tree/'kept').write_bytes(b'kept')
+        self.baseline()
+        identity=str(self.tree.stat().st_ino)
+        self.store.defer(identity,0)
+        self.store.defer('not-observed',0)
+        walker=self.update(self.tree)
+        def pending():
+            return self.store.db.execute('SELECT id FROM dirty WHERE volume=? AND id=?',(self.volume.id,identity)).fetchall()
+        self.assertEqual([r[0] for r in pending()],[identity], 'a relist is not a published refresh')
+        with patch('machine_audit.scanner.store.save_hierarchy',side_effect=RuntimeError('synthetic publication failure')):
+            with self.assertRaisesRegex(RuntimeError,'synthetic publication failure'):
+                self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=False,lean=True)
+        self.assertEqual([r[0] for r in pending()],[identity], 'rollback lost the deferred refresh')
+        self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=False,lean=True)
+        self.assertEqual(pending(),[])
+        self.assertEqual(self.store.db.execute('SELECT id FROM dirty').fetchone()[0],'not-observed')
+
     def test_shallow_parent_keeps_private_child_without_copying_its_subtree(self):
         private=self.tree/'browser';(private/'inner').mkdir(parents=True)
         (private/'Local State').write_bytes(b'private marker')

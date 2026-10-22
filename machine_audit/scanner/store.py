@@ -542,10 +542,15 @@ class MapStore:
     def _publication_changes(self):
         """SQL and counted work for the one atomic switch of changed rows."""
         plan=[]
-        if self.base_gen is None:return plan
         def remove(table,where,args):
             count,payload=self._row_size(table,where,args)
             plan.append((f'DELETE FROM {table} WHERE {where}',args,count,payload))
+        # Only a committed listing fulfills a deferred refresh. Probe its
+        # primary key from the small dirty set, never scan the complete map.
+        remove('dirty','''volume=? AND EXISTS(SELECT 1 FROM listings l
+            WHERE l.generation=? AND l.volume=? AND l.id=inode_key(dirty.id))''',
+            (self.volume,self.generation,self.vid))
+        if self.base_gen is None:return plan
         for table,key in (('files','parent'),('holders','dir')):
             remove(table,f'''generation=? AND volume=? AND {key} IN
                 (SELECT id FROM reset_dirs WHERE generation=? AND volume=? UNION SELECT id FROM removed WHERE generation=? AND volume=?)''',
