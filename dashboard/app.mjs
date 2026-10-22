@@ -16,7 +16,24 @@ const sections={
 function route() { const key=location.hash.slice(1).split('/')[0];return Object.hasOwn(views,key) ? key : 'overview'; }
 function interval() {const end=Date.now()/1000;return state.range ?? {start:end-state.span,end};}
 function bounds() {return {...interval(),limit:600};}
-function setBusy(busy){$('refresh').disabled=busy;$('view').setAttribute('aria-busy',String(busy));}
+let busyTimer;
+function setBusy(busy) {
+  clearTimeout(busyTimer);busyTimer=null;
+  $('refresh').disabled=busy;
+  $('view').setAttribute('aria-busy',String(busy));
+  $('view').classList.remove('loading');
+  $('loading').hidden=true;
+  if(!busy)return;
+  const started=performance.now(),title=views[state.view].title;
+  const update=()=>{
+    const seconds=Math.floor((performance.now()-started)/1000);
+    $('loading-text').textContent=`${seconds>=15 ? 'Still running:':'Loading'} ${title}… ${seconds} s`;
+  };
+  busyTimer=setTimeout(()=>{
+    update();$('loading').hidden=false;$('view').classList.add('loading');
+    busyTimer=setInterval(update,1000);
+  },300);
+}
 function message(id,text){$(id).textContent=text??'';$(id).hidden=!text;}
 function contentGroups(answer,component,onAround) {
   const remaining=seriesGroups(answer.rows ?? []).filter(g=>component==='self' ? !g.entity?.startsWith('program:') : !g.entity?.startsWith('process:'));

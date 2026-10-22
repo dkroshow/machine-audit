@@ -53,7 +53,7 @@ test('all dashboard views render real stored replay without leaked tokens or fak
   let startupError='';preview.stderr.on('data',chunk=>{startupError+=chunk;});
   t.after(()=>stop(preview));
   const connection=await until(()=>{try{return JSON.parse(readFileSync(ready,'utf8'));}catch{return null;}},Boolean,`Preview did not start: ${startupError}`);
-  const {send,run,errors}=await browser(t,directory);
+  const {send,run,errors,on}=await browser(t,directory);
   t.after(()=>rmSync(directory,{recursive:true,force:true}));
   const settled=()=>until(()=>run("document.querySelector('#view').getAttribute('aria-busy')"),value=>value==='false','Page did not finish its query');
   await send('Page.navigate',{url:connection.origin});
@@ -86,6 +86,27 @@ test('all dashboard views render real stored replay without leaked tokens or fak
   assert.ok(errors.splice(authErrorStart).every(error=>error.includes('status of 401')),'Only the intentional authorization failures may be logged');
   await run(`location.hash='#token=${encodeURIComponent(connection.token)}'`);await pause(100);await settled();
   assert.match(await run("document.querySelector('#notice').textContent"),/Synthetic replay/);
+  const previousView=await run("document.querySelector('#view').innerHTML");
+  let heldRequest;
+  on('Fetch.requestPaused',({requestId})=>{heldRequest=requestId;});
+  await send('Fetch.enable',{patterns:[{urlPattern:'*/api/series*component=cpu*'}]});
+  await run("location.hash='#cpu'");
+  await until(()=>heldRequest,Boolean,'CPU query was not held');
+  try {
+    await pause(400);
+    assert.equal(await run("!!document.querySelector('#loading')&&!document.querySelector('#loading').hidden"),true,'A held query must show the loading indicator');
+    assert.match(await run("document.querySelector('#loading').textContent"),/Loading CPU.*\d+ s/);
+    assert.equal(await run("document.querySelector('#view').innerHTML"),previousView,'Loading must preserve the previous view');
+    assert.equal(await run("document.querySelector('#view').classList.contains('loading')"),true,'Loading must dim the previous view');
+    assert.equal(await run("document.querySelector('#view').getAttribute('aria-busy')"),'true');
+  } finally {
+    await send('Fetch.continueRequest',{requestId:heldRequest});
+    await send('Fetch.disable');
+  }
+  await settled();
+  assert.equal(await run("document.querySelector('#loading').hidden"),true);
+  assert.equal(await run("document.querySelector('#view').classList.contains('loading')"),false);
+  assert.equal(await run("document.querySelector('#view').getAttribute('aria-busy')"),'false');
   await run("document.querySelector('#span').value='300';document.querySelector('#span').dispatchEvent(new Event('change'))");await settled();
   for(const view of ['overview','cpu','memory','gpu','storage','network','power','heat','cost','coverage']) {
     await run(`location.hash='#${view}'`);await pause(100);await settled();

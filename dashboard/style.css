@@ -199,6 +199,33 @@ main {
   align-items:flex-start;
   gap:20px;
 }
+.loading-indicator {
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  margin-top:8px;
+  color:var(--muted);
+  font-size:12px;
+}
+.loading-indicator::before {
+  content:'';
+  width:12px;
+  height:12px;
+  flex:none;
+  border:2px solid var(--line);
+  border-top-color:var(--accent);
+  border-radius:50%;
+  animation:loading-spin 1s linear infinite;
+}
+#view.loading {
+  opacity:.6;
+}
+@keyframes loading-spin {
+  to {transform:rotate(1turn);}
+}
+@media(prefers-reduced-motion:reduce) {
+  .loading-indicator::before {animation:none;}
+}
 .eyebrow {
   font-size:10px;
   letter-spacing:1.8px;
