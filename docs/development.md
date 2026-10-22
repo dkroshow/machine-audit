@@ -240,6 +240,16 @@ resident: one short-interval query decodes up to its 32 MiB bound inside the
 collector, and the server runs up to four at once. `scan --full` walked 97,486
 entries in 2.9 s (warm caches) with `peak_rss_bytes` 35.6 MB.
 
+**Upgrade to 227cc8f**, unattended as before: `install --upgrade --yes` renamed
+the 6a06973 markers and kept three releases, and `doctor` was ready 2 s after
+`start`. Coverage for the ten minutes before the upgrade took 1.65 s and
+listed 17 gap rows (1,925 on 6a06973), raising the collector's cgroup peak
+from 36 MB to 58 MB. `scan --full` walked 97,776 entries in 2.9 s, with
+`peak_rss_bytes` 35.7 MB; the forced run retried the denied EFI volume. A
+file touched in the watched test folder reached the dirty file within 15 s.
+The next `scan` updated 3 entries, left `/boot` current and did not retry
+the denied EFI volume, and consumed the dirty file.
+
 ## Review regressions and scale measurements
 
 Run the portable boundary checks in a complete source checkout with Python 3.12:
