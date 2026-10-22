@@ -64,6 +64,15 @@ def pack_summaries(rows):
     return zlib.compress(encode([2, [[keys,values] for keys,values in groups.items()]]).encode(), 1)
 
 
+UPSERT_SUMMARY = ("INSERT INTO summaries(run_id,sequence_min,sequence_max,resolution,bucket_ns,source,component,entity,payload) VALUES(?,?,?,?,?,?,?,?,?) "
+                  "ON CONFLICT(run_id,resolution,bucket_ns,source,component,entity) DO UPDATE SET "
+                  "sequence_min=excluded.sequence_min,sequence_max=excluded.sequence_max,payload=excluded.payload")
+
+
+def signal_key(row):
+    return tuple(row[k] for k in ("signal", "unit", "kind", "scope", "scale"))
+
+
 def ranked(component, entity):
     """Process and program rows whose minute grain is limited to top consumers."""
     return component != "self" and entity.startswith(("process:", "program:"))
@@ -90,6 +99,10 @@ def top_consumers(rows):
     return keep
 
 
+def held_rows(held):
+    return [row for payload in held["rows"].values() for row in unpack_summaries(payload)]
+
+
 def unpack_summaries(payload):
     version, groups = json.loads(zlib.decompress(payload))
     if version != 2:
@@ -106,6 +119,7 @@ class Store:
         if self.path.parent.resolve() != self.budget.root.resolve() or self.path.is_symlink():
             raise ValueError("store must be a regular file in the budget directory")
         self._mutex = threading.RLock()
+        self._held = None
         if read_only:
             self.db=sqlite3.connect(f"file:{self.path}?mode=ro",uri=True,check_same_thread=False,isolation_level=None)
             if self.db.execute("PRAGMA user_version").fetchone()[0]!=2:
@@ -143,17 +157,43 @@ class Store:
     def start_run(self, run_id, boot_id, started_ns):
         with self._mutex:
             self.maintain()
-            while True:
-                try:
-                    with self.budget.sqlite_write(self.db,self.path,rows=1):
-                        self.db.execute("INSERT INTO runs(run_id,boot_id,started_ns) VALUES(?,?,?)", (run_id, boot_id, started_ns))
-                    return
-                except (sqlite3.OperationalError,BudgetExceeded) as exc:
-                    if not self._capacity_error(exc) or not self.prune_oldest():raise
+            def write():
+                with self.budget.sqlite_write(self.db,self.path,rows=1):
+                    self.db.execute("INSERT INTO runs(run_id,boot_id,started_ns) VALUES(?,?,?)", (run_id, boot_id, started_ns))
+            self._pruning_until_admitted(write)
 
     def stop_run(self, run_id, stopped_ns):
-        with self._mutex, self.budget.sqlite_write(self.db,self.path,rows=1):
-            self.db.execute("UPDATE runs SET stopped_ns=? WHERE run_id=?", (stopped_ns,run_id))
+        """Mark the run stopped and save its held minute, which is now complete."""
+        with self._mutex:
+            prepared=[]
+            held=self._held if self._held is not None and self._held["run_id"]==run_id else None
+            if held:
+                rows=held_rows(held)
+                keep=top_consumers(rows)|held["own"]
+                groups=defaultdict(list)
+                for row in rows:
+                    if row["entity"] in keep:groups[(row["source"],row["component"],row["entity"])].append(row)
+                prepared=[(run_id,held["lower"],held["upper"],"minute",held["bucket"],*key,pack_summaries(group)) for key,group in groups.items()]
+            def write():
+                with self.budget.sqlite_write(self.db,self.path,rows=1+len(prepared),payload_bytes=sum(len(row[-1]) for row in prepared)):
+                    self.db.execute("BEGIN IMMEDIATE")
+                    try:
+                        self.db.executemany(UPSERT_SUMMARY,prepared)
+                        self.db.execute("UPDATE runs SET stopped_ns=? WHERE run_id=?", (stopped_ns,run_id))
+                        self.db.execute("COMMIT")
+                    except BaseException:
+                        if self.db.in_transaction:self.db.execute("ROLLBACK")
+                        raise
+            self._pruning_until_admitted(write)
+            if held:self._held=None
+
+    def _pruning_until_admitted(self,write):
+        """Run a write, pruning the oldest history between attempts until it fits."""
+        while True:
+            try:
+                return write()
+            except (sqlite3.OperationalError,BudgetExceeded) as exc:
+                if not self._capacity_error(exc) or not self.prune_oldest():raise
 
     def _previous(self, records):
         result = {}
@@ -191,76 +231,77 @@ class Store:
             for key,rows in coarser.items():
                 summaries[key[:5]].append(merge_summaries(rows) if len(rows)>1 else rows[0])
             self.maintain()
-            deletes=self._top_minutes(records[0].run_id,minutes,own,summaries)
+            held,lowers=self._top_minutes(records,minutes,own,summaries)
             # Prepare once: a save that must prune to fit repeats only admission and commit.
-            batch=self._prepare(records,raw,summaries,deletes)
-            while True:
-                try:
-                    self._write(records,raw,batch,commit_lock,on_commit)
-                    return
-                except (sqlite3.OperationalError,BudgetExceeded) as exc:
-                    if not self._capacity_error(exc) or not self.prune_oldest():raise
+            batch=self._prepare(records,raw,summaries,lowers)
+            self._pruning_until_admitted(lambda:self._write(records,raw,batch,commit_lock,on_commit))
+            self._held=held
 
     @staticmethod
     def _capacity_error(exc):
         return getattr(exc,"sqlite_errorcode",None)==sqlite3.SQLITE_FULL or str(exc) in {"managed_storage_limit","sqlite_checkpoint_headroom"}
 
-    def _top_minutes(self,run_id,minutes,own,summaries):
-        """Add each minute's top consumers to summaries; return the stored rows to delete.
+    def _top_minutes(self,records,minutes,own,summaries):
+        """Add each complete minute's top consumers to summaries; return the minute to hold.
 
-        A minute is ranked once it is complete, so its rows always hold the whole
-        minute. Until then the run's newest minute keeps every row. Later data for
-        a ranked minute extends only the rows it kept."""
-        if not minutes:return []
-        newest=max(minutes)
-        stored=self.db.execute("""SELECT bucket_ns FROM summaries WHERE run_id=? AND resolution='minute' AND bucket_ns>=?
-            AND component!='self' AND (entity LIKE 'process:%' OR entity LIKE 'program:%') ORDER BY bucket_ns DESC LIMIT 1""",
-            (run_id,min(minutes)-HOUR)).fetchone()
-        pending=stored[0] if stored else None
-        deletes=[]
-        for bucket in sorted(set(minutes)|({pending} if pending is not None and pending<newest else set())):
-            rows=minutes.get(bucket,[])
-            if pending is not None and bucket<pending:
-                keep={entity for entity, in self.db.execute("SELECT entity FROM summaries WHERE run_id=? AND resolution='minute' AND bucket_ns=?",(run_id,bucket))}
-            elif bucket==newest:
-                keep={row["entity"] for row in rows}
-            else:
-                previous=[]
-                if bucket==pending:
-                    previous=self.db.execute("SELECT id,component,entity,length(payload),payload FROM summaries WHERE run_id=? AND resolution='minute' AND bucket_ns=? AND (entity LIKE 'process:%' OR entity LIKE 'program:%')",(run_id,bucket)).fetchall()
-                keep=top_consumers(rows+[row for _,component,entity,_,payload in previous if ranked(component,entity) for row in unpack_summaries(payload)])
-                keep|=own|{entity for _,component,entity,_,_ in previous if component=="self"}
-                deletes.extend((identifier,size) for identifier,component,entity,size,_ in previous if ranked(component,entity) and entity not in keep)
+        Saves are not aligned with minutes. The run's newest minute is held here,
+        packed, until a later save completes it, so its rows are neither saved nor
+        counted at every save. Ranking then saves only its top consumers, so a
+        saved row always holds its whole minute. Later data for a ranked minute
+        extends only the rows it kept. Stopping the run saves the held minute; a
+        crash loses only its minute rows, never its readings or coarser rows."""
+        first,last=records[0],records[-1]
+        held=self._held if self._held is not None and self._held["run_id"]==first.run_id else None
+        if not minutes:return held,{}
+        lowers={};buckets=set(minutes)|({held["bucket"]} if held else set())
+        newest=max(buckets)
+        for bucket in sorted(buckets):
+            if bucket==newest and bucket not in minutes:continue  # only older data arrived
+            rows=minutes.get(bucket,[]);mine=own;lower=first.sequence
+            if held and held["bucket"]==bucket:
+                rows=held_rows(held)+rows;mine=own|held["own"];lower=held["lower"]
+            if bucket==newest:
+                groups=defaultdict(dict)
+                for row in rows:
+                    group=groups[(row["source"],row["component"],row["entity"])];k=signal_key(row)
+                    group[k]=merge_summaries([group[k],row]) if k in group else row
+                held=dict(run_id=first.run_id,bucket=bucket,own=mine,lower=lower,upper=last.sequence,
+                          rows={key:pack_summaries(list(group.values())) for key,group in groups.items()})
+                continue
+            keep={entity for entity, in self.db.execute("""SELECT entity FROM summaries WHERE run_id=? AND resolution='minute'
+                AND bucket_ns=? AND component!='self' AND (entity LIKE 'process:%' OR entity LIKE 'program:%')""",(first.run_id,bucket))}
+            keep=keep or top_consumers(rows)|mine
             for row in rows:
-                if row["entity"] in keep:summaries[("minute",bucket,row["source"],row["component"],row["entity"])].append(row)
-        return deletes
+                if row["entity"] in keep:
+                    key=("minute",bucket,row["source"],row["component"],row["entity"])
+                    summaries[key].append(row);lowers[key]=lower
+        return held,lowers
 
-    def _prepare(self,records,raw,summaries,deletes):
+    def _prepare(self,records,raw,summaries,lowers):
         """Merge each summary row with its saved row and count the write's bound."""
         first,last=records[0],records[-1]
         prepared=[];replaced_payload=0
         for (resolution,bucket,source,component,entity),rows in summaries.items():
-            lower=first.sequence
+            lower=lowers.get((resolution,bucket,source,component,entity),first.sequence)
             old=self.db.execute("SELECT sequence_min,payload FROM summaries WHERE run_id=? AND resolution=? AND bucket_ns=? AND source=? AND component=? AND entity=?",(first.run_id,resolution,bucket,source,component,entity)).fetchone()
             if old:replaced_payload+=len(old[1])
-            def key(row):return tuple(row[k] for k in ("signal","unit","kind","scope","scale"))
-            merged={key(row):row for row in unpack_summaries(old[1])} if old else {}
+            merged={signal_key(row):row for row in unpack_summaries(old[1])} if old else {}
             for row in rows:
-                k=key(row)
+                k=signal_key(row)
                 merged[k]=merge_summaries([merged[k],row]) if k in merged else row
             if old:lower=min(lower,old[0])
             prepared.append((first.run_id,lower,last.sequence,resolution,bucket,source,component,entity,pack_summaries(list(merged.values()))))
         components=sum(len({r.reading.component,*(field_component(f,r.reading.component) for f in r.reading.fields)}) for r in records)
         catalog={(row["source"],row["signal"],row["component"],row["kind"],row["unit"],row["scope"],row["scale"]) for rows in summaries.values() for row in rows}
-        count=2+len(records)+3*components+len(prepared)+len(deletes)+len(catalog)+len({r.reading.source for r in records})+sum(any(f.kind=='event' for f in r.reading.fields) for r in records)
+        count=2+len(records)+3*components+len(prepared)+len(catalog)+len({r.reading.source for r in records})+sum(any(f.kind=='event' for f in r.reading.fields) for r in records)
         for source in {r.reading.source for r in records}:
             old=self.db.execute('SELECT length(payload) FROM baselines WHERE source=?',(source,)).fetchone()
             if old:replaced_payload+=old[0]
-        payload=3*sum(len(p) for _,p in raw)+sum(len(row[-1]) for row in prepared)+sum(size for _,size in deletes)+replaced_payload
-        return prepared,catalog,deletes,count,payload
+        payload=3*sum(len(p) for _,p in raw)+sum(len(row[-1]) for row in prepared)+replaced_payload
+        return prepared,catalog,count,payload
 
     def _write(self,records,raw,batch,commit_lock,on_commit):
-        prepared,catalog,deletes,count,payload=batch
+        prepared,catalog,count,payload=batch
         with self.budget.sqlite_write(self.db,self.path,rows=count,payload_bytes=payload):
             self.db.execute("BEGIN IMMEDIATE")
             try:
@@ -272,8 +313,7 @@ class Store:
                     raise ValueError("sequence already committed")
                 self.db.executemany("INSERT INTO readings VALUES(?,?,?,?,?,?)",[(r.run_id,r.sequence,r.reading.end.wall_ns,r.reading.source,r.reading.component,p) for r,p in raw])
                 self.db.executemany("INSERT INTO reading_components VALUES(?,?,?,?)",[(r.run_id,r.sequence,c,int(not r.reading.fields or any(field_component(f,r.reading.component)==c and is_series(c,f.entity,f.scope) for f in r.reading.fields))) for r,_ in raw for c in {r.reading.component,*(field_component(f,r.reading.component) for f in r.reading.fields)}])
-                self.db.executemany("DELETE FROM summaries WHERE id=?",((identifier,) for identifier,_ in deletes))
-                self.db.executemany("INSERT INTO summaries(run_id,sequence_min,sequence_max,resolution,bucket_ns,source,component,entity,payload) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,resolution,bucket_ns,source,component,entity) DO UPDATE SET sequence_min=excluded.sequence_min,sequence_max=excluded.sequence_max,payload=excluded.payload",prepared)
+                self.db.executemany(UPSERT_SUMMARY,prepared)
                 self.db.executemany("INSERT OR REPLACE INTO signal_catalog VALUES(?,?,?,?,?,?,?)",sorted(catalog))
                 latest = {}
                 coverage = defaultdict(list)

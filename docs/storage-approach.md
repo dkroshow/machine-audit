@@ -219,9 +219,16 @@ keep every minute. The rule and `TOP_N` live in `store.py`, for the Mac and
 Linux alike.
 
 A minute is ranked once it is complete. Saves are not aligned with minutes,
-so the run's newest minute keeps every row until a later save completes it;
-ranking then deletes the rows outside the top. A kept row always holds its
-whole minute; data arriving after the ranking extends only kept rows.
+so the collector holds the run's newest minute in memory until a later save
+completes it, then saves only its top consumers. A saved row always holds its
+whole minute; data arriving after the ranking extends only kept rows. Until
+then `who` answers that minute from 15-minute rows. Stopping the run saves the
+held minute. A crash loses only that minute's minute rows; its readings,
+15-minute and hour rows are already saved.
+
+Each save reserves room in proportion to the rows it writes. A save that does
+not fit prunes the oldest history and tries again; it merges its rows once,
+whatever the number of attempts.
 
 **Answers across resolutions.** `series` uses minute rows; if they are pruned,
 15-minute rows, then hour rows, and names the resolution it used. `who` uses
@@ -239,7 +246,8 @@ with minutes) measured:
 | --- | ---: | ---: |
 | New summary rows | 7,200 | about 320, plus 7,200 15-minute rows each quarter hour (480 a minute) |
 | Store growth | 12.6 MB | about 3.3 MB (2.6–5.2), of which raw readings 2.0 MB |
-| Save CPU | about 14 s | about 19 s |
+| Save CPU | about 14 s | about 18 s |
+| Rows reserved per save | about 14,400 | about 14,800 |
 
 The 11.3 MB a minute recorded for Big Mac's 2,000 processes (16 GB a day, in
 [development](development.md#review-regressions-and-scale-measurements)) scales

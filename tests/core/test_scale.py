@@ -14,7 +14,6 @@ import time
 import unittest
 from unittest.mock import patch
 
-import machine_audit.store
 from machine_audit.budget import Budget
 from machine_audit.model import Clock,Field,Reading,Record
 from machine_audit.query import Query
@@ -169,11 +168,44 @@ class ScaleTests(unittest.TestCase):
         records=passes(1,840,lambda pid,t:1.0)
         old=[r for r in records if r.reading.end.wall_ns<=420*S]
         self.store.append(old)
+        self.store.stop_run('run',420*S)
         self.store.db.execute("DELETE FROM summaries WHERE resolution='15-minute'")
         new=[replace(r,run_id='run2',sequence=n+1) for n,r in enumerate(records[len(old):])]
         with patch('machine_audit.store.TOP_N',0):self.store.append(new)
         row=Query(self.store).who(30*S,810*S,signal='process.cpu',component='cpu')['rows'][0]
         self.assertEqual((row['summary_resolution'],row['total']),('15-minute',42.0+41.0))  # 10-420 s, 440-840 s
+
+    def test_the_newest_minute_is_held_until_complete_and_saved_on_stop(self):
+        # Saving the newest minute's rows for every process and deleting most a save later
+        # doubled the rows each save reserved. It is held in memory instead; stopping the
+        # run saves its top consumers: 25 by CPU (0-24), 25 by footprint and bytes (75-99).
+        records=passes(100,90,lambda pid,t:2.0 if pid<25 else 0.5)
+        self.store.append(records)
+        def processes(bucket):
+            return {e for e, in self.store.db.execute("SELECT entity FROM summaries WHERE resolution='minute' AND bucket_ns=? AND component='cpu' AND entity LIKE 'process:%'",(bucket*60*S,))}
+        top={f'process:{pid}' for pid in [*range(25),*range(75,100)]}
+        self.assertEqual((processes(0),processes(1)),(top,set()))
+        self.store.stop_run('run',90*S)
+        self.assertEqual(processes(1),top)
+
+    def test_a_save_that_fails_before_commit_changes_nothing_saved_or_held(self):
+        # A save that fails inside its transaction must leave saved rows as they were and
+        # must not merge its data into the held minute, or a retried save counts it twice.
+        records=passes(30,170,lambda pid,t:1.0+pid%7)
+        parts=[records[:9],records[9:14],records[14:]]  # each minute spans two saves
+        def summaries(store):
+            return sorted((res,bucket,entity,row['signal'],row['total'],row['sample_count']) for res,bucket,entity,payload in
+                          store.db.execute('SELECT resolution,bucket_ns,entity,payload FROM summaries') for row in unpack_summaries(payload))
+        self.store.append(parts[0]);self.store.append(parts[1])
+        saved=summaries(self.store)
+        with self.assertRaisesRegex(ValueError,'sequence already committed'):self.store.append(parts[1])
+        self.assertEqual(summaries(self.store),saved)
+        self.store.append(parts[2]);self.store.stop_run('run',170*S)
+        reference=Store(Path(self.tmp.name)/'reference.sqlite',self.store.budget)
+        for part in parts:reference.append(part)
+        reference.stop_run('run',170*S)
+        self.assertEqual(summaries(self.store),summaries(reference))
+        reference.close()
 
     def test_a_save_at_the_cap_prepares_once_and_prunes_only_until_it_fits(self):
         # Big Mac at the cap during a full scanner walk: each failed admission pruned one
@@ -197,14 +229,16 @@ class ScaleTests(unittest.TestCase):
         # Admission reserves the database plus one WAL frame per page: this fits only
         # after about half of the history is pruned, and stays under proactive pruning.
         self.store.budget.limit_bytes=(growth+pages//2)*(2*page+24)+65536
-        packed=[];rounds=[]
-        pack,prune=machine_audit.store.pack_summaries,Store.prune_oldest
-        def counting_pack(rows):packed.append(1);return pack(rows)
+        merges=[];rounds=[]
+        # Preparing looks up each summary row's saved row once, before merging it.
+        self.store.db.set_trace_callback(lambda sql:sql.startswith('SELECT sequence_min,payload FROM summaries') and merges.append(1))
+        prune=Store.prune_oldest
         def counting_prune(store):rounds.append(1);return prune(store)
-        with patch('machine_audit.store.pack_summaries',counting_pack),patch.object(Store,'prune_oldest',counting_prune):
+        with patch.object(Store,'prune_oldest',counting_prune):
             self.store.append(save)
+        self.store.db.set_trace_callback(None)
         written=self.store.db.execute('SELECT count(*) FROM summaries WHERE sequence_max=?',(save[-1].sequence,)).fetchone()[0]
-        self.assertEqual(len(packed),written)  # one merge per saved row, however many rounds
+        self.assertEqual(len(merges),written)  # one merge per saved row, however many rounds
         self.assertGreater(len(rounds),1,rounds)
         oldest=self.store.db.execute('SELECT min(wall_ns) FROM readings').fetchone()[0]
         self.assertTrue(0<oldest<1800*S,oldest)  # pruned, then stopped once the save fit
