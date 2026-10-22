@@ -152,11 +152,13 @@ def run_scan(data_dir, *, full=False, grain='files', roots=None, exclusions=(), 
             return {'status': run_status if root_failed else 'observed', 'volumes': results, 'entries': processed,
                     'peak_rss_bytes': peak}
         except (BudgetExceeded, sqlite3.Error) as exc:
+            status = 'budget_blocked' if isinstance(exc, BudgetExceeded) else 'write_failed'
+            reason = f'budget_blocked_{exc.code}' if isinstance(exc, BudgetExceeded) else 'write_failed'
             try:
-                store.mark_failed('budget_blocked' if isinstance(exc, BudgetExceeded) else 'write_failed')
+                store.mark_failed(reason)
             except (BudgetExceeded, sqlite3.Error):
                 pass
-            return {'status': 'budget_blocked' if isinstance(exc, BudgetExceeded) else 'write_failed', 'entries': processed}
+            return {'status': status, 'reason': reason, 'entries': processed}
         finally:
             store.close()
 

@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import threading
@@ -16,10 +17,18 @@ LIMIT_BYTES = 10 * GB
 FREE_MARGIN_BYTES = 64 * 1024**2
 ROW_PAGES = 16
 FIXED_WRITE_PAGES = 64
+_CODE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
 
 
 class BudgetExceeded(RuntimeError):
-    pass
+    """Refused admission. The message is a reason code, never free text,
+    so run records and status files can keep it."""
+
+    def __init__(self, code: str):
+        if not _CODE.fullmatch(code):
+            raise ValueError('invalid budget reason code')
+        super().__init__(code)
+        self.code = code
 
 
 class _ReservationBusy(Exception):

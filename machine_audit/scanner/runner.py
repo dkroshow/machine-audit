@@ -236,13 +236,14 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
             store.progress(processed,run_status)
             return {'status':run_status if root_failed else 'observed','volumes':results,'entries':processed,**store.run_context}
         except Exception as exc:
-            if isinstance(exc,BudgetExceeded):status=reason='budget_blocked'
-            elif isinstance(exc,sqlite3.Error):status=reason='write_failed'
-            else:
-                status='scan_failed'
-                reason=exc.code if isinstance(exc,ScanError) else 'os_error' if isinstance(exc,OSError) else 'invalid_scan_state' if isinstance(exc,ValueError) else 'unexpected_error'
             exception_type=type(exc).__name__
-            reason=f'{reason}_{exception_type}'
+            if isinstance(exc,BudgetExceeded):status,reason='budget_blocked',f'budget_blocked_{exc.code}'
+            else:
+                if isinstance(exc,sqlite3.Error):status=reason='write_failed'
+                else:
+                    status='scan_failed'
+                    reason=exc.code if isinstance(exc,ScanError) else 'os_error' if isinstance(exc,OSError) else 'invalid_scan_state' if isinstance(exc,ValueError) else 'unexpected_error'
+                reason=f'{reason}_{exception_type}'
             # Never print exception text: native/file errors can contain paths.
             # A separate failure to persist the reason is visible in the JSON.
             recorded=False

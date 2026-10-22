@@ -176,7 +176,7 @@ class RootPublicationTests(unittest.TestCase):
                 (ValueError('synthetic private path'), 'scan_failed', 'invalid_scan_state_ValueError'),
                 (OSError(5, 'synthetic private path'), 'scan_failed', 'os_error_OSError'),
                 (TypeError('synthetic private path'), 'scan_failed', 'unexpected_error_TypeError'),
-                (BudgetExceeded('synthetic private path'), 'budget_blocked', 'budget_blocked_BudgetExceeded'),
+                (BudgetExceeded('synthetic_rule'), 'budget_blocked', 'budget_blocked_synthetic_rule'),
                 (sqlite3.OperationalError('synthetic private path'), 'write_failed', 'write_failed_OperationalError')):
             with self.subTest(reason=reason), patch.object(MapStore, 'finish_volume', side_effect=error):
                 result, status = self.scan([self.volume],force=True)

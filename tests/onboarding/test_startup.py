@@ -75,7 +75,7 @@ class StartupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             config = Config(data_dir=tmp)
             def fail(ready):
-                raise BudgetExceeded('private path and token must not escape')
+                raise BudgetExceeded('synthetic_rule')
             with patch('machine_audit.startup.port_status', return_value='available'), redirect_stderr(io.StringIO()) as output:
                 for _ in range(3):
                     self.assertEqual(guarded_run(config, fail), 2)

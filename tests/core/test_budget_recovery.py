@@ -17,6 +17,13 @@ from machine_audit.store import Store, MINUTE, pack_summaries, unpack_summaries
 
 
 class BudgetRecoveryTests(unittest.TestCase):
+    def test_budget_refusal_carries_a_code_never_free_text(self):
+        # Scan and status records keep the refusal reason; a path or message
+        # raised in its place would otherwise reach a run record.
+        self.assertEqual(BudgetExceeded('managed_storage_limit').code, 'managed_storage_limit')
+        with self.assertRaises(ValueError):
+            BudgetExceeded('synthetic private path')
+
     def test_prune_recent_covered_raw_does_not_scan_old_coverage_per_reading(self):
         # Retained coverage outlives raw. A forward proof search repeated that
         # old prefix for each reading, stalling flushes before write admission.
