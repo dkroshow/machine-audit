@@ -1,4 +1,4 @@
-import {views,label,time,format,readToken,makeApi,tokenKey,seriesGroups,rowValue,rowUnit,statusText,ranksInWho} from './model.mjs';
+import {views,label,time,format,readToken,makeApi,queryPool,tokenKey,seriesGroups,rowValue,rowUnit,statusText,ranksInWho} from './model.mjs';
 import {el,card,empty,metric,signalsView,liveView,whoView,coverageView,statusView,intervalEvidence} from './render.mjs';
 import {storageView} from './storage.mjs';
 const $=id=>document.getElementById(id);
@@ -51,31 +51,43 @@ function contentGroups(answer,component,onAround) {
   if(!root.children.length)root.append(empty('No host or device readings cover this interval. Workload readings and coverage are shown separately.'));
   return root;
 }
-async function overview(params,abort) {
-  const keys=['cpu','memory','gpu','storage','network','power','heat','cost'];
-  const answers=new Map();
-  // Keep the 600-row total allowance, without one component consuming another's share.
-  for(let index=0;index<keys.length;index+=2) {
-    await Promise.all(keys.slice(index,index+2).map(async key=>{
-      const component=views[key].component ?? key;
-      answers.set(key,await api('series',{...params,component,limit:75},abort));
-    }));
-    if(abort.aborted)return null;
+function loading() {
+  return el('span',{class:'loading-indicator',role:'progressbar','aria-label':'Loading measurements'},el('span',{'aria-hidden':'true'},'Loading…'));
+}
+async function fill(target,read,abort,publish) {
+  try {
+    const content=await read();
+    if(abort.aborted)return;
+    target.replaceChildren(content);
+  } catch(error) {
+    if(abort.aborted)return;
+    if(error.status===401 || error.status===403)throw error;
+    target.replaceChildren(empty(error.message));
   }
+  publish?.();
+}
+async function overview(params,abort,query) {
+  const keys=['cpu','memory','gpu','storage','network','power','heat','cost'];
   const root=el('div');
   root.append(el('div',{class:'banner'},el('p',{},'Follow a resource from the whole machine to the programs using it.'),el('p',{class:'sub'},'The selected interval applies throughout. Usage, constraints and missing coverage stay separate.')));
   const grid=el('div',{class:'grid'});
-  for(const key of keys) {
-    const spec=views[key],component=spec.component ?? key;
-    const answer=answers.get(key);
-    const rows=seriesGroups(answer.rows ?? []).filter(g=>(component==='self' ? !g.entity?.startsWith('program:') : !g.entity?.startsWith('process:')) && !g.entity?.startsWith('cpu:')).slice(0,3);
+  const bodies=keys.map(key=>{
+    const spec=views[key],body=el('div',{},loading());
     const heading=el('div',{class:'card-head'},el('h2',{},spec.title),el('a',{href:`#${key}`},'Explore →'));
-    grid.append(el('section',{class:'card'},heading,el('p',{class:'sub'},spec.description),rows.length ? el('div',{class:'signal-list'},rows.map(g=>{const r=g.rows.at(-1);return metric(label(g.signal),format(rowValue(r),rowUnit(r)),r.status);})) : empty(answer.truncated ? 'No host or device measurements were returned in this partial sample.' : 'No host or device measurements were returned for this interval.'),
-      answer.truncated ? el('p',{class:'note'},'Partial sample. Explore this component for more detail.') : null));
-  }
-  root.append(grid);return root;
+    grid.append(el('section',{class:'card'},heading,el('p',{class:'sub'},spec.description),body));
+    return body;
+  });
+  root.append(grid);$('view').replaceChildren(root);
+  // Eight component allowances still total 600 rows.
+  await Promise.all(keys.map((key,index)=>fill(bodies[index],async()=>{
+    const spec=views[key],component=spec.component ?? key;
+    const answer=await query('series',{...params,component,limit:75},abort);
+    const rows=seriesGroups(answer.rows ?? []).filter(g=>(component==='self' ? !g.entity?.startsWith('program:') : !g.entity?.startsWith('process:')) && !g.entity?.startsWith('cpu:')).slice(0,3);
+    return el('div',{},rows.length ? el('div',{class:'signal-list'},rows.map(g=>{const r=g.rows.at(-1);return metric(label(g.signal),format(rowValue(r),rowUnit(r)),r.status);})) : empty(answer.truncated ? 'No host or device measurements were returned in this partial sample.' : 'No host or device measurements were returned for this interval.'),
+      answer.truncated ? el('p',{class:'note'},'Partial sample. Explore this component for more detail.') : null);
+  },abort)));
 }
-async function workloadSection(component,params,abort) {
+async function workloadSection(component,params,abort,query) {
   const wanted=(state.catalog.signals ?? []).filter(s=>s.component===component && ranksInWho(s));
   const names=[...new Set(wanted.map(s=>s.signal))];
   if(!names.length)return card('Programs and affected workloads',empty('No workload fields are available for this component. No per-program remainder is inferred.'));
@@ -87,7 +99,7 @@ async function workloadSection(component,params,abort) {
   let version=0;
   const update=async()=>{
     const request=++version;
-    try {const answer=await api('who',{...params,component,signal:select.value},abort);if(request===version&&!abort?.aborted)body.replaceChildren(whoView(answer,at=>around(at,component)));}
+    try {const answer=await query('who',{...params,component,signal:select.value},abort);if(request===version&&!abort?.aborted)body.replaceChildren(whoView(answer,at=>around(at,component)));}
     catch(e){if(e.name!=='AbortError'&&request===version)body.replaceChildren(empty(e.message));}
   };
   select.addEventListener('change',()=>{state.whoSignal=select.value;update();});
@@ -104,6 +116,7 @@ async function around(at,component) {
 }
 async function load() {
   clearTimeout(state.timer);state.abort?.abort();const controller=new AbortController();state.abort=controller;
+  const query=queryPool(api);
   state.view=route();const spec=views[state.view],component=spec.component ?? (state.view==='overview'||state.view==='coverage' ? undefined:state.view);
   $('view').classList.toggle('cost-view',state.view==='cost');
   $('view-title').textContent=spec.title;$('view-description').textContent=spec.description;document.title=`${spec.title} · Machine-audit`;
@@ -111,48 +124,42 @@ async function load() {
   message('error');message('notice');setBusy(true);
   const params=bounds();$('interval-caption').textContent=state.mode==='live' ? 'Recent source readings · refresh every 5 seconds while visible':`${time(params.start*1e9)} – ${time(params.end*1e9)} · ${Intl.DateTimeFormat().resolvedOptions().timeZone}`;
   try {
-    state.catalog ??= await api('catalog',{},controller.signal);
+    state.catalog ??= await query('catalog',{},controller.signal);
     if(controller.signal.aborted)return;
     const synthetic=(state.catalog.signals ?? []).some(s=>s.source?.startsWith('synthetic.'));
     if(synthetic)message('notice','Synthetic replay — invented scenario inputs, not measurements from this machine.');
     let answer;
     if(state.view==='coverage') {
-      const [coverage,status]=await Promise.all([api('coverage',params,controller.signal),api('status',{},controller.signal)]);
+      const [coverage,status]=await Promise.all([query('coverage',params,controller.signal),query('status',{},controller.signal)]);
       if(controller.signal.aborted)return;
       answer=coverage;$('view').replaceChildren(statusView(status),card('Interval coverage',coverageView(coverage)));
     } else if(state.mode==='live') {
-      answer=await api('now',{component},controller.signal);
+      answer=await query('now',{component},controller.signal);
       if(controller.signal.aborted)return;
       $('view').replaceChildren(spec.note ? el('p',{class:'intro'},spec.note):el('p',{class:'intro'},'Recent source readings, with their actual observation times.'),liveView(answer,at=>around(at,component)));
     } else if(state.view==='overview') {
-      const content=await overview(params,controller.signal);
-      if(controller.signal.aborted)return;
-      $('view').replaceChildren(content);
+      await overview(params,controller.signal,query);
     } else {
-      answer=await api('series',{...params,component},controller.signal);
-      if(controller.signal.aborted)return;
-      const content=contentGroups(answer,component,at=>around(at,component));
-      $('view').replaceChildren(...(spec.note ? [el('p',{class:'intro'},spec.note)]:[]),content);
+      const series=el('div',{},loading()),extra=el('div',{},loading());
+      const root=el('div',{},spec.note ? el('p',{class:'intro'},spec.note):null,series,extra);
+      const publish=()=>{if(!root.isConnected)$('view').replaceChildren(root);};
+      const pending=[fill(series,async()=>{
+        answer=await query('series',{...params,component},controller.signal);
+        return contentGroups(answer,component,at=>around(at,component));
+      },controller.signal,publish)];
       if(state.view==='storage') {
-        const block=card('Storage map',empty('Reading the saved map…'));$('view').prepend(block);
-        try {block.replaceChildren(await storageView(api,params,controller.signal));}
-        catch(e){if(e.name!=='AbortError')block.replaceChildren(el('h2',{},'Storage map'),empty(e.message));}
+        const block=card('Storage map',loading());root.prepend(block);
+        pending.push(fill(block,()=>storageView(query,params,controller.signal),controller.signal,publish));
       }
-      if(!['overview','cost'].includes(state.view)) {
-        const workloads=await workloadSection(component,params,controller.signal);
-        if(controller.signal.aborted)return;
-        $('view').append(workloads);
-      }
-      if(state.view==='cost') {
-        const status=await api('status',{},controller.signal);if(controller.signal.aborted)return;$('view').append(statusView(status));
-      }
+      pending.push(fill(extra,async()=>state.view==='cost' ? statusView(await query('status',{},controller.signal)) : await workloadSection(component,params,controller.signal,query),controller.signal,publish));
+      await Promise.all(pending);
     }
     if(controller.signal.aborted)return;
     $('evidence-footer').textContent=state.view==='overview'&&state.mode==='history' ? 'Each component has its own sample. Open a component for more detail.' : intervalEvidence(answer);
     if(answer?.truncated)message('notice',(synthetic ? 'Synthetic replay. ' : '')+'This answer reaches the result limit. Narrow the interval for detail; the API supplies a continuation for the remaining rows.');
     $('connection').textContent=`Last answer ${new Date().toLocaleTimeString()}`;
   } catch(e) {
-    if(e.name!=='AbortError') {message('error',e.message);$('view').replaceChildren(empty('Measurements could not be loaded. Refresh after checking that Machine-audit is running.'));$('connection').textContent='Connection needs attention';}
+    if(e.name!=='AbortError'&&!controller.signal.aborted) {controller.abort();setBusy(false);message('error',e.message);$('view').replaceChildren(empty('Measurements could not be loaded. Refresh after checking that Machine-audit is running.'));$('connection').textContent='Connection needs attention';}
   } finally {
     if(!controller.signal.aborted){setBusy(false);if(state.mode==='live'&&!document.hidden)state.timer=setTimeout(load,5000);}
   }

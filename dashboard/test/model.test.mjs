@@ -1,6 +1,36 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {readToken,makeApi,chartRuns,rowValue,format,seriesGroups,ranksInWho} from '../model.mjs';
+import {readToken,makeApi,queryPool,chartRuns,rowValue,format,seriesGroups,ranksInWho} from '../model.mjs';
+
+test('query pool delivers each result and reuses a free slot before the slow peer finishes',async()=>{
+  const pending=new Map(),painted=[];let active=0,peak=0;
+  const query=queryPool(name=>new Promise(resolve=>{
+    active++;peak=Math.max(peak,active);
+    pending.set(name,()=>{active--;resolve(name);});
+  }));
+  const done=['cpu','memory','gpu','storage'].map(name=>query(name).then(value=>painted.push(value)));
+  assert.deepEqual([...pending.keys()],['cpu','memory']);
+  pending.get('cpu')();await new Promise(setImmediate);
+  assert.deepEqual(painted,['cpu']);
+  assert.ok(pending.has('gpu'),'The third query starts while memory is still pending');
+  pending.get('gpu')();await new Promise(setImmediate);
+  assert.ok(pending.has('storage'));
+  pending.get('storage')();pending.get('memory')();await Promise.all(done);
+  assert.equal(peak,2);
+  assert.deepEqual(painted,['cpu','gpu','storage','memory']);
+});
+
+test('query pool does not start queued work after its view is aborted',async()=>{
+  const pending=[];let started=0;
+  const query=queryPool(()=>new Promise(resolve=>{started++;pending.push(resolve);}));
+  const controller=new AbortController();
+  const done=Promise.allSettled([0,1,2,3].map(()=>query('series',{},controller.signal)));
+  controller.abort();pending.forEach(resolve=>resolve());
+  const results=await done;
+  assert.equal(started,2);
+  assert.deepEqual(results.map(result=>result.status),['fulfilled','fulfilled','rejected','rejected']);
+  assert.equal(results[2].reason.name,'AbortError');
+});
 
 test('fragment bootstrap removes the secret before navigation and API uses a header',async()=>{
   const location={hash:'#token=synthetic%2Bsecret',pathname:'/',search:''};

@@ -103,21 +103,35 @@ export function readToken(location, history) {
 }
 const unauthorizedMessage='This session is not authorized. Open the dashboard link again with its #token=... fragment; the operator finds the current link with machine-audit open on the machine.';
 export const tokenKey='machine-audit.token';
+const QUERY_CONCURRENCY=2;
+export function queryPool(request) {
+  const queued=[];let active=0;
+  function start() {
+    while(active<QUERY_CONCURRENCY && queued.length) {
+      const {args,resolve,reject}=queued.shift();
+      const signal=args[2];
+      if(signal?.aborted) {reject(signal.reason);continue;}
+      active++;
+      (async()=>request(...args))().then(resolve,reject).finally(()=>{active--;start();});
+    }
+  }
+  return (...args)=>new Promise((resolve,reject)=>{queued.push({args,resolve,reject});start();});
+}
 export function makeApi(token, fetcher=fetch, storage=globalThis.sessionStorage) {
   let tokenRun;
   if(token)storage?.setItem(tokenKey,token);
   else storage?.removeItem(tokenKey);
-  const unauthorized=()=>{
+  const unauthorized=(status=401)=>{
     token=null;tokenRun=undefined;
     storage?.removeItem(tokenKey);
-    throw new Error(unauthorizedMessage);
+    throw Object.assign(new Error(unauthorizedMessage),{status});
   };
   return async (shape, parameters={}, signal) => {
-    if (!token) throw new Error(unauthorizedMessage);
+    if (!token) throw Object.assign(new Error(unauthorizedMessage),{status:401});
     const query=new URLSearchParams();
     for (const [key,value] of Object.entries(parameters)) if (value !== undefined && value !== null) query.set(key,Array.isArray(value) ? value.join(',') : String(value));
     const response=await fetcher(`/api/${shape}${query.size ? '?'+query : ''}`, {headers:{Authorization:`Bearer ${token}`},credentials:'omit',cache:'no-store',signal});
-    if (response.status === 401 || response.status === 403) unauthorized();
+    if (response.status === 401 || response.status === 403) unauthorized(response.status);
     if (!response.ok) throw new Error(`The ${shape} request failed (HTTP ${response.status}). No missing values have been replaced with zero.`);
     const answer=await response.json();
     if(shape==='status' && answer.collector?.run_id!=null) {

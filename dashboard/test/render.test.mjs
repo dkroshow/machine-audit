@@ -89,13 +89,13 @@ test('all dashboard views render real stored replay without leaked tokens or fak
   const previousView=await run("document.querySelector('#view').innerHTML");
   let heldRequest;
   on('Fetch.requestPaused',({requestId})=>{heldRequest=requestId;});
-  await send('Fetch.enable',{patterns:[{urlPattern:'*/api/series*component=cpu*'}]});
-  await run("location.hash='#cpu'");
-  await until(()=>heldRequest,Boolean,'CPU query was not held');
+  await send('Fetch.enable',{patterns:[{urlPattern:'*/api/coverage*'}]});
+  await run("location.hash='#coverage'");
+  await until(()=>heldRequest,Boolean,'Coverage query was not held');
   try {
     await pause(400);
     assert.equal(await run("!!document.querySelector('#loading')&&!document.querySelector('#loading').hidden"),true,'A held query must show the loading indicator');
-    assert.match(await run("document.querySelector('#loading').textContent"),/Loading CPU.*\d+ s/);
+    assert.match(await run("document.querySelector('#loading').textContent"),/Loading Coverage & status.*\d+ s/);
     assert.equal(await run("document.querySelector('#view').innerHTML"),previousView,'Loading must preserve the previous view');
     assert.equal(await run("document.querySelector('#view').classList.contains('loading')"),true,'Loading must dim the previous view');
     assert.equal(await run("document.querySelector('#view').getAttribute('aria-busy')"),'true');
@@ -107,6 +107,21 @@ test('all dashboard views render real stored replay without leaked tokens or fak
   assert.equal(await run("document.querySelector('#loading').hidden"),true);
   assert.equal(await run("document.querySelector('#view').classList.contains('loading')"),false);
   assert.equal(await run("document.querySelector('#view').getAttribute('aria-busy')"),'false');
+  const pendingOverview=new Map();
+  on('Fetch.requestPaused',({requestId,request})=>pendingOverview.set(new URL(request.url).searchParams.get('component'),requestId));
+  await send('Fetch.enable',{patterns:[{urlPattern:'*/api/series*'}]});
+  await run("location.hash='#overview'");
+  try {
+    await until(()=>pendingOverview.size,count=>count===2,'Overview did not start two requests');
+    await send('Fetch.continueRequest',{requestId:pendingOverview.get('cpu')});pendingOverview.delete('cpu');
+    await until(()=>run("[...document.querySelectorAll('#view .card')].some(card=>card.querySelector('h2')?.textContent==='CPU'&&!card.querySelector('.loading-indicator'))"),Boolean,'First overview card did not paint while other queries were held');
+    assert.equal(await run("document.querySelectorAll('#view .loading-indicator').length"),7);
+    await until(()=>pendingOverview.has('gpu'),Boolean,'A free request slot did not start the next component');
+  } finally {
+    for(const requestId of pendingOverview.values())await send('Fetch.continueRequest',{requestId});
+    await send('Fetch.disable');
+  }
+  await settled();
   await run("document.querySelector('#span').value='300';document.querySelector('#span').dispatchEvent(new Event('change'))");await settled();
   for(const view of ['overview','cpu','memory','gpu','storage','network','power','heat','cost','coverage']) {
     await run(`location.hash='#${view}'`);await pause(100);await settled();
