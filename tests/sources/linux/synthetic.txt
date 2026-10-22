@@ -968,3 +968,23 @@ connected
 
 ==> /sys/devices/system/cpu/online <==
 0-1
+==> /sys/class/drm/version <==
+drm 1.1.0 20060810
+
+==> /sys/class/hwmon/hwmon5/name <==
+nvme
+
+==> /sys/class/hwmon/hwmon5/temp1_input <==
+-273150
+
+==> /sys/class/hwmon/hwmon5/temp1_label <==
+Composite
+
+==> /sys/class/hwmon/hwmon5/temp2_input <==
+40850
+
+==> /sys/class/hwmon/hwmon5/temp2_label <==
+Sensor 1
+
+==> /sys/class/hwmon/hwmon5/temp2_max <==
+65261850

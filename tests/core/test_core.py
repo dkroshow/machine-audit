@@ -83,6 +83,15 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(rows[-1]["value"],1)
         self.assertEqual(rows[-1]["sleep_s"],10)
 
+    def test_clock_pair_jitter_is_not_sleep(self):
+        # First Linux run: the awake and continuous clocks, read by two calls, differed by up
+        # to 8,270 ns between reads and flagged every window as containing sleep.
+        def at(awake,continuous,seq,value):
+            c=Clock(awake,awake,continuous)
+            return Record(Reading("synthetic","cpu",c,c,(Field("cpu.counter",value,"seconds","counter"),)),"boot","run",seq,c.wall_ns,c)
+        rows=points([at(0,0,1,0),at(10*S,10*S+8270,2,10)])
+        self.assertEqual((rows[-1]["sleep_s"],rows[-1]["value"]),(0.0,1.0))
+
     def test_snapshot_commit_race_does_not_duplicate_saved_tail(self):
         collector=Collector(self.store,run_id="run",clock=lambda:Clock(20*S,20*S,20*S))
         collector.ingest(reading(0,0));collector.ingest(reading(10,10))

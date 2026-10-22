@@ -9,6 +9,9 @@ GOOD = {"observed", "measured_zero"}
 # Busy CPU states (cpu-view.md): user plus system; Linux nice is user time, and
 # Linux irq and softirq are system time. Absent states add nothing.
 BUSY = ("cpu.user","cpu.system","cpu.nice","cpu.irq","cpu.softirq")
+# A read's awake and continuous clocks come from two calls, nanoseconds to microseconds
+# apart. A difference below this is that gap, not a suspend.
+SLEEP_TOLERANCE_S = 0.001
 
 
 def source_fields(reading):
@@ -98,7 +101,7 @@ def points(records: list[Record], previous: dict[str, Record] | None = None) -> 
                     else:
                         p.update(total=delta, covered_s=dt, value=delta * field.scale / dt,
                                  awake_start_ns=old_end.awake_ns,
-                                 sleep_s=max(0.0, continuous-dt),
+                                 sleep_s=continuous-dt if continuous-dt >= SLEEP_TOLERANCE_S else 0.0,
                                  status="measured_zero" if delta == 0 else "observed")
             elif field.kind == "accumulator" and p["status"] in GOOD:
                 dt = (end_clock.awake_ns - start_clock.awake_ns) / 1e9

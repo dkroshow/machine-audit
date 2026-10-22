@@ -176,9 +176,12 @@ class LinuxSourceTests(unittest.TestCase):
     def test_heat_power_and_gpu_come_from_named_chips_and_a_suspended_gpu_is_not_read(self):
         devices = Devices(self.root, b'0' * 64)
         temperatures = list(devices.temperatures())
-        self.assertEqual(sorted(f.label for f in temperatures if f.name == 'heat.temperature'),
-                         ['amdgpu edge', 'k10temp Tctl', 'mt7921_phy0 temp1', 'nvme Composite', 'nvme Composite'])
-        self.assertEqual(len({f.entity for f in temperatures if f.label == 'nvme Composite'}), 2)
+        self.assertEqual(sorted(f.label for f in temperatures if f.name == 'heat.temperature' and f.status == 'observed'),
+                         ['amdgpu edge', 'k10temp Tctl', 'mt7921_phy0 temp1', 'nvme Composite', 'nvme Composite', 'nvme Sensor 1'])
+        self.assertEqual(len({f.entity for f in temperatures if f.label == 'nvme Composite'}), 3)
+        # First Linux run: nvme drivers report -273150 for no reading and 65261850 for no limit.
+        sentinels = [(f.name, f.value, f.status) for f in temperatures if f.value is None]
+        self.assertEqual(sorted(sentinels), [('heat.temperature', None, 'unavailable'), ('heat.temperature_max', None, 'unavailable')])
         tctl = next(f for f in temperatures if f.label == 'k10temp Tctl')
         self.assertEqual((tctl.value, tctl.unit), (45.125, 'degC'))  # hwmon millidegrees
         power = by_name(devices.power())['power.average']

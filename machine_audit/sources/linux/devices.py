@@ -116,7 +116,10 @@ class Devices:
             status = (optional(device / 'power/runtime_status') or '').strip()
             yield chip, identity, directory, chip == 'amdgpu' and status == 'suspended'
 
-    def sensor_fields(self, prefix, kind, name, unit, divisor=1, limits=()):
+    def sensor_fields(self, prefix, kind, name, unit, divisor=1, limits=(), plausible=None):
+        def value(text):
+            number = int(text) / divisor if divisor != 1 else int(text)
+            return number if plausible is None or plausible[0] < number < plausible[1] else None
         for chip, identity, directory, suspended in self.hwmon():
             for n in channels(directory, prefix):
                 label = (optional(directory / f'{prefix}{n}_label') or f'{prefix}{n}').strip()
@@ -125,19 +128,19 @@ class Devices:
                     yield field(name, None, unit, kind, status='unobserved', **kw)
                     continue
                 try:
-                    value = int((directory / f'{prefix}{n}_input').read_text())
+                    yield field(name, value((directory / f'{prefix}{n}_input').read_text()), unit, kind, **kw)
                 except OSError as exc:
                     yield field(name, None, unit, kind, status=gap_status(exc), **kw)
                     continue
-                yield field(name, value / divisor if divisor != 1 else value, unit, kind, **kw)
                 for limit in limits:
                     text = optional(directory / f'{prefix}{n}_{limit}')
                     if text is not None:
-                        yield field(f'{name}_{limit}', int(text) / divisor if divisor != 1 else int(text), unit, **kw)
+                        yield field(f'{name}_{limit}', value(text), unit, **kw)
 
     def temperatures(self):
-        # hwmon reports millidegrees Celsius.
-        yield from self.sensor_fields('temp', 'gauge', 'heat.temperature', 'degC', 1000, ('max', 'crit'))
+        # hwmon reports millidegrees Celsius. Drivers fill "no reading" with sentinels such as
+        # -273150 or 65261850; outside this range a value is unavailable, not a temperature.
+        yield from self.sensor_fields('temp', 'gauge', 'heat.temperature', 'degC', 1000, ('max', 'crit'), (-273, 1000))
 
     def fans(self):
         yield from self.sensor_fields('fan', 'gauge', 'heat.fan_rpm', 'rpm', limits=('min', 'max'))
@@ -198,10 +201,12 @@ class Devices:
     def gpu(self):
         base = self.root / 'sys/class/drm'
         for card in sorted(base.iterdir()) if base.exists() else ():
+            if not re.fullmatch(r'card\d+', card.name):
+                continue  # connectors, and the class's version file
             device = card / 'device'
             uevent = keyed(optional(device / 'uevent') or '', '=')
-            if not re.fullmatch(r'card\d+', card.name) or uevent.get('DRIVER') != ['amdgpu']:
-                continue  # connectors, and drivers without these files
+            if uevent.get('DRIVER') != ['amdgpu']:
+                continue
             kw = dict(entity=self.hashed('gpu', uevent.get('PCI_SLOT_NAME', [card.name])[0]), scope='gpu')
             status = (optional(device / 'power/runtime_status') or 'unknown').strip()
             yield field('gpu.runtime_status', status if status in RUNTIME_STATES else 'unknown', 'state', 'state', **kw)

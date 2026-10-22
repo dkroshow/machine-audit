@@ -34,7 +34,7 @@ def optional(path):
     """A file a controller or driver does not provide is absent, not zero."""
     try:
         return path.read_text()
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
         return None
 
 
