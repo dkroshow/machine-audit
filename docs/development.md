@@ -261,6 +261,18 @@ file touched in the watched test folder reached the dirty file within 15 s.
 The next `scan` updated 3 entries, left `/boot` current and did not retry
 the denied EFI volume, and consumed the dirty file.
 
+**Upgrade to 907ef94** (top-consumer minute rows, 15-minute rows, the held
+newest minute): `install --upgrade --yes` exited 0, renamed the 227cc8f markers
+and kept four releases; `doctor` was ready 2 s after `start`. In the next ten
+minutes the collector saved 9 times with no save error or restart, used 31.2 s
+of CPU (5.0% of a core; 26.6 s on 614fb7f), 15.6 s of it saving, and peaked at
+96 MB. The data directory grew 6.98 MB, 0.68 MB a minute. Coverage for those
+ten minutes took 3.1 s and listed 201 gap rows, all in the first minute after
+the restart: 180 counter baselines, 16 source statuses and 5 from the previous
+run's end. `who` (raw, 75 rows) took 5.2 s for CPU and 5.1 s for memory,
+raising the collector's peak to 288 MB. `scan --full` walked 97,894 entries in
+2.9 s with `peak_rss_bytes` 35.7 MB, and retried the denied EFI volume.
+
 ## Review regressions and scale measurements
 
 Run the portable boundary checks in a complete source checkout with Python 3.12:
