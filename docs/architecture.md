@@ -29,7 +29,7 @@ through four parts:
    [accepted cadence](storage-approach.md#collection-baseline), stamps
    readings with boot id, run id and sequence number, holds the unsaved tail, writes.
 3. **Store** (portable): one SQLite database in write-ahead-log mode, one
-   transaction per minute, minute and hourly rollups alongside.
+   transaction per minute, minute, 15-minute and hourly rollups alongside.
 4. **Query and interfaces** (portable): one query module answers a selected
    interval with the [query design](query-design.md)'s answer shapes. A loopback
    HTTP server exposes it as JSON and serves the static dashboard; a `--json`

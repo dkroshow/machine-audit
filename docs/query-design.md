@@ -118,7 +118,8 @@ includes all measured Machine-audit components, not only the collector process.
   windows, as the [time and coverage rules](cpu-view.md#time-windows-and-coverage-working)
   say; the method is visible in the answer.
 - **Resolution follows the span and a row cap.** Raw readings for a few
-  minutes, minute rollups for hours, hourly rollups for days. The answer
+  minutes, minute rollups for hours, hourly rollups for days; a process
+  outside a minute's top consumers answers from 15-minute rollups. The answer
   names its resolution and the cadence behind it. Nothing is interpolated.
 - **Peaks keep their meaning.** A maximum is the maximum of the samples the
   rollup saw, with its time. A process peak is a 10-second pass rate; a host

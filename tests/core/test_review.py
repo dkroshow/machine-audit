@@ -163,7 +163,7 @@ class ReviewTests(unittest.TestCase):
         self.store.budget.limit_bytes=2_000_000
         for sequence in range(1,17):
             c=Clock(sequence*60*S,sequence*60*S,sequence*60*S)
-            fields=tuple(Field('memory.used',i,'bytes',entity=f'process:{i}',component='memory') for i in range(200))
+            fields=tuple(Field('memory.used',i,'bytes',entity=f'volume:{i}',component='memory') for i in range(200))
             self.store.append([Record(Reading('memory','memory',c,c,fields),'boot','run',sequence,c.wall_ns,c)])
             self.assertLessEqual(self.store.budget.usage()['bytes'],2_000_000)
         with self.store.read() as db:
