@@ -104,7 +104,7 @@ class Collector:
     def _save_error(exc):
         if isinstance(exc, sqlite3.Error):
             return getattr(exc,"sqlite_errorname","sqlite_storage_error").lower()
-        if isinstance(exc, (OSError, RuntimeError)) and str(exc) in {"managed_storage_limit","free_space_margin","checkpoint_pinned_by_reader","sqlite_checkpoint_headroom"}:
+        if isinstance(exc, (OSError, RuntimeError)) and str(exc) in {"managed_storage_limit","free_space_margin","checkpoint_pinned_by_reader","sqlite_checkpoint_headroom","prune_precheck_limit"}:
             return str(exc)
         return type(exc).__name__
 

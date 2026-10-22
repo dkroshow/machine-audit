@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sqlite3
 import threading
+import time
 import zlib
 from .budget import Budget, BudgetExceeded
 from .derive import points, rollups, merge_summaries
@@ -29,6 +30,8 @@ IO_RANK = ("process.diskio_bytesread", "process.diskio_byteswritten")
 HOUR_ONLY_SCOPES = frozenset({"unit_detail"})
 PRUNE_BATCH = 4096
 PRUNE_ROW_PAGES = 16
+PRUNE_PRECHECK_STEPS = 1_000_000
+PRUNE_PRECHECK_SECONDS = 1.0
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs(run_id TEXT PRIMARY KEY, boot_id TEXT NOT NULL, started_ns INTEGER NOT NULL, stopped_ns INTEGER, last_sequence INTEGER NOT NULL DEFAULT 0, last_saved_ns INTEGER);
 CREATE TABLE IF NOT EXISTS readings(run_id TEXT NOT NULL, sequence INTEGER NOT NULL, wall_ns INTEGER NOT NULL, source TEXT NOT NULL, component TEXT NOT NULL, payload BLOB NOT NULL, PRIMARY KEY(run_id,sequence));
@@ -305,57 +308,89 @@ class Store:
             if not self.prune_oldest():
                 break
 
+    @contextmanager
+    def _prune_precheck(self):
+        """Bound only the read-only search; interruption never changes history."""
+        steps=0;expired=False
+        deadline=time.monotonic()+PRUNE_PRECHECK_SECONDS
+        def progress():
+            nonlocal steps,expired
+            steps+=1000
+            expired=steps>PRUNE_PRECHECK_STEPS or time.monotonic()>=deadline
+            return int(expired)
+        self.db.set_progress_handler(progress,1000)
+        try:
+            yield deadline
+        except sqlite3.OperationalError:
+            if expired:raise BudgetExceeded("prune_precheck_limit") from None
+            raise
+        finally:
+            self.db.set_progress_handler(None,0)
+
+    def _prune_candidates(self,deadline):
+        summary_heads=[]
+        preserved=[]
+        row = self.db.execute("SELECT MIN(wall_ns) FROM readings").fetchone()
+        while row[0] is not None:
+            if time.monotonic()>=deadline:raise BudgetExceeded("prune_precheck_limit")
+            kind, start = "raw", row[0]
+            end = (start // MINUTE + 1) * MINUTE
+            table, condition, args = "readings", "wall_ns>=? AND wall_ns<?", (start,end)
+            # Keep every proof condition, but seek recent coverage first.
+            # EXISTS discards ORDER BY; the non-null scalar preserves it.
+            missing = self.db.execute("""SELECT 1 FROM readings r WHERE wall_ns>=? AND wall_ns<? AND
+            (SELECT s.start_ns FROM coverage s WHERE s.run_id=r.run_id AND s.resolution='minute'
+             AND s.sequence_max>=r.sequence AND s.source=r.source AND s.start_ns<=r.wall_ns AND s.end_ns>=r.wall_ns
+             ORDER BY s.start_ns DESC LIMIT 1) IS NULL LIMIT 1""",(start,end)).fetchone()
+            if not missing:break
+            if preserved and preserved[-1][1]==start//MINUTE*MINUTE:
+                preserved[-1]=(preserved[-1][0],end)
+            else:preserved.append((start,end))
+            row=self.db.execute('SELECT MIN(wall_ns) FROM readings WHERE wall_ns>=?',(end,)).fetchone()
+        skipped_raw=bool(preserved)
+        if row[0] is None:
+            # Uncovered windows remain intact; covered raw still comes
+            # before summaries, even when it follows a retained window.
+            for kind,width in WIDTHS.items():
+                summary_heads=self._summary_heads(kind)
+                if summary_heads:
+                    start=min(t for _,t in summary_heads)
+                    end,table=start+width,"summaries"
+                    break
+            else:
+                row=self.db.execute("SELECT MIN(wall_ns) FROM incidents").fetchone()
+                if row[0] is None:return None
+                kind,start,end="incident",row[0],(row[0]//MINUTE+1)*MINUTE
+                table,condition,args="incidents","wall_ns < ?",(end,)
+        if summary_heads:
+            rows=[]
+            for component,first in summary_heads:
+                if first<end:
+                    rows.extend(self.db.execute('''SELECT rowid,length(payload) FROM summaries
+                        WHERE resolution=? AND component=? AND bucket_ns<? LIMIT ?''',
+                        (kind,component,end,PRUNE_BATCH-len(rows))).fetchall())
+                if len(rows)==PRUNE_BATCH:break
+        else:
+            rows=self.db.execute(f"SELECT rowid,length(payload) FROM {table} WHERE {condition} LIMIT ?",(*args,PRUNE_BATCH)).fetchall()
+        page=self.db.execute('PRAGMA page_size').fetchone()[0]
+        preserved=[(start,end) for start,end in preserved if not self.db.execute(
+            "SELECT 1 FROM retention WHERE kind='raw_preserved' AND start_ns<=? AND end_ns>=?",(start,end)).fetchone()]
+        return kind,start,end,table,rows,preserved,skipped_raw,page
+
     def prune_oldest(self):
         with self._mutex:
-            summary_heads=[]
-            preserved=[]
-            row = self.db.execute("SELECT MIN(wall_ns) FROM readings").fetchone()
-            while row[0] is not None:
-                kind, start = "raw", row[0]
-                end = (start // MINUTE + 1) * MINUTE
-                table, condition, args = "readings", "wall_ns>=? AND wall_ns<?", (start,end)
-                # Every raw row must have a committed summary fragment before pruning.
-                missing = self.db.execute("SELECT 1 FROM readings r WHERE wall_ns>=? AND wall_ns<? AND NOT EXISTS (SELECT 1 FROM coverage s WHERE s.run_id=r.run_id AND s.resolution='minute' AND s.sequence_max>=r.sequence AND s.source=r.source AND s.start_ns<=r.wall_ns AND s.end_ns>=r.wall_ns) LIMIT 1",(start,end)).fetchone()
-                if not missing:break
-                if preserved and preserved[-1][1]==start//MINUTE*MINUTE:
-                    preserved[-1]=(preserved[-1][0],end)
-                else:preserved.append((start,end))
-                row=self.db.execute('SELECT MIN(wall_ns) FROM readings WHERE wall_ns>=?',(end,)).fetchone()
-            skipped_raw=bool(preserved)
-            if row[0] is None:
-                # Uncovered windows remain intact; covered raw still comes
-                # before summaries, even when it follows a retained window.
-                for kind,width in WIDTHS.items():
-                    summary_heads=self._summary_heads(kind)
-                    if summary_heads:
-                        start=min(t for _,t in summary_heads)
-                        end,table=start+width,"summaries"
-                        break
-                else:
-                    row=self.db.execute("SELECT MIN(wall_ns) FROM incidents").fetchone()
-                    if row[0] is None:return self._reclaim_free_pages()
-                    kind,start,end="incident",row[0],(row[0]//MINUTE+1)*MINUTE
-                    table,condition,args="incidents","wall_ns < ?",(end,)
-            if summary_heads:
-                rows=[]
-                for component,first in summary_heads:
-                    if first<end:
-                        rows.extend(self.db.execute('''SELECT rowid,length(payload) FROM summaries
-                            WHERE resolution=? AND component=? AND bucket_ns<? LIMIT ?''',
-                            (kind,component,end,PRUNE_BATCH-len(rows))).fetchall())
-                    if len(rows)==PRUNE_BATCH:break
-            else:
-                rows=self.db.execute(f"SELECT rowid,length(payload) FROM {table} WHERE {condition} LIMIT ?",(*args,PRUNE_BATCH)).fetchall()
-            page=self.db.execute('PRAGMA page_size').fetchone()[0]
-            preserved=[(start,end) for start,end in preserved if not self.db.execute(
-                "SELECT 1 FROM retention WHERE kind='raw_preserved' AND start_ns<=? AND end_ns>=?",(start,end)).fetchone()]
+            with self._prune_precheck() as deadline:
+                batch=self._prune_candidates(deadline)
+            if batch is None:return self._reclaim_free_pages()
+            kind,start,end,table,rows,preserved,skipped_raw,page=batch
             while rows:
                 payload_pages=sum((size+page-1)//page for _,size in rows)
                 coverage=[]
                 if kind in ('minute','hour'):
                     predicate="resolution='minute' AND end_ns<?" if kind=='minute' else 'end_ns<?'
-                    coverage=self.db.execute(f'SELECT rowid,length(payload) FROM coverage WHERE {predicate} LIMIT ?',
-                                             (end,len(rows))).fetchall()
+                    with self._prune_precheck():
+                        coverage=self.db.execute(f'SELECT rowid,length(payload) FROM coverage WHERE {predicate} LIMIT ?',
+                                                 (end,len(rows))).fetchall()
                 coverage_pages=sum((size+page-1)//page for _,size in coverage)
                 vacuum_steps=min(PRUNE_BATCH,payload_pages+len(rows))
                 # Bounded delete/index work, overflow pages, then bounded page moves.

@@ -93,6 +93,18 @@ excluded from pruned gaps and export `pruned_ranges`. Summary deletions made
 while raw is retained carry reason `storage_budget_raw_uncovered`. Uncovered
 raw must neither block startup recovery nor cause covered raw to accumulate.
 
+The raw-pruning proof searches the existing coverage-time index backward from
+each reading. It retains the run, source, sequence and time checks; any matching
+fragment proves coverage. The read-only candidate search stops after one million
+SQLite VM instructions or one second, checked every 1,000 instructions and
+between windows. It reports `prune_precheck_limit` without deleting history or
+discarding pending readings. Native I/O must return before SQLite can check its
+progress limit. No additional index or background scan is needed.
+The regression uses 32,768 covered raw rows, an older uncovered row and 33,000
+coverage fragments. Its two coverage proofs use about 4,000 VM instructions;
+the previous query exceeds 100,000. This is synthetic query work, not a live
+machine latency measurement.
+
 Alerts appear in the dashboard and agent output, with status events;
 external notification delivery is outside the current scope.
 

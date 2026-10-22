@@ -2,17 +2,80 @@
 from pathlib import Path
 from contextlib import contextmanager
 import random
+import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from machine_audit.budget import Budget
+from machine_audit.budget import Budget, BudgetExceeded
 from machine_audit.collector import Collector
 from machine_audit.model import Clock, Field, Reading, Record
 from machine_audit.query import Query
-from machine_audit.store import Store, pack_summaries
+from machine_audit.store import Store, MINUTE, pack_summaries
 
 
 class BudgetRecoveryTests(unittest.TestCase):
+    def test_prune_recent_covered_raw_does_not_scan_old_coverage_per_reading(self):
+        # Retained coverage outlives raw. A forward proof search repeated that
+        # old prefix for each reading, stalling flushes before write admission.
+        scratch=Path(__file__).parent/'.tmp';scratch.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as root:
+            store=Store(Path(root)/'readings.sqlite',Budget(root,free_margin_bytes=0))
+            snapshot=sqlite3.connect(':memory:')
+            try:
+                db=store.db;history=33000;count=32768;per_minute=128
+                first=history-count//per_minute
+                db.execute('BEGIN')
+                db.executemany('INSERT INTO coverage VALUES(?,?,?,?,?,?,?,?)',
+                    (('run',(i+1)*per_minute,'minute','source','cpu',i*MINUTE,(i+1)*MINUTE,'{}')
+                     for i in range(1,history+1)))
+                # Keep the oldest uncovered row, then prune a later covered
+                # window rather than prematurely discarding summary history.
+                db.execute("INSERT INTO readings VALUES('run',1,0,'source','cpu',?)",(b'{}',))
+                db.executemany('INSERT INTO readings VALUES(?,?,?,?,?,?)',
+                    (('run',first*per_minute+i+1,(first+i//per_minute)*MINUTE+1,'source','cpu',b'{}')
+                     for i in range(count)))
+                db.execute('COMMIT');db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+                db.backup(snapshot)
+                proofs=[]
+                db.set_trace_callback(lambda sql: proofs.append(sql) if sql.startswith('SELECT 1 FROM readings r') else None)
+                try:self.assertTrue(store.prune_oldest())
+                finally:db.set_trace_callback(None)
+                self.assertEqual(db.execute('SELECT count(*) FROM readings').fetchone()[0],count-per_minute+1)
+                self.assertEqual(db.execute('SELECT wall_ns FROM readings WHERE sequence=1').fetchone()[0],0)
+                self.assertEqual(db.execute("SELECT kind,reason FROM retention ORDER BY rowid").fetchall(),
+                                 [('raw_preserved','missing_summary_coverage'),('raw','storage_budget')])
+                self.assertEqual(db.execute('SELECT count(*) FROM coverage').fetchone()[0],history)
+                # Replay the exact precheck SQL against the pre-prune snapshot,
+                # measuring SQLite work without a machine-speed assertion.
+                steps=0
+                def bounded():
+                    nonlocal steps
+                    steps+=1000
+                    return steps>100_000
+                snapshot.set_progress_handler(bounded,1000)
+                for sql in proofs:snapshot.execute(sql).fetchone()
+                self.assertEqual(len(proofs),2)
+                self.assertLess(steps,100_000)
+
+                collector=Collector(store,(),run_id='new',boot_id='boot')
+                collector.start()
+                clock=Clock((history+1)*MINUTE,(history+1)*MINUTE,(history+1)*MINUTE)
+                collector.ingest(Reading('fresh','memory',clock,clock,(Field('memory.used',1,'bytes'),)))
+                before=db.execute('SELECT count(*) FROM readings').fetchone()[0]
+                with patch.object(store,'_write',side_effect=BudgetExceeded('managed_storage_limit')), \
+                     patch('machine_audit.store.PRUNE_PRECHECK_STEPS',0):
+                    self.assertFalse(collector.flush())
+                self.assertEqual(collector.status()['save_error'],'prune_precheck_limit')
+                self.assertGreater(collector.tail_bytes,0)
+                self.assertEqual(collector.committed,0)
+                self.assertEqual(db.execute('SELECT count(*) FROM readings').fetchone()[0],before)
+                self.assertEqual(db.execute('SELECT count(*) FROM retention').fetchone()[0],2)
+                self.assertTrue(collector.flush())
+                self.assertTrue(collector.close())
+            finally:
+                snapshot.close();store.close()
+
     def test_uncovered_window_does_not_block_later_covered_raw_windows(self):
         scratch=Path(__file__).parent/'.tmp';scratch.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=scratch) as root:
