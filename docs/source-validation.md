@@ -379,11 +379,16 @@ the daily cooldown. Persistent `scanner_full` retries at most daily from the
 last full attempt, stored as `volumes.full_attempt_ns` at preparation. Legacy
 stores leave this unknown until an actual attempt; no history is invented.
 Hourly waits keep the prior failure code visible. The cooldown covers a failed
-full walk only: a volume whose update failed (`update_unreadable`) is updated
-again at the next hourly run from its unchanged bookmark. A changed directory
-that is gone or no longer a directory by walk time does not fail the update:
-its parent is re-listed shallowly, which records the removal or replacement,
-and only an unlistable parent fails the volume. Access checks still run first;
+full walk only (a full attempt later than the last publication); a volume whose
+update failed is updated again at the next hourly run from its unchanged
+bookmark. A changed directory that is gone, or no longer a directory, by scan
+time does not fail the update: its subtree is dropped and its parent re-listed
+shallowly, which records the removal or replacement; a parent gone too is
+recorded by its own ancestor's listing, and only an unlistable parent fails the
+volume. A changed directory that still exists but cannot be read keeps its last
+map, adds the `directory_unreadable` gap and is deferred an hour; it is never
+cleared first, since anything staged beneath a cleared, unwalked directory
+would have no ancestor. Access checks still run first;
 published map times, points and hierarchy change only on successful publication.
 Unreadable root attempts now save their safe reason in `volumes.status`, while
 invariant exceptions already save their specific code there. A partial run at

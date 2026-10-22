@@ -287,9 +287,28 @@ class RootPublicationTests(unittest.TestCase):
         self.assertEqual((result['action'],result['trigger']),('full','deferred_root_due'))
         self.assertEqual(status,'complete')
 
-    def test_directory_replaced_after_event_resolution_relists_its_parent(self):
-        # A changed directory gone by walk time failed the whole update and left the
+    def test_directory_replaced_before_the_scan_relists_its_parent(self):
+        # A changed directory gone by scan time failed the whole update and left the
         # map stale for a day; its parent's listing records the replacement instead.
+        self.scan([self.volume])  # Publish a real tiny map with real inode identities.
+        before = self.published()
+        with sqlite3.connect(self.data/'scanner.sqlite') as db:
+            now = db.execute('SELECT observed_ns FROM volumes').fetchone()[0]+3600*10**9
+        events = SimpleNamespace(uuid=lambda device:'events', current_id=lambda:30,
+                                 replay=lambda device,since:Replay(paths={'/child':False}, up_to=30))
+        child = self.tree/'child'
+        child.rmdir()  # Disposable empty test directory only.
+        child.write_bytes(b'replacement')
+        with patch('machine_audit.scanner.runner.time.time_ns', return_value=now):
+            result, status = self.scan([self.volume], events=events)
+        self.assertEqual((status, result['volumes'][0]['status']), ('complete', 'observed'))
+        after = self.published()
+        self.assertNotEqual(after[1], before[1])
+        with sqlite3.connect(self.data/'scanner.sqlite') as db:
+            generation = db.execute("SELECT generation FROM volumes WHERE id='v'").fetchone()[0]
+            self.assertEqual(db.execute('SELECT count(*) FROM files WHERE generation=?', (generation,)).fetchone()[0], 1)
+
+    def test_directory_replaced_between_check_and_walk_is_a_volume_gap(self):
         self.scan([self.volume])  # Publish a real tiny map with real inode identities.
         before = self.published()
         with sqlite3.connect(self.data/'scanner.sqlite') as db:
@@ -307,15 +326,11 @@ class RootPublicationTests(unittest.TestCase):
         with patch.object(Walker,'walk',replace_before_walk), \
              patch('machine_audit.scanner.runner.time.time_ns', return_value=now):
             result, status = self.scan([self.volume,replace(self.volume,id='other',mount=str(other))], events=events)
-        self.assertEqual(status, 'complete')
-        self.assertEqual(result['volumes'][0]['status'], 'observed')
+        self.assertEqual(status, 'partial')
+        self.assertEqual(result['volumes'][0]['status'], 'update_unreadable')
         self.assertIn('root_not_directory', result['volumes'][0]['gaps'])
         self.assertEqual(result['volumes'][1]['status'], 'observed')
-        after = self.published()
-        self.assertNotEqual(after[1], before[1])
-        with sqlite3.connect(self.data/'scanner.sqlite') as db:
-            generation = db.execute("SELECT generation FROM volumes WHERE id='v'").fetchone()[0]
-            self.assertEqual(db.execute('SELECT count(*) FROM files WHERE generation=?', (generation,)).fetchone()[0], 1)
+        self.assertEqual(self.published(), before)
 
     def test_failed_volume_does_not_prevent_another_empty_root_publication(self):
         before = self.published()

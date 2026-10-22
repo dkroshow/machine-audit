@@ -1,8 +1,10 @@
 """Scanner process orchestration; hourly log replay and weekly full walks."""
 from __future__ import annotations
 from contextlib import contextmanager
+import errno
 import fcntl
 import os
+import stat
 from pathlib import Path
 import sqlite3
 import sys
@@ -88,13 +90,27 @@ def relist(store,walker,policy,volume,now,changes):
         chosen.append(path)
         previous=roots_to_update[path]
         recursive=path in recursive_roots
+        try:
+            present=stat.S_ISDIR(os.stat(path,follow_symlinks=False).st_mode)
+        except OSError as exc:
+            if exc.errno not in (errno.ENOENT,errno.ENOTDIR):
+                # Still there but unreadable: its last map stands and it is retried
+                # next hour. Clearing it first would orphan anything staged beneath.
+                walker.gaps.add('directory_unreadable');store.defer(previous['id'],now+3600*10**9);continue
+            present=False
+        if not present:
+            # Gone, or no longer a directory: drop its subtree; its parent's listing
+            # records the removal or replacement. A parent gone too is recorded by
+            # its own ancestor's listing; only an unlistable parent fails the update.
+            store.clear_subtree(previous['id'])
+            parent=os.path.dirname(path) if path!=volume.mount else None
+            above=store.find_path(parent) if parent else None
+            if not above:complete=False
+            elif not walker.walk(parent,above['parent'],above['kind']=='private',recursive=False):
+                if os.path.lexists(parent):complete=False
+            continue
         if recursive:store.clear_subtree(previous['id'])
-        if walker.walk(path,previous['parent'],previous['kind']=='private',recursive=recursive):continue
-        # The changed directory is gone or is no longer a directory. Its parent's
-        # listing records that; only an unlistable parent fails the update.
-        parent=os.path.dirname(path) if path!=volume.mount else None
-        above=store.find_path(parent) if parent else None
-        if not above or not walker.walk(parent,above['parent'],above['kind']=='private',recursive=False):complete=False
+        if not walker.walk(path,previous['parent'],previous['kind']=='private',recursive=recursive):complete=False
     return complete
 
 
@@ -164,7 +180,11 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                 # CLI --full can retry immediately. The persistent full setting
                 # retries a failed volume at most daily, from its last attempt
                 # rather than its last successful publication.
-                if full and old and old['status'] not in ('observed','partial','invalid','unavailable','update_unreadable'):
+                # Only a failed full walk waits for the daily cooldown; a failed update
+                # (its last full published before the attempt) is tried again hourly.
+                failed_full=old and old['status'] not in ('observed','partial','invalid','unavailable') and \
+                    (old['full_attempt_ns'] is None or old['observed_ns'] is None or old['full_attempt_ns']>old['observed_ns'])
+                if full and failed_full:
                     if force or old['full_attempt_ns'] is None or now-old['full_attempt_ns']>=86400*10**9:
                         action,trigger='full','failed_volume_retry'
                     else:action,trigger='wait','failed_full_retry_cooldown'

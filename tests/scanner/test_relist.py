@@ -1,4 +1,5 @@
 """Event replay must not turn ordinary missing paths into subtree walks."""
+import os
 from pathlib import Path
 from dataclasses import replace
 import tempfile
@@ -59,6 +60,37 @@ class RelistTests(unittest.TestCase):
         self.assertTrue(relist(self.store,walker,self.policy,self.volume,0,[(str(gone),True)]))
         self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=False,lean=True)
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM files WHERE generation=?',(self.store.generation,)).fetchone()[0],1)
+
+    def test_vanished_directory_with_descendants_leaves_no_orphans(self):
+        # A shallow event on a directory removed with its files; the orphaned
+        # descendants broke publication with a missing-ancestor invariant.
+        gone=self.tree/'parent'/'gone';gone.mkdir(parents=True)
+        for i in range(5):(gone/str(i)).write_bytes(b'x')
+        (self.tree/'parent'/'kept').write_bytes(b'kept')
+        self.baseline()
+        for i in range(5):(gone/str(i)).unlink()
+        gone.rmdir()  # Disposable test directory only.
+        walker=Walker(self.volume,self.policy,self.store,Blocks())
+        self.assertTrue(relist(self.store,walker,self.policy,self.volume,0,[(str(gone),False)]))
+        self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=False,lean=True)
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM files WHERE generation=?',(self.store.generation,)).fetchone()[0],1)
+
+    def test_unreadable_changed_directory_keeps_its_map_and_is_deferred(self):
+        # An existing directory whose stat fails (a parent without search permission)
+        # must keep its last map and be retried later; clearing it orphaned new nodes.
+        if os.geteuid()==0:self.skipTest('permission checks need an unprivileged user')
+        locked=self.tree/'locked';inner=locked/'inner';inner.mkdir(parents=True)
+        for i in range(3):(inner/str(i)).write_bytes(b'x')
+        self.baseline()
+        locked.chmod(0)
+        try:
+            walker=Walker(self.volume,self.policy,self.store,Blocks())
+            self.assertTrue(relist(self.store,walker,self.policy,self.volume,0,[(str(inner),True)]))
+        finally:locked.chmod(0o700)
+        self.assertIn('directory_unreadable',walker.gaps)
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM dirty').fetchone()[0],1)
+        self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=False,lean=True)
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM files WHERE generation=?',(self.store.generation,)).fetchone()[0],3)
 
     def test_must_scan_still_recurses(self):
         (self.tree/'parent'/'kept').mkdir(parents=True)
