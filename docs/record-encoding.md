@@ -1,6 +1,6 @@
 # Change-only record encoding (experimental)
 
-Status: proposal. Off by default; the default write path is unchanged.
+Status: proposal, off by default; the default write path is unchanged.
 
 ## Format
 
@@ -52,6 +52,6 @@ Two minutes of 2,000-process passes through the real macOS adapter.
 | Scattered | 14.3 MB/min | 2.84 MB/min | 0.74 MB/min |
 
 Raw falls 74–77%, but raw is 14–20% of growth: total falls about 10–15%.
-Summaries are most of the rest. Five-minute keyframes would cut raw 86–89%
+Five-minute keyframes would cut raw 86–89%
 if pruning removed five-minute windows. A pass costs about 0.3 s CPU to
 encode and 0.2–0.5 s to decode.
