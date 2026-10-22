@@ -11,6 +11,7 @@ import re
 import shlex
 import subprocess
 import sys
+import uuid
 
 from .config import Config
 from .installation import _command, _private_directory, _snapshot, _write
@@ -158,15 +159,31 @@ def install(config: Config, *, json_output=False, yes=False, upgrade=False) -> i
             raise ValueError('existing_installation_requires_reviewed_update')
         if not upgrade and (cli.exists() or cli.is_symlink()):
             raise ValueError('cli_path_already_exists')
-        _snapshot(candidate)  # before any marker moves, so a failed copy leaves the installation as it was
+        release = Path(candidate['release'])
+        if not upgrade and release.exists():
+            raise ValueError('release_already_present_review_before_reusing')
+        # Everything new is written in this run's own staging folder, then renamed into place,
+        # so an interrupted run leaves the installation as it was and a retry is one command.
+        stage = root / ('.prepare-' + uuid.uuid4().hex)
+        stage.mkdir(mode=0o700)
+        _snapshot(dict(candidate, release=str(stage / 'release')))
+        (stage / 'units').mkdir(mode=0o700)
+        for name, text in units.items():
+            _write(stage / 'units' / name, text.encode(), 0o644)
+        command = [candidate['python'], '-I', candidate['release'] + '/machine_audit/bootstrap.py', '--config', candidate['config']]
+        _write(stage / 'cli', ('#!/bin/sh\nexec ' + shlex.join(command) + ' "$@"\n').encode(), 0o700)
+        release.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if release.exists():
+            # Left by an interrupted earlier upgrade: kept, renamed aside.
+            (root / 'retired').mkdir(mode=0o700, exist_ok=True)
+            os.rename(release, root / 'retired' / f'{release.name}.interrupted-{stage.name[-8:]}')
+        os.rename(stage / 'release', release)
         if upgrade:
             retire(root, cli, previous)
-        (root / 'units').mkdir(mode=0o700)
-        for name, text in units.items():
-            _write(root / 'units' / name, text.encode(), 0o644)
+        os.rename(stage / 'units', root / 'units')
         cli.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        command = [candidate['python'], '-I', candidate['release'] + '/machine_audit/bootstrap.py', '--config', candidate['config']]
-        _write(cli, ('#!/bin/sh\nexec ' + shlex.join(command) + ' "$@"\n').encode(), 0o700)
+        os.rename(stage / 'cli', cli)
+        stage.rmdir()  # this run's staging folder, now empty
         config.source_options['install_revision'] = candidate['revision']
         config.save()
         from .startup import StartupStatus

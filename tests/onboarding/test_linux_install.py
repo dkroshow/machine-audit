@@ -90,7 +90,8 @@ class LinuxInstallTests(unittest.TestCase):
 
     def upgrade(self, parent, prepare):
         config = Config(data_dir=str(Path(parent) / 'data'))
-        config.save()
+        if not config.path.exists():
+            config.save()
         root = Path(parent) / 'app'
         candidate = dict(CANDIDATE, release=str(root / 'releases' / 'new5'), root=str(root), config=str(config.path),
                          data=str(config.root), revision='new5', source=parent, cli=str(Path(parent) / 'bin' / 'machine-audit'),
@@ -123,6 +124,26 @@ class LinuxInstallTests(unittest.TestCase):
             self.assertEqual(json.loads((root / 'current.json').read_text())['revision'], 'new5')
             self.assertEqual(sorted(p.name for p in (root / 'releases').iterdir()), ['new5', 'old2', 'old3', 'old4'])
             self.assertEqual([p.name for p in (root / 'retired').iterdir()], ['old1'])  # moved, never deleted
+
+    def test_an_upgrade_interrupted_after_its_snapshot_is_retried_with_one_command(self):
+        # Review: a retry needed releases/<new> and a half-written units/ moved aside by hand.
+        def installed(root, cli):
+            root.mkdir(mode=0o700)
+            (root / 'units').mkdir()
+            (root / 'current.json').write_text(json.dumps({'revision': 'old4'}))
+            (root / 'releases' / 'new5').mkdir(parents=True)  # what an earlier build left behind
+            cli.parent.mkdir()
+            cli.write_text('old cli')
+        with tempfile.TemporaryDirectory() as parent:
+            with patch('machine_audit.installation_linux._write', side_effect=OSError('interrupted')):
+                result, root, cli, _ = self.upgrade(parent, installed)
+            self.assertEqual(result, 2)
+            self.assertEqual((json.loads((root / 'current.json').read_text())['revision'], cli.read_text()), ('old4', 'old cli'))
+            result, root, cli, _ = self.upgrade(parent, lambda root, cli: None)
+            self.assertEqual(result, 0)
+            self.assertEqual(json.loads((root / 'current.json').read_text())['revision'], 'new5')
+            self.assertTrue((root / 'previous-old4.json').is_file() and cli.with_name('machine-audit.old4').is_file())
+            self.assertEqual([p.name.split('.')[0] for p in (root / 'retired').iterdir()], ['new5'])  # kept, renamed aside
 
     def test_upgrade_refuses_when_nothing_is_installed(self):
         with tempfile.TemporaryDirectory() as parent:

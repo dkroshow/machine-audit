@@ -149,7 +149,10 @@ To upgrade, as the operator:
    `current.json` to `previous-<old>.json`, `units/` to `units.<old>/` and the
    wrapper to `machine-audit.<old>`. It keeps the three previous releases and
    moves older ones into `retired/`; nothing is deleted. It refuses when
-   nothing is installed or the revision is already installed.
+   nothing is installed or the revision is already installed. New files are
+   written in a `.prepare-*` folder and renamed into place, so an interrupted
+   run is retried with the same command; a release an earlier interrupted run
+   left in `releases/` is renamed into `retired/`.
 4. Run the two printed root commands, then `start`.
 
 To roll back, rename the markers back and place the old units.
