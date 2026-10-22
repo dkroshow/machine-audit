@@ -1,6 +1,6 @@
 # Change-only record encoding (experimental)
 
-Status: proposal, off by default; the default write path is unchanged.
+Status: not built; see the decision below. Nothing in the code uses this design.
 
 ## Format
 
@@ -22,7 +22,7 @@ wall-clock minute, and whenever a delta would not be smaller. Raw pruning
 removes whole minutes, so it never strands a delta.
 
 The magic bytes are the format flag: old `MR1` stores read unchanged.
-`Store(delta_records=True)` turns the experiment on.
+A `Store(delta_records=True)` flag, off by default, would turn it on.
 
 ## Decoding
 
@@ -54,3 +54,12 @@ Two minutes of 2,000-process passes through the real macOS adapter.
 Raw falls 74–77%, but raw is 14–20% of growth: total falls about 10–15%.
 Five-minute keyframes would cut raw 86–89% if pruning removed five-minute
 windows. A pass costs about 0.3 s CPU to encode and 0.2–0.5 s to decode.
+
+## Decision
+
+A scratch prototype rebuilt every pass exactly. It cut raw readings by
+74–77%, but raw readings were only 14–20% of store growth, so total growth
+would fall about 10–15%. That gain does not yet justify a new storage format
+plus the encode and decode cost, so the owner stopped the work at this note
+(2026-10-22). Revisit after the top-rows summary change lands and growth is
+measured again: raw readings will then be a larger share of growth.
