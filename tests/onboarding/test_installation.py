@@ -1,5 +1,7 @@
 """Exercise permission boundaries without installing jobs or reading user files."""
 import json
+import io
+from contextlib import redirect_stdout
 import os
 from pathlib import Path
 import subprocess
@@ -89,6 +91,17 @@ class InstallationTests(unittest.TestCase):
         with patch('machine_audit.scanner_entry.observe_access') as probe:
             self.assertEqual(main({'config': str(self.config.path)}), 2)
         probe.assert_not_called()
+
+    def test_scheduled_failure_prints_reason_json_and_exits_nonzero(self):
+        self.config.enabled['scanner'] = True
+        self.config.save()
+        result = {'status': 'scan_failed', 'reason': 'invalid_scan_state', 'failure_recorded': True, 'entries': 123}
+        observation = AccessObservation('unchecked', os.getpid(), os.getuid(), 'c'*64, time.time_ns())
+        output = io.StringIO()
+        with patch('machine_audit.scanner_entry.observe_access', return_value=observation), \
+             patch('machine_audit.scanner.runner.run_scan', return_value=result), redirect_stdout(output):
+            self.assertEqual(main({'config': str(self.config.path)}), 1)
+        self.assertEqual(json.loads(output.getvalue()), result)
 
     def test_existing_installation_is_preserved_before_source_copy(self):
         """An unreviewed update must not replace an existing installation or recordings."""

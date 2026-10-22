@@ -50,9 +50,19 @@ inserts are bounded at 8,192 operations or 2 MiB of arguments, charge writes at
 4,096 rows, aggregate updates at 8,192 rows and obsolete-generation deletes at
 4,096 rows. Regressions measure their WAL frames against the declared allowance.
 This factor is a product transaction contract, not a general SQLite guarantee.
-Schema work and scanner publication whose writes are not yet counted retain
-the conservative whole-database fallback; they must not claim these small
-reservations. Arbitrary SQL is not admitted through the counted-write API.
+Scanner sharing and ancestor totals are staged in counted batches. Before
+publication, the scanner counts the base rows to remove, staged rows to copy
+or delete, and upper bounds for point, hierarchy and metadata writes. Each
+replacement counts both deletion and insertion; variable payload is counted
+too. One reservation covers that counted transaction so map rows, original
+points, hierarchy and the volume pointer remain atomic. Its cost follows the
+changed rows, not unrelated retained history. A large update can still exceed
+available headroom; refusal preserves the prior published map.
+An existing complete scanner schema needs no startup write. Schema creation
+counts its fixed metadata and any rows used to build missing indexes. The
+generic budget API retains the whole-database fallback for uncounted callers;
+product scanner writes declare counts. Arbitrary SQL is not admitted through
+the counted-write API.
 
 Startup and flush both retry admission after pruning, without a fixed number
 of history windows. Pruning uses at most 4,096 primary rows and 4,096 related

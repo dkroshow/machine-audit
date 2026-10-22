@@ -160,6 +160,22 @@ class RootPublicationTests(unittest.TestCase):
         with sqlite3.connect(self.data / 'scanner.sqlite') as db:
             self.assertEqual(db.execute('SELECT bookmark FROM volumes').fetchone()[0], 20)
 
+    def test_unexpected_publication_error_ends_run_without_exposing_exception_text(self):
+        before = self.published()
+        for error, reason in ((ValueError('synthetic private path'), 'invalid_scan_state'),
+                              (OSError(5, 'synthetic private path'), 'os_error'),
+                              (TypeError('synthetic private path'), 'unexpected_error')):
+            with self.subTest(reason=reason), patch.object(MapStore, 'finish_volume', side_effect=error):
+                result, status = self.scan([self.volume])
+                self.assertEqual(result['status'], 'scan_failed')
+                self.assertEqual(result['reason'], reason)
+                self.assertEqual(status, reason)
+                self.assertNotIn('synthetic private path', repr(result))
+                # Failure status may change; published evidence cannot.
+                after = self.published()
+                self.assertEqual(after[1:6], before[1:6])
+                self.assertEqual(after[6]['rows'], before[6]['rows'])
+
     def test_failed_volume_does_not_prevent_another_empty_root_publication(self):
         before = self.published()
         empty = self.base / 'empty'

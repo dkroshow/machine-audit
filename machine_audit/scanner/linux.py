@@ -72,7 +72,7 @@ def run_scan(data_dir, *, full=False, grain='files', roots=None, exclusions=(), 
                 if has_root and old['status'] == 'unavailable' and not old['valid']:
                     # Published before Linux maps were observed without a residual; same facts, no re-walk.
                     gaps = sorted(set(json.loads(old['gaps'])) | {'physical_residual_not_computed'})
-                    with store.write():
+                    with store.write(rows=1):
                         store.db.execute("UPDATE volumes SET status='observed',valid=1,gaps=? WHERE id=?", (json.dumps(gaps), volume.id))
                 now = time.time_ns()
                 # A root the service user cannot read is retried on the same schedule as a full walk,
@@ -106,7 +106,7 @@ def run_scan(data_dir, *, full=False, grain='files', roots=None, exclusions=(), 
                         store.buffer.clear()
                         store.buffer_bytes = 0
                         store.observe_unscanned(volume, 'denied', lean=False)
-                        with store.write():  # the attempt, apart from any published map's age
+                        with store.write(rows=1):  # the attempt, apart from any published map's age
                             store.db.execute('INSERT OR REPLACE INTO denied VALUES(?,?)', (volume.id, time.time_ns()))
                         results.append({'volume_id': volume.id, 'status': 'denied', 'action': action})
                         continue
@@ -131,11 +131,11 @@ def run_scan(data_dir, *, full=False, grain='files', roots=None, exclusions=(), 
                 store.progress(processed)
                 results.append({'volume_id': volume.id, 'status': 'observed', 'action': action,
                                 'entries': walker.entries, 'gaps': sorted(walker.gaps)})
-            with store.write():
-                current = {v.id for v, _ in found}
-                for row in store.db.execute('SELECT id FROM volumes'):
-                    if row[0] not in current:
-                        store.db.execute('UPDATE volumes SET mounted=0 WHERE id=?', (row[0],))
+            current = {v.id for v, _ in found}
+            missing = [row[0] for row in store.db.execute('SELECT id FROM volumes') if row[0] not in current]
+            if missing:
+                with store.write(rows=len(missing)):
+                    store.db.executemany('UPDATE volumes SET mounted=0 WHERE id=?', ((identity,) for identity in missing))
             for path in taken:
                 path.unlink()
             run_status = ('partial' if published else 'root_unreadable') if root_failed else 'complete'

@@ -89,7 +89,7 @@ def relist(store,walker,policy,volume,now,changes):
         if recursive:store.clear_subtree(previous['id'])
         walker.walk(path,previous['parent'],previous['kind']=='private',recursive=recursive)
         if previous['id'] in walker.listed:
-            with store.write():store.db.execute('DELETE FROM dirty WHERE volume=? AND id=?',(volume.id,previous['id']))
+            with store.write(rows=1):store.db.execute('DELETE FROM dirty WHERE volume=? AND id=?',(volume.id,previous['id']))
 
 
 def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roots=None, access=None, exclusions=(), force=False):
@@ -114,14 +114,14 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
         events=FSEvents(IOKit())
         policy=Policy(full_disk_access=full_disk_access,exclusions=exclusions,data_root=str(root))
         store=MapStore(root/'scanner.sqlite',budget)
-        store.written_bytes=lambda:native.process(os.getpid()).diskio_byteswritten
-        store.process_start=str(native.process(os.getpid()).proc_start_abstime)
-        store.start('requested_full' if full else 'scheduled')
         processed=0
         root_failed=False
         published=0
         results=[]
         try:
+            store.written_bytes=lambda:native.process(os.getpid()).diskio_byteswritten
+            store.process_start=str(native.process(os.getpid()).proc_start_abstime)
+            store.start('requested_full' if full else 'scheduled')
             volumes=list(fs.volumes())
             if roots:
                 selected=[v for v in volumes if v.mount in roots]
@@ -134,7 +134,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     # Missing proof is not grant loss. Preserve the last committed
                     # map and its history; no lean replacement is constructed.
                     status='access_unverified'
-                    with store.write():store.db.execute('UPDATE volumes SET status=? WHERE id=?',(status,volume.id))
+                    with store.write(rows=1):store.db.execute('UPDATE volumes SET status=? WHERE id=?',(status,volume.id))
                     results.append({'volume_id':volume.id,'status':status})
                     continue
                 if volume.external and not full_disk_access:
@@ -181,27 +181,39 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                            ((os.path.normpath(os.path.join(volume.mount,relative.lstrip('/'))),recursive)
                             for relative,recursive in replay.paths.items()))
                 store.finish_volume(volume,blocks,walker.gaps,full=action=='full',lean=not full_disk_access,
-                    bookmark=bookmark,event_uuid=event_uuid,complete=walker.sharing_complete and not (replay and replay.interrupted))
+                    bookmark=bookmark,event_uuid=event_uuid,complete=walker.sharing_complete and not (replay and replay.interrupted),
+                    event_progress=None if not replay or not replay.paths else bookmark!=old['bookmark'])
                 published+=1
                 processed+=walker.entries
                 store.progress(processed)
                 results.append({'volume_id':volume.id,'status':'observed','action':action,'entries':walker.entries,
                                 'gaps':sorted(walker.gaps)})
-            with store.write():
-                current={v.id for v in volumes}
-                for row in store.db.execute('SELECT id FROM volumes'):
-                    if row[0] not in current:
-                        store.db.execute('UPDATE volumes SET mounted=0 WHERE id=?',(row[0],))
+            current={v.id for v in volumes}
+            missing=[row[0] for row in store.db.execute('SELECT id FROM volumes') if row[0] not in current]
+            if missing:
+                with store.write(rows=len(missing)):
+                    store.db.executemany('UPDATE volumes SET mounted=0 WHERE id=?',((identity,) for identity in missing))
             run_status=('partial' if published else 'root_unreadable') if root_failed else 'complete'
             store.progress(processed,run_status)
             return {'status':run_status if root_failed else 'observed','volumes':results,'entries':processed}
-        except (BudgetExceeded,sqlite3.Error) as exc:
-            # The last published generation is untouched. Persist failure if even
-            # the small pre-existing status page still has write headroom.
+        except Exception as exc:
+            if isinstance(exc,BudgetExceeded):status=reason='budget_blocked'
+            elif isinstance(exc,sqlite3.Error):status=reason='write_failed'
+            else:
+                status='scan_failed'
+                reason='os_error' if isinstance(exc,OSError) else 'invalid_scan_state' if isinstance(exc,ValueError) else 'unexpected_error'
+            # Never print exception text: native/file errors can contain paths.
+            # A separate failure to persist the reason is visible in the JSON.
+            recorded=False
             try:
-                store.mark_failed('budget_blocked' if isinstance(exc,BudgetExceeded) else 'write_failed')
-            except (BudgetExceeded,sqlite3.Error):
+                store.mark_failed(reason)
+            except Exception:
                 pass
-            return {'status':'budget_blocked' if isinstance(exc,BudgetExceeded) else 'write_failed','entries':processed}
+            try:
+                recorded=bool(store.db.execute('SELECT 1 FROM runs WHERE id=? AND status=? AND ended_ns IS NOT NULL',
+                                               (store.run,reason)).fetchone())
+            except Exception:
+                pass
+            return {'status':status,'reason':reason,'failure_recorded':recorded,'entries':store.entries}
         finally:
             store.close()

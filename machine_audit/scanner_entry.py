@@ -57,4 +57,5 @@ def main(installation: dict, *, check_only=False) -> int:
                       full=bool(config.source_options.get('scanner_full', False)),
                       grain=config.source_options.get('scanner_grain', 'files'),
                       exclusions=config.scanner_exclusions)
+    print(json.dumps(result))
     return 0 if result['status'] == 'observed' else 1

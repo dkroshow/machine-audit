@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import resource
+import re
 import sqlite3
 import sys
 import time
@@ -103,10 +104,23 @@ class MapStore:
                 self.db.execute('PRAGMA busy_timeout=5000')
                 self.db.create_function('source_id',1,source_id,deterministic=True)
                 self.db.create_function('inode_key',1,inode_key,deterministic=True)
-            with self.write():
-                for statement in SCHEMA.split(';'):
-                    if statement.strip():self.db.execute(statement)
-                self.db.execute('PRAGMA user_version=2')
+            objects={r[0] for r in self.db.execute('SELECT name FROM sqlite_master')}
+            missing=[(kind,name,table) for kind,name,table in re.findall(
+                r'CREATE (TABLE|INDEX) IF NOT EXISTS (\w+)(?: ON (\w+))?',SCHEMA) if name not in objects]
+            metadata=not existing or not self.db.execute(
+                "SELECT 1 FROM map_meta WHERE key='next_generation'").fetchone()
+            if missing or metadata:
+                # Existing installs do no schema writes. A missing index counts
+                # the rows it will index; empty-schema metadata has fixed size.
+                rows=2*len(SCHEMA.split(';'));payload=len(SCHEMA.encode())
+                for kind,_,table in missing:
+                    if kind=='INDEX' and table in objects:
+                        count,size=self._row_size(table)
+                        rows+=count;payload+=size
+                with self.write(rows=rows,payload_bytes=payload):
+                    for statement in SCHEMA.split(';'):
+                        if statement.strip():self.db.execute(statement)
+                    self.db.execute('PRAGMA user_version=2')
         except BaseException:
             if self.db is not None:self.db.close()
             raise
@@ -116,8 +130,6 @@ class MapStore:
 
     @contextmanager
     def write(self,growth=None,*,rows=None,payload_bytes=0):
-        # Counted batches use their row/payload contract. Uncounted publication
-        # retains the conservative whole-DB bound until its writes are bounded.
         with self.budget.sqlite_write(self.db,self.path,max_growth_bytes=growth,rows=rows,payload_bytes=payload_bytes):
             self.db.execute('BEGIN IMMEDIATE')
             try:
@@ -126,6 +138,13 @@ class MapStore:
             except BaseException:
                 if self.db.in_transaction:self.db.execute('ROLLBACK')
                 raise
+
+    def _row_size(self,table,where='1',args=()):
+        """Count rows and variable payload before their bounded mutation."""
+        columns=[r['name'] for r in self.db.execute(f'PRAGMA table_info({table})')]
+        size='+'.join(f"CASE WHEN typeof({c}) IN ('text','blob') THEN length(CAST({c} AS BLOB)) ELSE 0 END" for c in columns)
+        row=self.db.execute(f'SELECT count(*),coalesce(sum({size}),0) FROM {table} WHERE {where}',args).fetchone()
+        return tuple(row)
 
     def start(self,kind):
         self.run=uuid.uuid4().hex;now=time.time_ns()
@@ -142,10 +161,12 @@ class MapStore:
         if status=='running' and now-self.last_progress<5:return
         self.last_progress=now
         r=resource.getrusage(resource.RUSAGE_SELF)
+        try:written=self.written_bytes() if hasattr(self,'written_bytes') else None
+        except OSError:written=None
         with self.write(rows=1):
             self.db.execute('UPDATE runs SET updated_ns=?,entries=?,cpu_ns=?,peak_rss_bytes=?,written_bytes=?,status=?,ended_ns=? WHERE id=?',
                 (time.time_ns(),self.entries,time.process_time_ns(),int(r.ru_maxrss*(1 if sys.platform=='darwin' else 1024)),
-                 self.written_bytes() if hasattr(self,'written_bytes') else None,status,
+                 written,status,
                  None if status=='running' else time.time_ns(),self.run))
 
     def prepare(self,volume,full=True,lean=True):
@@ -373,14 +394,13 @@ class MapStore:
         pending=[]
         def save_charges():
             if not pending:return
-            if full:
-                # Only this unpublished generation changes. Bound each write;
-                # no transaction or reservation spans the stream lookup loop.
-                with self.write(growth=16*1024**2,rows=len(pending)):
-                    self.db.executemany('INSERT OR REPLACE INTO charges VALUES(?,?,?,?,?,?,?,?)',pending)
-                self.progress()
-            else:
-                self.db.executemany('INSERT OR REPLACE INTO charges VALUES(?,?,?,?,?,?,?,?)',pending)
+            # Charges belong to the unpublished generation, including updates.
+            # No reservation spans the stream lookup loop.
+            with self.write(growth=16*1024**2,rows=len(pending),payload_bytes=sum(
+                    len(v.encode()) for _,args in pending for v in args if isinstance(v,str))):
+                for query,rows in groupby(pending,key=lambda row:row[0]):
+                    self.db.executemany(query,(args for _,args in rows))
+            self.progress()
             pending.clear()
         if full:
             streams=[r[0] for r in self.db.execute('SELECT DISTINCT stream FROM holders WHERE generation=? AND volume=?',(self.generation,self.vid))]
@@ -395,14 +415,16 @@ class MapStore:
             holders=list(self._rows('holders','stream=?',(stream,)))
             affected.update(h['dir'] for h in holders)
             if not holders:
-                self.db.execute('INSERT OR IGNORE INTO removed_charges VALUES(?,?,?)',(self.generation,self.vid,stream));continue
-            owner=min(holders,key=lambda h:(str(h['file_id']),str(h['dir'])))
-            same=old and all(old[k]==owner[k] for k in ('allocated','private','partial'))
-            if not full and same:amount=old['charge']
-            elif not full and owner['partial']:
-                amount=owner['private'] or 0;complete=False
-            else:amount=charges.get(int(source_id(stream)),owner['private'] or 0 if owner['partial'] else owner['allocated'])
-            pending.append((self.generation,self.vid,stream,amount,owner['allocated'],owner['private'],owner['partial'],owner['dir']))
+                pending.append(('INSERT OR IGNORE INTO removed_charges VALUES(?,?,?)',(self.generation,self.vid,stream)))
+            else:
+                owner=min(holders,key=lambda h:(str(h['file_id']),str(h['dir'])))
+                same=old and all(old[k]==owner[k] for k in ('allocated','private','partial'))
+                if not full and same:amount=old['charge']
+                elif not full and owner['partial']:
+                    amount=owner['private'] or 0;complete=False
+                else:amount=charges.get(int(source_id(stream)),owner['private'] or 0 if owner['partial'] else owner['allocated'])
+                pending.append(('INSERT OR REPLACE INTO charges VALUES(?,?,?,?,?,?,?,?)',
+                    (self.generation,self.vid,stream,amount,owner['allocated'],owner['private'],owner['partial'],owner['dir'])))
             if len(pending)>=4096:save_charges()
         save_charges()
         return affected,complete
@@ -484,58 +506,91 @@ class MapStore:
             value=depths.get(current,-1)
             for item in reversed(chain):value+=1;depths[item]=value
             return depths[key]
-        for identity in sorted(work,key=depth,reverse=True):
-            node=self._node(identity)
-            if node is None:continue
-            listed,uses=self._own(node,homes)
-            for child in self._rows('nodes','parent=?',(identity,)):
-                listed+=child['listed'];uses+=child['uses']
-            updated=list(node);updated[0]=self.generation;updated[8]=listed;updated[9]=uses
-            self.db.execute('INSERT OR REPLACE INTO nodes VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',updated)
-            self.changed.add(identity)
+        for _,level in groupby(sorted(work,key=depth,reverse=True),key=depth):
+            for identity in level:
+                node=self._node(identity)
+                if node is None:continue
+                listed,uses=self._own(node,homes)
+                for child in self._rows('nodes','parent=?',(identity,)):
+                    listed+=child['listed'];uses+=child['uses']
+                updated=list(node);updated[0]=self.generation;updated[8]=listed;updated[9]=uses
+                self._queue('INSERT OR REPLACE INTO nodes VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',updated)
+                self.changed.add(identity)
+            # Parents must see the committed staged totals of their children.
+            self.flush()
 
-    def _publish_changes(self):
-        if self.base_gen is None:return
+    def _publication_changes(self):
+        """SQL and counted work for the one atomic switch of changed rows."""
+        plan=[]
+        if self.base_gen is None:return plan
+        def remove(table,where,args):
+            count,payload=self._row_size(table,where,args)
+            plan.append((f'DELETE FROM {table} WHERE {where}',args,count,payload))
         for table,key in (('files','parent'),('holders','dir')):
-            self.db.execute(f'''DELETE FROM {table} WHERE generation=? AND volume=? AND {key} IN
+            remove(table,f'''generation=? AND volume=? AND {key} IN
                 (SELECT id FROM reset_dirs WHERE generation=? AND volume=? UNION SELECT id FROM removed WHERE generation=? AND volume=?)''',
                 (self.base_gen,self.vid,self.generation,self.vid,self.generation,self.vid))
         for table,key in (('nodes','id'),('listings','id'),('charges','stream')):
             removed='removed_charges' if table=='charges' else 'removed'
-            self.db.execute(f'DELETE FROM {table} WHERE generation=? AND volume=? AND {key} IN (SELECT id FROM {removed} WHERE generation=? AND volume=?)',
+            remove(table,f'generation=? AND volume=? AND {key} IN (SELECT id FROM {removed} WHERE generation=? AND volume=?)',
                 (self.base_gen,self.vid,self.generation,self.vid))
         for table in MAP_TABLES:
             key={'nodes':'id','files':'parent','holders':'dir','listings':'id','charges':'stream'}[table]
             removed='removed_charges' if table=='charges' else 'removed'
-            self.db.execute(f'DELETE FROM {table} WHERE generation=? AND volume=? AND {key} IN (SELECT id FROM {removed} WHERE generation=? AND volume=?)',
+            remove(table,f'generation=? AND volume=? AND {key} IN (SELECT id FROM {removed} WHERE generation=? AND volume=?)',
                             (self.generation,self.vid,self.generation,self.vid))
             columns=[r[1] for r in self.db.execute(f'PRAGMA table_info({table})')]
             names=','.join(columns[1:])
-            self.db.execute(f'INSERT OR REPLACE INTO {table} SELECT ?,{names} FROM {table} WHERE generation=? AND volume=?',
-                            (self.base_gen,self.generation,self.vid))
-            self.db.execute(f'DELETE FROM {table} WHERE generation=? AND volume=?',(self.generation,self.vid))
+            count,payload=self._row_size(table,'generation=? AND volume=?',(self.generation,self.vid))
+            # REPLACE can delete a prior row as well as insert its replacement.
+            plan.append((f'INSERT OR REPLACE INTO {table} SELECT ?,{names} FROM {table} WHERE generation=? AND volume=?',
+                         (self.base_gen,self.generation,self.vid),2*count,2*payload))
+            remove(table,'generation=? AND volume=?',(self.generation,self.vid))
+        return plan
 
-    def finish_volume(self,volume,blocks,gaps,*,full,lean,bookmark=None,event_uuid=None,complete=True,physical=True):
+    def finish_volume(self,volume,blocks,gaps,*,full,lean,bookmark=None,event_uuid=None,complete=True,physical=True,event_progress=None):
         self.flush();old=self.db.execute('SELECT * FROM volumes WHERE id=?',(self.volume,)).fetchone()
+        affected,sharing_complete=self._sharing(blocks,full)
         if full:
-            affected,sharing_complete=self._sharing(blocks,True)
             self._aggregate_full(affected)
-        with self.write():
-            if not full:
-                affected,sharing_complete=self._sharing(blocks,False)
-                self._aggregate(affected)
-            if not sharing_complete:gaps=set(gaps)|{'partial_stream_needs_full_map'}
-            complete=complete and sharing_complete
-            roots=list(self._rows('nodes','parent IS NULL'))
-            total=sum(r['uses'] for r in roots) if roots else None
-            if physical:
-                result=reconcile(volume.used,total,supported=volume.fs in ('apfs','hfs'),complete=complete,
-                                 previously_invalid=bool(old['generation'] and not old['valid']),full=full)
-            else:
-                # No extents provider (Linux): uses charge hard links once; no residual is claimed.
-                result={'valid':True,'uses':total,'not_attributed':None,'status':'observed' if complete else 'partial'}
-                gaps=set(gaps)|{'physical_residual_not_computed'}
-            self._publish_changes()
+        else:self._aggregate(affected)
+        if not sharing_complete:gaps=set(gaps)|{'partial_stream_needs_full_map'}
+        complete=complete and sharing_complete
+        roots=list(self._rows('nodes','parent IS NULL'))
+        total=sum(r['uses'] for r in roots) if roots else None
+        if physical:
+            result=reconcile(volume.used,total,supported=volume.fs in ('apfs','hfs'),complete=complete,
+                             previously_invalid=bool(old['generation'] and not old['valid']),full=full)
+        else:
+            # No extents provider (Linux): uses charge hard links once; no residual is claimed.
+            result={'valid':True,'uses':total,'not_attributed':None,'status':'observed' if complete else 'partial'}
+            gaps=set(gaps)|{'physical_residual_not_computed'}
+        plan=self._publication_changes()
+        metric='uses' if result['valid'] else 'listed'
+        where='generation=? AND volume=?'
+        params=(self.generation,self.vid)
+        if full:
+            where+=f' AND ({metric}>=1000000000 OR EXISTS(SELECT 1 FROM tracked WHERE volume=? AND id=source_id(nodes.id)))'
+            params+=self.volume,
+        candidates,payload=self._row_size('nodes',where,params)
+        tracked,tracked_payload=self._row_size('tracked','volume=?',(self.volume,))
+        # Points: two writes per candidate, one terminal point per old identity.
+        # Hierarchy: at most old+new identities, plus one epoch. Count deleted
+        # stage markers and both sides of every REPLACE in the map switch.
+        rows=sum(p[2] for p in plan)+3*candidates+2*tracked+5
+        payload=3*payload+3*tracked_payload+sum(p[3] for p in plan)
+        payload+=(candidates+tracked)*(len(self.volume.encode())+64)  # volume and hierarchy version
+        payload+=self.db.execute('''SELECT coalesce(sum(length(CAST(p.label AS BLOB))),0)
+            FROM tracked t JOIN points p ON p.volume=t.volume AND p.id=t.id
+            AND p.observed_ns=(SELECT max(q.observed_ns) FROM points q WHERE q.volume=t.volume AND q.id=t.id)
+            WHERE t.volume=?''',(self.volume,)).fetchone()[0]*2
+        gap_text=json.dumps(sorted(set(gaps)))
+        payload+=len((volume.label+volume.mount+gap_text+(event_uuid or '')).encode())
+        if self.base_gen is not None:
+            rows+=sum(self._row_size(table,'generation=?',(self.generation,))[0] for table in STAGE_TABLES)
+        no_progress=0 if full or event_progress is True else old['no_progress']+1 if event_progress is False else old['no_progress']
+        with self.write(rows=rows,payload_bytes=payload):
+            for sql,args,_,_ in plan:self.db.execute(sql,args)
             published=self.base_gen if self.base_gen is not None else self.generation
             now=time.time_ns()
             self._points(published,now,result['valid'],full)
@@ -543,8 +598,8 @@ class MapStore:
             self.db.execute('''UPDATE volumes SET label=?,mount=?,generation=?,observed_ns=?,full_ns=?,volume_used=?,capacity=?,free=?,available=?,
                 valid=?,status=?,lean=?,bookmark=?,no_progress=?,event_uuid=?,gaps=?,mounted=1 WHERE id=?''',
                 (volume.label,volume.mount,published,now,now if full else old['full_ns'],volume.used,volume.capacity,volume.free,volume.available,
-                 int(result['valid']),result['status'],int(lean),bookmark,old['no_progress']+1 if bookmark==old['bookmark'] else 0,
-                 event_uuid,json.dumps(sorted(set(gaps))),self.volume))
+                 int(result['valid']),result['status'],int(lean),bookmark,no_progress,
+                 event_uuid,gap_text,self.volume))
             if full and old['generation'] is not None:
                 self.db.execute("UPDATE generations SET status='retired' WHERE id=?",(old['generation'],))
             self.db.execute("UPDATE generations SET status='published' WHERE id=?",(published,))
@@ -582,8 +637,10 @@ class MapStore:
 
     def mark_failed(self,status):
         self.buffer.clear();self.buffer_bytes=0;self.pending_resets.clear()
-        with self.write(rows=1):self.db.execute('UPDATE volumes SET status=? WHERE id=?',(status,self.volume))
+        # End the run before attempting a separate volume-status write. A
+        # failure of that second admission must not leave the run "running".
         self.progress(status=status)
+        with self.write(rows=1):self.db.execute('UPDATE volumes SET status=? WHERE id=?',(status,self.volume))
 
     def close(self):self.db.close()
 
