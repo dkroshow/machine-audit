@@ -2,6 +2,7 @@
 from __future__ import annotations
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
+import heapq
 import json
 import os
 from pathlib import Path
@@ -13,7 +14,16 @@ from .derive import points, rollups, merge_summaries
 from .model import Record, field_component, is_series
 
 MINUTE = 60_000_000_000
+QUARTER = 15 * MINUTE
 HOUR = 60 * MINUTE
+# Stored summary resolutions, finest first; pruning removes them in this order.
+WIDTHS = {"minute": MINUTE, "15-minute": QUARTER, "hour": HOUR}
+# Minute rows for processes and programs keep only each minute's top consumers: per-instance
+# minute rows were half of a 2,000-process Mac's store growth (development.md). 25 each by CPU
+# time, memory and disk bytes names a minute's heavy users; 15-minute and hour rows keep everyone.
+TOP_N = 25
+MEMORY_RANK = ("process.phys_footprint", "process.resident_size")  # Mac footprint, else Linux resident set
+IO_RANK = ("process.diskio_bytesread", "process.diskio_byteswritten")
 # Per-scope summary resolution (storage-approach.md): these scopes keep hour summaries only.
 # Raw readings still answer recent intervals.
 HOUR_ONLY_SCOPES = frozenset({"unit_detail"})
@@ -49,6 +59,32 @@ def pack_summaries(rows):
         keys=tuple(sorted(row))
         groups.setdefault(keys,[]).append([row[k] for k in keys])
     return zlib.compress(encode([2, [[keys,values] for keys,values in groups.items()]]).encode(), 1)
+
+
+def ranked(component, entity):
+    """Process and program rows whose minute grain is limited to top consumers."""
+    return component != "self" and entity.startswith(("process:", "program:"))
+
+
+def top_consumers(rows):
+    """The union of the top N processes and the top N programs by each measure."""
+    cpu, io, memory = defaultdict(float), defaultdict(float), {}
+    for row in rows:
+        signal, entity = row["signal"], row["entity"]
+        if signal == "process.cpu" and row["total"] is not None:
+            cpu[entity] += row["total"]*row["scale"]
+        elif signal in IO_RANK and row["total"] is not None:
+            io[entity] += row["total"]
+        elif signal in MEMORY_RANK and row["max"] is not None:
+            key = (-MEMORY_RANK.index(signal), row["max"])
+            memory[entity] = max(memory.get(entity, key), key)
+    measures = (cpu, {entity: value for entity, (_, value) in memory.items()}, io)
+    keep = set()
+    for measure in measures:
+        for kind in ("process:", "program:"):
+            keep.update(heapq.nlargest(TOP_N, (e for e, v in measure.items() if v > 0 and e.startswith(kind)),
+                                       key=lambda e: (measure[e], e)))
+    return keep
 
 
 def unpack_summaries(payload):
@@ -139,18 +175,23 @@ class Store:
             raw = [(r, r.packed) for r in records]
             derived = points(records, self._previous(records))
             summaries = defaultdict(list)
-            hours=defaultdict(list)
+            minutes=defaultdict(list)
+            own=set()
+            coarser=defaultdict(list)
             for bucket,row in rollups(derived,MINUTE):
                 if row["scope"] not in HOUR_ONLY_SCOPES:
-                    summaries[("minute",bucket,row["source"],row["component"],row["entity"])].append(row)
-                hours[(bucket//HOUR*HOUR,row["source"],row["component"],row["entity"],row["signal"],row["unit"],row["scope"],row["kind"],row["scale"])].append(row)
-            for key,rows in hours.items():
-                bucket,source,component,entity,*_=key
-                summaries[("hour",bucket,source,component,entity)].append(merge_summaries(rows) if len(rows)>1 else rows[0])
+                    if ranked(row["component"],row["entity"]):minutes[bucket].append(row)
+                    else:summaries[("minute",bucket,row["source"],row["component"],row["entity"])].append(row)
+                    if row["scope"]=="managed_process":own.add(row["entity"])
+                    coarser[("15-minute",bucket//QUARTER*QUARTER,row["source"],row["component"],row["entity"],row["signal"],row["unit"],row["scope"],row["kind"],row["scale"])].append(row)
+                coarser[("hour",bucket//HOUR*HOUR,row["source"],row["component"],row["entity"],row["signal"],row["unit"],row["scope"],row["kind"],row["scale"])].append(row)
+            for key,rows in coarser.items():
+                summaries[key[:5]].append(merge_summaries(rows) if len(rows)>1 else rows[0])
             self.maintain()
+            deletes=self._top_minutes(records[0].run_id,minutes,own,summaries)
             while True:
                 try:
-                    self._write(records,raw,summaries,commit_lock,on_commit)
+                    self._write(records,raw,summaries,deletes,commit_lock,on_commit)
                     return
                 except (sqlite3.OperationalError,BudgetExceeded) as exc:
                     if not self._capacity_error(exc) or not self.prune_oldest():raise
@@ -159,7 +200,37 @@ class Store:
     def _capacity_error(exc):
         return getattr(exc,"sqlite_errorcode",None)==sqlite3.SQLITE_FULL or str(exc) in {"managed_storage_limit","sqlite_checkpoint_headroom"}
 
-    def _write(self,records,raw,summaries,commit_lock,on_commit):
+    def _top_minutes(self,run_id,minutes,own,summaries):
+        """Add each minute's top consumers to summaries; return the stored rows to delete.
+
+        A minute is ranked once it is complete, so its rows always hold the whole
+        minute. Until then the run's newest minute keeps every row. Later data for
+        a ranked minute extends only the rows it kept."""
+        if not minutes:return []
+        newest=max(minutes)
+        stored=self.db.execute("""SELECT bucket_ns FROM summaries WHERE run_id=? AND resolution='minute' AND bucket_ns>=?
+            AND component!='self' AND (entity LIKE 'process:%' OR entity LIKE 'program:%') ORDER BY bucket_ns DESC LIMIT 1""",
+            (run_id,min(minutes)-HOUR)).fetchone()
+        pending=stored[0] if stored else None
+        deletes=[]
+        for bucket in sorted(set(minutes)|({pending} if pending is not None and pending<newest else set())):
+            rows=minutes.get(bucket,[])
+            if pending is not None and bucket<pending:
+                keep={entity for entity, in self.db.execute("SELECT entity FROM summaries WHERE run_id=? AND resolution='minute' AND bucket_ns=?",(run_id,bucket))}
+            elif bucket==newest:
+                keep={row["entity"] for row in rows}
+            else:
+                previous=[]
+                if bucket==pending:
+                    previous=self.db.execute("SELECT id,component,entity,length(payload),payload FROM summaries WHERE run_id=? AND resolution='minute' AND bucket_ns=? AND (entity LIKE 'process:%' OR entity LIKE 'program:%')",(run_id,bucket)).fetchall()
+                keep=top_consumers(rows+[row for _,component,entity,_,payload in previous if ranked(component,entity) for row in unpack_summaries(payload)])
+                keep|=own|{entity for _,component,entity,_,_ in previous if component=="self"}
+                deletes.extend((identifier,size) for identifier,component,entity,size,_ in previous if ranked(component,entity) and entity not in keep)
+            for row in rows:
+                if row["entity"] in keep:summaries[("minute",bucket,row["source"],row["component"],row["entity"])].append(row)
+        return deletes
+
+    def _write(self,records,raw,summaries,deletes,commit_lock,on_commit):
         first,last=records[0],records[-1]
         prepared=[];replaced_payload=0
         for (resolution,bucket,source,component,entity),rows in summaries.items():
@@ -175,11 +246,11 @@ class Store:
             prepared.append((first.run_id,lower,last.sequence,resolution,bucket,source,component,entity,pack_summaries(list(merged.values()))))
         components=sum(len({r.reading.component,*(field_component(f,r.reading.component) for f in r.reading.fields)}) for r in records)
         catalog={(row["source"],row["signal"],row["component"],row["kind"],row["unit"],row["scope"],row["scale"]) for rows in summaries.values() for row in rows}
-        count=2+len(records)+3*components+len(prepared)+len(catalog)+len({r.reading.source for r in records})+sum(any(f.kind=='event' for f in r.reading.fields) for r in records)
+        count=2+len(records)+3*components+len(prepared)+len(deletes)+len(catalog)+len({r.reading.source for r in records})+sum(any(f.kind=='event' for f in r.reading.fields) for r in records)
         for source in {r.reading.source for r in records}:
             old=self.db.execute('SELECT length(payload) FROM baselines WHERE source=?',(source,)).fetchone()
             if old:replaced_payload+=old[0]
-        payload=3*sum(len(p) for _,p in raw)+sum(len(row[-1]) for row in prepared)+replaced_payload
+        payload=3*sum(len(p) for _,p in raw)+sum(len(row[-1]) for row in prepared)+sum(size for _,size in deletes)+replaced_payload
         with self.budget.sqlite_write(self.db,self.path,rows=count,payload_bytes=payload):
             self.db.execute("BEGIN IMMEDIATE")
             try:
@@ -191,6 +262,7 @@ class Store:
                     raise ValueError("sequence already committed")
                 self.db.executemany("INSERT INTO readings VALUES(?,?,?,?,?,?)",[(r.run_id,r.sequence,r.reading.end.wall_ns,r.reading.source,r.reading.component,p) for r,p in raw])
                 self.db.executemany("INSERT INTO reading_components VALUES(?,?,?,?)",[(r.run_id,r.sequence,c,int(not r.reading.fields or any(field_component(f,r.reading.component)==c and is_series(c,f.entity,f.scope) for f in r.reading.fields))) for r,_ in raw for c in {r.reading.component,*(field_component(f,r.reading.component) for f in r.reading.fields)}])
+                self.db.executemany("DELETE FROM summaries WHERE id=?",((identifier,) for identifier,_ in deletes))
                 self.db.executemany("INSERT INTO summaries(run_id,sequence_min,sequence_max,resolution,bucket_ns,source,component,entity,payload) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,resolution,bucket_ns,source,component,entity) DO UPDATE SET sequence_min=excluded.sequence_min,sequence_max=excluded.sequence_max,payload=excluded.payload",prepared)
                 self.db.executemany("INSERT OR REPLACE INTO signal_catalog VALUES(?,?,?,?,?,?,?)",sorted(catalog))
                 latest = {}
@@ -223,7 +295,7 @@ class Store:
                 raise
 
     def maintain(self, required_bytes=0):
-        """Prune raw, then minute, hour and finally rare incident history.
+        """Prune raw, then minute, 15-minute, hour and finally rare incident history.
 
         Work starts well before the cap; if reserve cannot fit, fail without
         removing a file or discarding the collector's pending batch.
@@ -253,22 +325,17 @@ class Store:
             if row[0] is None:
                 # Uncovered windows remain intact; covered raw still comes
                 # before summaries, even when it follows a retained window.
-                summary_heads=self._summary_heads('minute')
-                if summary_heads:
-                    start=min(t for _,t in summary_heads)
-                    kind, end = "minute", start+MINUTE
-                    table, condition, args = "summaries", "resolution='minute' AND bucket_ns < ?", (end,)
-                else:
-                    summary_heads=self._summary_heads('hour')
+                for kind,width in WIDTHS.items():
+                    summary_heads=self._summary_heads(kind)
                     if summary_heads:
                         start=min(t for _,t in summary_heads)
-                        kind,end="hour",start+HOUR
-                        table,condition,args="summaries","resolution='hour' AND bucket_ns < ?",(end,)
-                    else:
-                        row=self.db.execute("SELECT MIN(wall_ns) FROM incidents").fetchone()
-                        if row[0] is None:return self._reclaim_free_pages()
-                        kind,start,end="incident",row[0],(row[0]//MINUTE+1)*MINUTE
-                        table,condition,args="incidents","wall_ns < ?",(end,)
+                        end,table=start+width,"summaries"
+                        break
+                else:
+                    row=self.db.execute("SELECT MIN(wall_ns) FROM incidents").fetchone()
+                    if row[0] is None:return self._reclaim_free_pages()
+                    kind,start,end="incident",row[0],(row[0]//MINUTE+1)*MINUTE
+                    table,condition,args="incidents","wall_ns < ?",(end,)
             if summary_heads:
                 rows=[]
                 for component,first in summary_heads:

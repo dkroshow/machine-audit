@@ -78,7 +78,7 @@ class CoreTests(unittest.TestCase):
                                                           Field("memory.free",2,"bytes")))
         self.store.append([Record(reading,"boot","run",1,c.wall_ns,c)])
         rows=set(self.store.db.execute("SELECT resolution,entity FROM summaries"))
-        self.assertEqual(rows,{("hour","cgroup:abc:1"),("minute","host"),("hour","host")})
+        self.assertEqual(rows,{("hour","cgroup:abc:1"),("minute","host"),("15-minute","host"),("hour","host")})
 
     def test_raw_counter_reset_and_pid_reuse_do_not_become_usage(self):
         a=process_identity(7,1,"boot");b=process_identity(7,2,"boot")
@@ -460,15 +460,22 @@ class CoreTests(unittest.TestCase):
         self.assertFalse(Query(self.store).who(0,10*S,component="memory")["accounting"]["additive"])
 
     def test_pruning_retires_routine_hours_before_incident_evidence(self):
+        # Order: raw, minute, 15-minute, hour, then incidents; each step leaves the coarser
+        # rows, and series answers from the finest that remains.
         c=Clock(10*S,10*S,10*S)
         event=Record(Reading("events","heat",c,c,(Field("heat.state","hot","state","event"),)),"boot","run",2,c.wall_ns,c)
         self.store.append([record(0,0,1),event])
-        self.assertTrue(self.store.prune_oldest())
-        self.assertTrue(self.store.prune_oldest())
-        self.assertTrue(self.store.prune_oldest())
+        def left():
+            with self.store.read() as db:
+                return (db.execute("SELECT count(*) FROM readings").fetchone()[0],
+                        {r for r, in db.execute("SELECT DISTINCT resolution FROM summaries")},
+                        Query(self.store).series(0,3600*S)["resolution"])
+        for expected in [(0,{"minute","15-minute","hour"},"minute"),(0,{"15-minute","hour"},"15-minute"),(0,{"hour"},"hour"),(0,set(),"hour")]:
+            self.assertTrue(self.store.prune_oldest())
+            self.assertEqual(left(),expected)
         with self.store.read() as db:
-            self.assertEqual(db.execute("SELECT count(*) FROM summaries").fetchone()[0],0)
             self.assertEqual(db.execute("SELECT count(*) FROM incidents").fetchone()[0],1)
+            self.assertEqual([r for r, in db.execute("SELECT kind FROM retention ORDER BY rowid")],["raw","minute","15-minute","hour"])
         self.assertTrue(self.store.prune_oldest())
 
 

@@ -8,8 +8,9 @@ import threading
 import math
 import heapq
 from dataclasses import replace
+from itertools import chain, groupby
 from .derive import points, rollups, summarize, merge_summaries, GOOD, BUSY
-from .store import MINUTE, HOUR, unpack_summaries
+from .store import MINUTE, QUARTER, HOUR, WIDTHS, unpack_summaries
 from .model import Record, field_component, is_process_evidence, is_series
 
 # Without a named signal, each workload ranks once, by its component total: CPU time, written
@@ -161,7 +162,7 @@ class Query:
 
     def _iter_summaries(self,db,captured,start_ns,end_ns,resolution,signals=None,
                         component=None,program_only=False,series_only=False,spans=None):
-        width = MINUTE if resolution == "minute" else HOUR
+        width = WIDTHS[resolution]
         spans = spans or [(resolution,start_ns//width*width,end_ns)]
         args=[];parts=[]
         for res,lo,hi in spans:
@@ -191,7 +192,8 @@ class Query:
                 if signals and row["signal"] not in signals:continue
                 if row["start_ns"] >= end_ns or row["end_ns"] < start_ns:continue
                 row["summary_bucket_start_ns"]=bucket
-                row["summary_bucket_end_ns"]=bucket+(MINUTE if res=="minute" else HOUR)
+                row["summary_bucket_end_ns"]=bucket+WIDTHS[res]
+                row["summary_resolution"]=res
                 row["partial_boundary"]=row["start_ns"]<start_ns or row["end_ns"]>end_ns
                 yield row
 
@@ -206,34 +208,61 @@ class Query:
             raw,more=self._raw(db,captured,max(start_ns,min(r.end_ns for r in captured["tail"])),end_ns,component,series_only)
             overflow=overflow or more
             tail_points=[p for p in points(raw) if p["run_id"]==captured["run_id"] and p["sequence"]>captured["committed"] and (not signals or p["signal"] in signals)]
-            width=MINUTE if resolution=="minute" else HOUR
-            result.extend(r for _,r in rollups(tail_points,width) if r["start_ns"]<end_ns and r["end_ns"]>=start_ns)
+            result.extend(r for _,r in rollups(tail_points,WIDTHS[resolution]) if r["start_ns"]<end_ns and r["end_ns"]>=start_ns)
         return result,overflow
 
     def _who_summaries(self,db,captured,start_ns,end_ns,signal,component):
-        # Full interior hours, minute detail only at the two edges. No input
-        # LIMIT can silently turn the first part of a day into the whole day.
+        # Full interior hours; 15-minute and minute rows only for the sides. No
+        # input LIMIT can silently turn the first part of a day into the whole day.
         lo=(start_ns+HOUR-1)//HOUR*HOUR;hi=end_ns//HOUR*HOUR
+        sides=[(start_ns,lo),(hi,end_ns)] if lo<hi else [(start_ns,end_ns)]
         spans=[("hour",lo,hi)] if lo<hi else []
-        if start_ns<min(lo,end_ns):spans.append(("minute",start_ns//MINUTE*MINUTE,min(lo,end_ns)))
-        if max(hi,lo)<end_ns:spans.append(("minute",max(hi,lo),end_ns))
-        if not spans:spans=[("minute",start_ns//MINUTE*MINUTE,end_ns)]
-        rows=self._iter_summaries(db,captured,start_ns,end_ns,"hour",[signal] if signal else None,component,program_only=signal=="process.cpu",spans=spans)
+        for a,b in sides:
+            spans+=[("15-minute",a//QUARTER*QUARTER,b),("minute",a//MINUTE*MINUTE,b)]
+        # Rows outside the window still show which minutes have a row; filter after choosing.
+        wide=self._iter_summaries(db,captured,start_ns//QUARTER*QUARTER,end_ns+QUARTER,"hour",[signal] if signal else None,component,program_only=signal=="process.cpu",spans=spans)
+        rows=(row for _,group in groupby(wide,key=lambda r:(r["source"],r["entity"])) for row in self._edge_rows(group,start_ns,end_ns)
+              if row["start_ns"]<end_ns and row["end_ns"]>=start_ns)
         first=next(rows,None)
         if first is None:
             rows=self._iter_summaries(db,captured,start_ns,end_ns,"hour",[signal] if signal else None,component,program_only=signal=="process.cpu")
         else:
-            from itertools import chain
             rows=chain((first,),rows)
-        current=None;merged={}
+        current=None;merged={};edges={}
+        def done():
+            for key,row in merged.items():
+                # The coarsest grain that set an edge; hour only when no side row was used.
+                row["summary_resolution"]=max(edges.get(key,{"hour"}),key=WIDTHS.get)
+                yield row
         for row in rows:
+            row["partial_boundary"]=row["start_ns"]<start_ns or row["end_ns"]>end_ns
             entity=(row["source"],row["entity"])
             if current is not None and entity!=current:
-                yield from merged.values();merged={}
+                yield from done();merged={};edges={}
             current=entity
             key=tuple(row[k] for k in ("signal","unit","kind","scope","scale"))
             merged[key]=merge_summaries([merged[key],row]) if key in merged else row
-        yield from merged.values()
+            if row["summary_resolution"]!="hour":edges.setdefault(key,set()).add(row["summary_resolution"])
+        yield from done()
+
+    @staticmethod
+    def _edge_rows(rows,start_ns,end_ns):
+        """Per quarter hour of a side: minute rows when they cover each of its minutes in
+        the window, otherwise the 15-minute rows. Minute rows ending before a 15-minute row
+        begins predate 15-minute rows and still count."""
+        def key(r):return tuple(r[k] for k in ("signal","unit","kind","scope","scale"))
+        quarters=defaultdict(lambda:([],[]))
+        for row in rows:
+            if row["summary_resolution"]=="hour":yield row
+            else:quarters[row["summary_bucket_start_ns"]//QUARTER*QUARTER][row["summary_resolution"]=="minute"].append(row)
+        for bucket,(coarse,fine) in quarters.items():
+            needed=range(max(bucket,start_ns)//MINUTE*MINUTE,min(bucket+QUARTER,end_ns),MINUTE)
+            if {r["summary_bucket_start_ns"] for r in fine}>=set(needed):
+                yield from fine;continue
+            yield from coarse
+            begins={}
+            for r in coarse:begins[key(r)]=min(begins.get(key(r),r["start_ns"]),r["start_ns"])
+            yield from (r for r in fine if r["end_ns"]<begins.get(key(r),math.inf))
 
     @measured
     def now(self,component=None,limit=600):
@@ -372,12 +401,10 @@ class Query:
                 rows,overflow=self._summary(db,captured,start_ns,end_ns,resolution,signals,component,series_only=True)
             rows=[r for r in rows if (not component or r["component"]==component) and is_series(r["component"],r["entity"],r["scope"]) and (not signals or r["signal"] in signals)]
             # Raw history may have been pruned; use retained summaries, explicitly.
-            if not rows and resolution=="raw":
-                rows,overflow=self._summary(db,captured,start_ns,end_ns,"minute",signals,component,series_only=True)
-                resolution="minute";width=MINUTE
-            if not rows and resolution=="minute":
-                rows,overflow=self._summary(db,captured,start_ns,end_ns,"hour",signals,component,series_only=True)
-                resolution="hour";width=HOUR
+            for finer,coarser in (("raw","minute"),("minute","15-minute"),("15-minute","hour")):
+                if not rows and resolution==finer:
+                    rows,overflow=self._summary(db,captured,start_ns,end_ns,coarser,signals,component,series_only=True)
+                    resolution=coarser;width=WIDTHS[coarser]
             lanes={(r["source"],r["signal"],r["entity"],r["unit"],r["scale"]):r for r in rows}
             for requested in signals:
                 if not any(key[1]==requested for key in lanes):

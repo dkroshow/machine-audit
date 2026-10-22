@@ -10,16 +10,18 @@ implementation has not started.
   write logs and separate filesystem index together, not as independent caps.
 - **Preserve individual readings at collection cadence**, including process
   and GPU-client detail. Build summaries alongside them for efficient queries.
-- Favor more useful evidence within that budget. Top-N selection, group-only
-  storage and fixed short-window expiry are later pruning candidates, not MVP
-  defaults. Choose reductions from measured growth and actual investigations.
+- Favor more useful evidence within that budget. Minute summaries keep only
+  each minute's top processes and programs ([summary resolutions](#summary-resolutions));
+  group-only storage and fixed short-window expiry remain later candidates.
+  Choose reductions from measured growth and actual investigations.
 
 **Check growth and prune old records before reaching 10 GB, keeping recording
 continuous.** If the cap is reached, prune old records to make room and keep
 writing. Prune in this order:
 
 1. Oldest individual readings, after their summaries are safely stored.
-2. Oldest minute summaries, retaining hourly summaries longer.
+2. Oldest minute summaries, then oldest 15-minute summaries, retaining hourly
+   summaries longest.
 3. Retain rare incident records longer than routine readings.
 
 Use consistent time cutoffs across components and processes. Show remaining
@@ -66,14 +68,14 @@ copy of the entire database to delete old data. `max_page_count` enforces
 the admitted database-length limit. Each committed prune batch checkpoints
 before the next admission. Retention records expose the affected time windows,
 including partially removed windows; raw data without saved coverage is kept.
-This bounded pruning path lets recovery remove raw readings, then minute
-summaries, then hourly summaries, retaining incident history longest, even
+This bounded pruning path lets recovery remove raw readings, then minute,
+15-minute and hourly summaries, retaining incident history longest, even
 when the ordinary whole-database write reservation no longer fits.
 
 If crash recovery leaves a raw window without summary coverage, keep that
 window and search forward for the oldest fully covered raw window. Only after
-all covered raw windows are gone may pruning continue into minute summaries,
-hour summaries and incidents. Coverage evidence must match both sequence and
+all covered raw windows are gone may pruning continue into minute, 15-minute
+and hour summaries and incidents. Coverage evidence must match both sequence and
 observation time; a later high sequence alone does not prove an earlier window
 was summarized. Each retained window is recorded as `raw_preserved` with reason
 `missing_summary_coverage`. These records appear in retention history, but are
@@ -136,7 +138,8 @@ transitions and complete read coverage. Sparse *derived effect rows* do not
 replace memory gauges or source counter baselines. An unchanged reading differs
 from a missing reading.
 
-Minute and hourly summaries accelerate queries alongside the detailed store.
+Minute, 15-minute and hourly summaries accelerate queries alongside the
+detailed store.
 Only the agreed retention policy may retire older detail. Counter summaries
 retain totals and covered duration. Gauge summaries
 retain count, sum, min, max and last, with weighting and method version; a
@@ -149,10 +152,11 @@ no minute-grain answer reads it and its values change slowly. Raw readings
 still answer recent intervals, and pruning removes them as for any other
 scope. The rule lives in one set in `store.py`. Its first user is the Linux
 `unit_detail` scope: unit limits, memory breakdowns, pressure, throttling and
-process counts. Mac scopes all keep minute and hour summaries.
+process counts. Mac scopes all keep every resolution.
 
-Per-process rollups, per process instance and per signal, at minute and hourly
-grain, serve the [query design](query-design.md)'s process table and spike
+Per-process rollups, per process instance and per signal, at 15-minute and
+hourly grain (minute grain for each minute's top consumers), serve the
+[query design](query-design.md)'s process table and spike
 questions over long spans. Beyond the summary family above they keep the
 highest pass rate with its time, retained as observed, plus seconds above a
 small fixed set of levels and a small histogram of pass rates, both weighted by
@@ -173,6 +177,62 @@ identities. A stored maximum can preserve an observed peak's magnitude, but not
 its moment unless that time is retained. Nothing reconstructs activity between
 reads. Shared [time and coverage rules](cpu-view.md#time-windows-and-coverage-working)
 govern the selected interval in both interfaces.
+
+### Summary resolutions
+
+| Resolution | Rows kept |
+| --- | --- |
+| Minute | Every entity, except processes and programs: only each minute's top consumers |
+| 15-minute | Every entity |
+| Hour | Every entity |
+
+**Minute top consumers.** A minute keeps process and program rows for the union
+of the top 25 by CPU time, the top 25 by memory (Mac footprint, Linux resident
+set) and the top 25 by disk bytes read and written, ranked separately for
+processes and programs, plus the collector's own processes. At most 75
+processes and 75 programs, plus our own, have minute rows in each component.
+Every process and program keeps 15-minute and hour rows, so `who` over 15
+minutes or more answers for all of them. Host, device, unit and self rows
+keep every minute. The rule and `TOP_N` live in `store.py`, for the Mac and
+Linux alike.
+
+A minute is ranked once it is complete. Saves are not aligned with minutes,
+so the run's newest minute keeps every row until a later save completes it;
+ranking then deletes the rows outside the top. A kept row always holds its
+whole minute; data arriving after the ranking extends only kept rows.
+
+**Answers across resolutions.** `series` uses minute rows; if they are pruned,
+15-minute rows, then hour rows, and names the resolution it used. `who` uses
+complete interior hours and, at each side, per process and quarter hour: its
+minute rows when it has one for every minute of that quarter hour inside the
+window, otherwise its 15-minute row, marked `partial_boundary`. Each row names
+the coarsest resolution that set its edges. History saved before 15-minute
+rows existed answers from its minute rows. Coverage and export are unchanged.
+
+**Measured and estimated cost.** A Mac-shaped synthetic run (2,000
+processes, 600 program labels, 10 s passes, saves every 60 s not aligned
+with minutes) measured:
+
+| Per minute | Before | After |
+| --- | ---: | ---: |
+| New summary rows | 7,200 | about 320, plus 7,200 15-minute rows each quarter hour (480 a minute) |
+| Store growth | 12.6 MB | about 3.3 MB (2.6–5.2), of which raw readings 2.0 MB |
+| Save CPU | about 14 s | about 19 s |
+
+The 11.3 MB a minute recorded for Big Mac's 2,000 processes (16 GB a day, in
+[development](development.md#review-regressions-and-scale-measurements)) scales
+to about 3 MB a minute, about 4.3 GB a day, against the 10 GB cap. The
+15-minute rows are rewritten at each save, like hour rows; that is most of
+the added save CPU.
+
+Target B (Ubuntu, estimate from the [Linux adapter](linux-adapter.md)'s
+table, not measured): about 750 minute rows a minute today. Its roughly 115
+sampled processes fall to at most 51 (other users' disk bytes are denied, so
+the disk list holds only our own), about 200 to 90 rows; programs about 98 to
+70; units, host and devices are unchanged. With 15-minute rows (about 50 a
+minute) it writes about 660 rows a minute, roughly 10% fewer. Its growth, about
+1.7 MB a minute (Target A's 1.07 MB scaled by units and processes), is mostly
+raw workload records and unit rows, so it falls by about 5%.
 
 ## Saving, cost and retention
 
