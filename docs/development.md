@@ -87,6 +87,20 @@ and their final readings are saved, preventing an overlapping collector while
 that process remains alive; process exit abandons remaining daemon threads.
 This preserves the deadline without claiming the blocked measurement completed.
 
+Final saves do not prune: at the storage limit, pruning until a save fits can
+outlast any stop deadline. A final save is checked against the limit before it
+merges its summary rows (about 15 s at 2,000 processes), so a refusal is quick.
+If the limit refuses a final save, the collector
+writes the unsaved readings and the held minute to its own private spill file
+in the data directory (`unsaved-<run>-<time>.json`, mode 0600, created
+exclusively within the budget, never replacing an earlier one). It then stops
+cleanly and records `stop_unsaved_budget` in `startup.json`. The next start
+saves each spill file under its original run, with ordinary pruning, records
+that run's stop, and removes the file; readings already saved are not saved
+twice. If that fails, the file stays for a later start and collection still
+begins. If even the spill file does not fit, the stop fails with
+`stop_unsaved_lost` and those readings are lost.
+
 | Transition | Action and visible evidence |
 | --- | --- |
 | source due → reading | Start one read; keep actual start/lateness |

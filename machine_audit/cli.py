@@ -96,8 +96,10 @@ def _run(config,ready):
         for sig in (signal.SIGINT,signal.SIGTERM):
             signal.signal(sig,lambda *_:collector.stop_event.set())
         clean=collector.run()
-        if not clean:print("Collector stopped before all pending evidence was saved.",file=sys.stderr)
-        return 0 if clean else 2
+        if collector.stop_code=="stop_unsaved_budget":
+            print("Collector stopped within the storage limit; unsaved readings are kept for the next start.",file=sys.stderr)
+        elif not clean:print("Collector stopped before all pending evidence was saved.",file=sys.stderr)
+        return (0 if clean else 2),collector.stop_code
     finally:
         if server is not None:
             if server_thread is not None and server_thread.is_alive():server.shutdown()

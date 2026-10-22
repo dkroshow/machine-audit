@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import random
 import sqlite3
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -11,7 +12,7 @@ from machine_audit.budget import Budget, BudgetExceeded
 from machine_audit.collector import Collector
 from machine_audit.model import Clock, Field, Reading, Record
 from machine_audit.query import Query
-from machine_audit.store import Store, MINUTE, pack_summaries
+from machine_audit.store import Store, MINUTE, pack_summaries, unpack_summaries
 
 
 class BudgetRecoveryTests(unittest.TestCase):
@@ -130,6 +131,68 @@ class BudgetRecoveryTests(unittest.TestCase):
                 self.assertEqual(raw(0,200*MINUTE),1200)  # uncovered readings stay
                 self.assertIn('storage_budget_raw_uncovered',reasons[:-1])  # ran out, pruned summaries
                 self.assertEqual(reasons[-1],'storage_budget')  # then reached covered raw
+            finally:store.close()
+
+    def test_a_stop_at_the_cap_spills_within_its_deadline_and_the_next_start_saves_it(self):
+        # Big Mac at the cap: stopping pruned until the final save fit, outlasting the
+        # stop deadline, so launchd restarted it unclean. A stop now saves only what fits
+        # without pruning and keeps the rest in its own spill file for the next start.
+        scratch=Path(__file__).parent/'.tmp';scratch.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as root:
+            store=Store(Path(root)/'readings.sqlite',Budget(root,free_margin_bytes=0))
+            def reads(collector,first,last):
+                for t in range(first,last):
+                    clock=Clock(t*10**9,t*10**9,t*10**9)
+                    collector.ingest(Reading('synthetic.process','cpu',clock,clock,tuple(
+                        Field('process.cpu',float(t*pid),'seconds','counter',entity=f'process:{pid}',label=f'p{pid}',scope='process',additive=True)
+                        for pid in (1,2))))
+            def saved():
+                return (store.db.execute('SELECT run_id,sequence,payload FROM readings ORDER BY run_id,sequence').fetchall(),
+                        store.db.execute('SELECT run_id,resolution,bucket_ns,entity,payload FROM summaries ORDER BY 1,2,3,4').fetchall())
+            def at_cap():
+                # Room to prune one batch and for a spill file, not for the final save,
+                # which reserves about the database again for its WAL.
+                store.budget.limit_bytes=store.budget.usage()['bytes']+2*1024**2
+            try:
+                # Older raw-heavy history: pruning could make room, slowly and by deleting it.
+                history=[]
+                for n in range(300):
+                    clock=Clock((n*10-20000)*10**9,(n*10-20000)*10**9,(n*10-20000)*10**9)
+                    history.append(Record(Reading('synthetic.blob','storage',clock,clock,tuple(
+                        Field(f'storage.f{i}',(n*7919+i*104729)%10**9,'bytes') for i in range(300))),'boot','history',n+1,clock.wall_ns,clock))
+                for lo in range(0,300,60):store.append(history[lo:lo+60])
+                store.stop_run('history',-17000*10**9)
+                first=Collector(store,(),run_id='first',boot_id='boot');first.start()
+                reads(first,0,70);self.assertTrue(first.flush())
+                reads(first,70,100)  # unsaved tail; minute 1 is held
+                at_cap();before=saved();began=time.monotonic();merges=[]
+                # A refused stop must not first merge every summary row (15 s on Big Mac).
+                store.db.set_trace_callback(lambda sql:sql.startswith('SELECT sequence_min,payload FROM summaries') and merges.append(1))
+                self.assertTrue(first.close(timeout_s=10))
+                store.db.set_trace_callback(None)
+                self.assertEqual(merges,[])
+                self.assertLess(time.monotonic()-began,10)
+                self.assertEqual((first.stop_code,saved()),('stop_unsaved_budget',before))  # nothing saved was lost
+                spill1,=Path(root).glob('unsaved-first-*.json')
+                self.assertEqual(spill1.stat().st_mode&0o777,0o600)
+                kept=spill1.read_bytes()
+                # A crash before restoring: the next run's own stop must not replace that file.
+                second=Collector(store,(),run_id='second',boot_id='boot')
+                store.budget.limit_bytes=10**9
+                with patch.object(store,'recover_unsaved',side_effect=BudgetExceeded('managed_storage_limit')):second.start()
+                reads(second,200,230);at_cap()
+                self.assertTrue(second.close(timeout_s=10))
+                self.assertEqual(spill1.read_bytes(),kept)
+                self.assertEqual(len(list(Path(root).glob('unsaved-second-*.json'))),1)
+                store.budget.limit_bytes=10**9
+                third=Collector(store,(),run_id='third',boot_id='boot');third.start()
+                self.assertEqual(list(Path(root).glob('unsaved-*')),[])
+                runs=dict(store.db.execute("SELECT run_id,last_sequence FROM runs WHERE stopped_ns IS NOT NULL").fetchall())
+                self.assertEqual((runs['first'],runs['second']),(first.sequence,second.sequence))  # every reading, under its own run
+                held={entity:[row['sample_count'] for row in unpack_summaries(payload)] for entity,payload in store.db.execute(
+                    "SELECT entity,payload FROM summaries WHERE run_id='first' AND resolution='minute' AND bucket_ns=? AND entity LIKE 'process:%'",(60*10**9,))}
+                self.assertEqual(held,{'process:1':[39],'process:2':[39]})  # the whole held minute, 61-99 s
+                self.assertTrue(third.close())
             finally:store.close()
 
     def test_largest_prune_batches_stay_inside_declared_wal_pages(self):

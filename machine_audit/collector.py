@@ -65,6 +65,10 @@ class _Pending:
         return component in components if component else bool(components)
 
 
+# Save errors that mean the budget, not the store, refused the write.
+BUDGET_ERRORS = frozenset({"managed_storage_limit","sqlite_checkpoint_headroom","prune_precheck_limit","free_space_margin","sqlite_full"})
+
+
 class Collector:
     def __init__(self, store, sources=(), *, boot_id="unknown", run_id=None,
                  clock=Clock.now, tail_limit_bytes=64*1024**2, flush_s=60):
@@ -99,6 +103,7 @@ class Collector:
         self._transitions = {}
         self._closer = None
         self._close_result = False
+        self.stop_code = None
 
     @staticmethod
     def _save_error(exc):
@@ -122,6 +127,11 @@ class Collector:
         if self._started:
             raise RuntimeError("collector already started")
         self.acquire()
+        try:
+            self.store.recover_unsaved()
+        except Exception as exc:
+            # Spilled readings stay on disk for a later start; collection still begins.
+            self.last_save_error=self._save_error(exc)
         self.store.start_run(self.run_id,self.boot_id,self.clock().wall_ns)
         self._started = True
         for source in self.sources:
@@ -235,7 +245,7 @@ class Collector:
                 fields.append(Field("self."+key,value,"bytes" if key.endswith("bytes") else "seconds" if key.endswith("_s") else "operations","counter"))
         self.ingest(Reading("collector.health","self",now,now,tuple(fields)))
 
-    def flush(self):
+    def flush(self, prunes=None):
         """Drain the entry snapshot; keep later arrivals for the next flush."""
         with self._flush_lock:
             self._status_events()
@@ -261,7 +271,7 @@ class Collector:
                     self.tail_bytes=sum(size for _,size in self.tail)
                 try:
                     records=[Record.unpack(p.payload) for p,_ in batch]
-                    self.store.append(records,commit_lock=self.lock,on_commit=committed)
+                    self.store.append(records,commit_lock=self.lock,on_commit=committed,prunes=prunes)
                 except Exception as exc:
                     with self.lock:
                         self.last_save_error = self._save_error(exc)
@@ -342,15 +352,19 @@ class Collector:
             if self._closer is None or (not self._closer.is_alive() and not self._close_result):
                 def finish():
                     try:
-                        saved=self.flush()
+                        # Final saves do not prune: pruning to make room can outlast
+                        # any stop deadline. What does not fit is spilled below.
+                        saved=self.flush(prunes=0)
                         for thread in self.threads:thread.join()
                         # An in-flight read can finish during the first save or
                         # the joins. Preserve its completion before clean stop.
-                        if self.tail:saved=self.flush()
-                        while saved and self.tail:saved=self.flush()
-                        if self._started and saved:self.store.stop_run(self.run_id,self.clock().wall_ns)
+                        if self.tail:saved=self.flush(prunes=0)
+                        while saved and self.tail:saved=self.flush(prunes=0)
+                        if self._started and saved:self.store.stop_run(self.run_id,self.clock().wall_ns,prunes=0)
                     except Exception as exc:
                         self.last_save_error=self._save_error(exc);saved=False
+                    if self._started and not saved and self.last_save_error in BUDGET_ERRORS:
+                        saved=self._spill()
                     with self.lock:
                         self._close_result=saved
                         if saved and self._instance_fd is not None:
@@ -361,3 +375,16 @@ class Collector:
             closer=self._closer
         closer.join(max(0,timeout_s))
         return not closer.is_alive() and self._close_result
+
+    def _spill(self):
+        """The budget refused the final save: keep the unsaved readings and the held
+        minute for the next start, which saves them under this run."""
+        with self.lock:
+            payloads=[pending.payload for pending,_ in self.tail]
+        try:
+            self.store.spill(self.run_id,self.clock().wall_ns,payloads)
+        except Exception as exc:
+            self.last_save_error=self._save_error(exc);self.stop_code="stop_unsaved_lost"
+            return False
+        self.stop_code="stop_unsaved_budget"
+        return True

@@ -1,11 +1,13 @@
 """SQLite readings and cumulative summaries share every atomic watermark."""
 from __future__ import annotations
+import base64
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 import heapq
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import threading
 import time
@@ -162,7 +164,7 @@ class Store:
                     self.db.execute("INSERT INTO runs(run_id,boot_id,started_ns) VALUES(?,?,?)", (run_id, boot_id, started_ns))
             self._pruning_until_admitted(write)
 
-    def stop_run(self, run_id, stopped_ns):
+    def stop_run(self, run_id, stopped_ns, prunes=None):
         """Mark the run stopped and save its held minute, which is now complete."""
         with self._mutex:
             prepared=[]
@@ -184,16 +186,60 @@ class Store:
                     except BaseException:
                         if self.db.in_transaction:self.db.execute("ROLLBACK")
                         raise
-            self._pruning_until_admitted(write)
+            self._pruning_until_admitted(write,prunes)
             if held:self._held=None
 
-    def _pruning_until_admitted(self,write):
-        """Run a write, pruning the oldest history between attempts until it fits."""
+    def _pruning_until_admitted(self,write,prunes=None):
+        """Run a write, pruning the oldest history between attempts until it fits,
+        or until `prunes` batches have been pruned."""
         while True:
             try:
                 return write()
             except (sqlite3.OperationalError,BudgetExceeded) as exc:
-                if not self._capacity_error(exc) or not self.prune_oldest():raise
+                if not self._capacity_error(exc) or prunes==0 or not self.prune_oldest():raise
+                if prunes is not None:prunes-=1
+
+    def spill(self, run_id, stopped_ns, payloads):
+        """Keep a stopping run's unsaved readings and held minute for the next start.
+
+        Each stop writes its own private file, created exclusively inside the
+        budget, so it never replaces an earlier stop's file."""
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}",run_id):raise ValueError("invalid run id")
+        with self._mutex:
+            held=self._held if self._held is not None and self._held["run_id"]==run_id else None
+            committed=self.db.execute("SELECT last_sequence FROM runs WHERE run_id=?",(run_id,)).fetchone()[0]
+            data=encode({"format":"machine-audit-unsaved-v1","run_id":run_id,"stopped_ns":stopped_ns,"committed":committed,
+                         "records":[base64.b64encode(p).decode() for p in payloads],
+                         "held":None if held is None else {"bucket":held["bucket"],"lower":held["lower"],"upper":held["upper"],
+                             "own":sorted(held["own"]),"rows":[[*key,base64.b64encode(payload).decode()] for key,payload in held["rows"].items()]}}).encode()
+            path=self.path.parent/f"unsaved-{run_id}-{stopped_ns}.json"
+            with self.budget.reserve(len(data)):
+                fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+                try:
+                    with os.fdopen(fd,"wb") as stream:
+                        stream.write(data);stream.flush();os.fsync(stream.fileno())
+                except BaseException:
+                    path.unlink(missing_ok=True);raise
+            return path
+
+    def recover_unsaved(self):
+        """Save each spilled stop under its own run, as its next save would have, then
+        remove the file. Readings saved since the spill are not saved twice."""
+        with self._mutex:
+            for path in sorted(self.path.parent.glob("unsaved-*.json")):
+                with os.fdopen(os.open(path,os.O_RDONLY|os.O_NOFOLLOW),"rb") as stream:
+                    data=json.loads(stream.read())
+                if data.get("format")!="machine-audit-unsaved-v1":raise ValueError("unsupported_unsaved_file")
+                run_id,held=data["run_id"],data["held"]
+                last=self.db.execute("SELECT last_sequence FROM runs WHERE run_id=?",(run_id,)).fetchone()[0]
+                records=[r for r in (Record.unpack(base64.b64decode(p)) for p in data["records"]) if r.sequence>last]
+                # A save after the spill already merged newer data; that held minute is stale.
+                self._held=None if held is None or last!=data["committed"] else dict(
+                    run_id=run_id,bucket=held["bucket"],lower=held["lower"],upper=held["upper"],own=set(held["own"]),
+                    rows={tuple(row[:3]):base64.b64decode(row[3]) for row in held["rows"]})
+                self.append(records)
+                self.stop_run(run_id,data["stopped_ns"])
+                path.unlink()
 
     def _previous(self, records):
         result = {}
@@ -208,7 +254,9 @@ class Store:
                 result[source] = Record.unpack(row[0])
         return result
 
-    def append(self, records: list[Record], *, commit_lock=None, on_commit=None):
+    def append(self, records: list[Record], *, commit_lock=None, on_commit=None, prunes=None):
+        """Save records. `prunes` bounds the pruning a stopping save may do; it then
+        skips proactive pruning as well."""
         if not records:
             return
         with self._mutex:
@@ -230,11 +278,16 @@ class Store:
                 coarser[("hour",bucket//HOUR*HOUR,row["source"],row["component"],row["entity"],row["signal"],row["unit"],row["scope"],row["kind"],row["scale"])].append(row)
             for key,rows in coarser.items():
                 summaries[key[:5]].append(merge_summaries(rows) if len(rows)>1 else rows[0])
-            self.maintain()
+            if prunes is None:self.maintain()
             held,lowers=self._top_minutes(records,minutes,own,summaries)
+            if prunes==0:
+                # A stopping save the limit refuses before merging fails now, not after
+                # merging every row: its full reservation is larger still.
+                _,count,payload=self._bound(records,raw,summaries)
+                with self.budget.sqlite_write(self.db,self.path,rows=count,payload_bytes=payload):pass
             # Prepare once: a save that must prune to fit repeats only admission and commit.
             batch=self._prepare(records,raw,summaries,lowers)
-            self._pruning_until_admitted(lambda:self._write(records,raw,batch,commit_lock,on_commit))
+            self._pruning_until_admitted(lambda:self._write(records,raw,batch,commit_lock,on_commit),prunes)
             self._held=held
 
     @staticmethod
@@ -277,9 +330,18 @@ class Store:
                     summaries[key].append(row);lowers[key]=lower
         return held,lowers
 
+    @staticmethod
+    def _bound(records,raw,summaries):
+        """The write's catalog, counted rows and the payload known before merging."""
+        components=sum(len({r.reading.component,*(field_component(f,r.reading.component) for f in r.reading.fields)}) for r in records)
+        catalog={(row["source"],row["signal"],row["component"],row["kind"],row["unit"],row["scope"],row["scale"]) for rows in summaries.values() for row in rows}
+        count=2+len(records)+3*components+len(summaries)+len(catalog)+len({r.reading.source for r in records})+sum(any(f.kind=='event' for f in r.reading.fields) for r in records)
+        return catalog,count,3*sum(len(p) for _,p in raw)
+
     def _prepare(self,records,raw,summaries,lowers):
         """Merge each summary row with its saved row and count the write's bound."""
         first,last=records[0],records[-1]
+        catalog,count,payload=self._bound(records,raw,summaries)
         prepared=[];replaced_payload=0
         for (resolution,bucket,source,component,entity),rows in summaries.items():
             lower=lowers.get((resolution,bucket,source,component,entity),first.sequence)
@@ -291,13 +353,10 @@ class Store:
                 merged[k]=merge_summaries([merged[k],row]) if k in merged else row
             if old:lower=min(lower,old[0])
             prepared.append((first.run_id,lower,last.sequence,resolution,bucket,source,component,entity,pack_summaries(list(merged.values()))))
-        components=sum(len({r.reading.component,*(field_component(f,r.reading.component) for f in r.reading.fields)}) for r in records)
-        catalog={(row["source"],row["signal"],row["component"],row["kind"],row["unit"],row["scope"],row["scale"]) for rows in summaries.values() for row in rows}
-        count=2+len(records)+3*components+len(prepared)+len(catalog)+len({r.reading.source for r in records})+sum(any(f.kind=='event' for f in r.reading.fields) for r in records)
         for source in {r.reading.source for r in records}:
             old=self.db.execute('SELECT length(payload) FROM baselines WHERE source=?',(source,)).fetchone()
             if old:replaced_payload+=old[0]
-        payload=3*sum(len(p) for _,p in raw)+sum(len(row[-1]) for row in prepared)+replaced_payload
+        payload+=sum(len(row[-1]) for row in prepared)+replaced_payload
         return prepared,catalog,count,payload
 
     def _write(self,records,raw,batch,commit_lock,on_commit):

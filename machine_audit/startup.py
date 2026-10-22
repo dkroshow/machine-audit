@@ -13,7 +13,8 @@ from .budget import Budget, BudgetExceeded
 SIZE = 4096
 STATES = {'prepared', 'starting', 'running', 'stopped', 'failed'}
 CODES = {'port_in_use', 'port_unavailable', 'budget_exhausted', 'permission_denied',
-         'storage_failed', 'collector_busy', 'initialization_failed', 'shutdown_incomplete'}
+         'storage_failed', 'collector_busy', 'initialization_failed', 'shutdown_incomplete',
+         'stop_unsaved_budget', 'stop_unsaved_lost'}
 
 
 def port_status(config):
@@ -89,7 +90,9 @@ def guarded_run(config, run):
             print('Collection did not start: ' + port, file=sys.stderr)
             return 2
         result = run(lambda: status.write('running'))
-        status.write('stopped' if result == 0 else 'failed', None if result == 0 else 'shutdown_incomplete')
+        # A stop can name why readings were kept for the next start, or lost.
+        result, code = result if isinstance(result, tuple) else (result, None)
+        status.write('stopped' if result == 0 else 'failed', code or (None if result == 0 else 'shutdown_incomplete'))
         return result
     except Exception as exc:
         code = ('budget_exhausted' if isinstance(exc, BudgetExceeded) else
