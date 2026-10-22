@@ -37,10 +37,14 @@ def source_fields(reading):
         first=host_busy[0][1][0]
         fields.append(Field("cpu.busy",sum(f.value for _,parts in host_busy for f in parts),first.unit,"counter",
                             scale=first.scale,rate_unit="CPUs"))
-        fields.append(Field("cpu.capacity",len(host_busy),"logical CPUs"))
+        # Linux host totals arrive as one aggregate entity; its CPU count is cpu.logical.
+        # On the Mac, cpu.logical equals the per-CPU entity count.
+        logical=next((f for f in fields if f.name=="cpu.logical" and f.status in GOOD),None)
+        capacity=logical.value if logical else len(host_busy)
+        fields.append(Field("cpu.capacity",capacity,"logical CPUs"))
         runnable=next((f for f in fields if f.name=="cpu.runnable" and f.status in GOOD),None)
         if runnable:
-            fields.append(Field("cpu.excess_runnable",max(0,runnable.value*runnable.scale-len(host_busy)),"threads"))
+            fields.append(Field("cpu.excess_runnable",max(0,runnable.value*runnable.scale-capacity),"threads"))
     return fields
 
 

@@ -10,7 +10,7 @@ import unittest
 from machine_audit.budget import Budget
 from machine_audit.collector import Collector
 from machine_audit.config import Config
-from machine_audit.derive import points
+from machine_audit.derive import points, source_fields
 from machine_audit.model import Clock, Field, Reading, Record
 from machine_audit.query import Query
 from machine_audit.sources.linux import sources
@@ -122,19 +122,25 @@ class LinuxSourceTests(unittest.TestCase):
     def test_busy_cpu_is_user_and_system_states_and_mac_busy_is_unchanged(self):
         # cpu-view.md: Linux nice is user time and irq/softirq are system time; iowait,
         # steal and guest (already inside user) are not added. macOS keeps user+system+nice.
-        def busy(first, second):
+        def derived(first, second):
             records = [Record(Reading('host', 'cpu', Clock(t, t, t), Clock(t, t, t), tuple(f)), 'boot', 'run', n, t, Clock(t, t, t))
                        for n, t, f in ((1, 10**9, first), (2, 2 * 10**9, second))]
-            return next(p['total'] for p in points(records) if p['signal'] == 'cpu.busy' and p['total'] is not None)
+            found = points(records)
+            return (next(p['total'] for p in found if p['signal'] == 'cpu.busy' and p['total'] is not None),
+                    next(p['value'] for p in reversed(found) if p['signal'] == 'cpu.capacity'))
 
         def mac(user, system, idle, nice):
             return [Field('cpu.' + s, v, 'ticks', 'counter', entity='cpu:0', additive=True, scale=0.01)
                     for s, v in (('user', user), ('system', system), ('idle', idle), ('nice', nice))]
         first = list(self.host.cpu())
-        self.edit('proc/stat', 'cpu0 2342 170 300 1849500 1000 0 100 0 0 0',
-                  'cpu0 2352 171 305 1849600 1050 2 103 7 4 0')
-        self.assertEqual(busy(first, list(self.host.cpu())), 10 + 1 + 5 + 2 + 3)
-        self.assertEqual(busy(mac(100, 50, 900, 4), mac(110, 55, 1000, 5)), 10 + 5 + 1)
+        self.edit('proc/stat', 'cpu  4705 356 584 3699176 2011 0 128 0 0 0', 'cpu  4715 357 589 3699276 2061 2 131 7 4 0')
+        # Host totals come from the aggregate line every second; capacity is the online CPU count.
+        self.assertEqual(derived(first, list(self.host.cpu())), (10 + 1 + 5 + 2 + 3, 2))
+        self.assertEqual(derived(mac(100, 50, 900, 4), mac(110, 55, 1000, 5)), (10 + 5 + 1, 1))
+        # Per-CPU states (every 10 s) are detail and derive no second host busy series.
+        per_cpu = list(self.host.per_cpu())
+        self.assertEqual({f.entity for f in per_cpu}, {'cpu:0', 'cpu:1'})
+        self.assertFalse(any(f.name == 'cpu.busy' for f in source_fields(Reading('linux.per_cpu', 'cpu', Clock(1, 1, 1), Clock(1, 1, 1), tuple(per_cpu)))))
 
     def test_who_ranks_unit_consumption_not_limits_coverage_or_pressure(self):
         # First Linux run: `who --component cpu` ranked unit.cpu.weight and unit.processes first.

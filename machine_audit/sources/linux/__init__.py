@@ -30,6 +30,7 @@ def sources(config, budget, operations=None, scanner=None, root='/'):
     rapl = any(host.root.glob('sys/class/powercap/*/energy_uj'))
     return [
         ReadSource('linux.cpu', 'cpu', 1, host.cpu),
+        ReadSource('linux.per_cpu', 'cpu', 10, host.per_cpu),
         ReadSource('linux.memory', 'memory', 1, host.memory),
         ReadSource('linux.workloads', 'cpu', 10, host.workloads) if cgroup_v2 else
         GapSource('linux.workloads', 'cpu', 10, 'cgroup_v2_required', 'unavailable'),
