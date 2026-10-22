@@ -146,7 +146,7 @@ class LinuxSourceTests(unittest.TestCase):
         # First Linux run: `who --component cpu` ranked unit.cpu.weight and unit.processes first.
         data = self.root / 'data'
         data.mkdir()
-        store = Store(data / 'readings.sqlite', Budget(data, free_margin_bytes=0))
+        store = Store(data / 'readings.sqlite', Budget(data, limit_bytes=20_000_000, free_margin_bytes=0))
         store.start_run('run', 'boot', 0)
         collector = Collector(store, run_id='run', boot_id='boot')
         start = Clock.now().wall_ns
@@ -160,6 +160,8 @@ class LinuxSourceTests(unittest.TestCase):
             store.close()
         signals = {r['signal'] for r in rows}
         self.assertIn('unit.cpu.stat.usage_usec', signals)
+        # First Linux re-run: a process.threads gauge filled 38 of the top 40 CPU rows.
+        self.assertTrue(all(r['additive'] for r in rows), signals)
         self.assertFalse(signals & {'unit.cpu.weight', 'unit.cpu.max.quota', 'unit.processes', 'unit.cpu.pressure.some',
                                     'unit.cpu.stat.nr_periods'})
 
@@ -230,7 +232,7 @@ class LinuxSourceTests(unittest.TestCase):
         for absent in ('sys/class/hwmon', 'sys/class/drm', 'sys/devices/system/cpu'):
             shutil.rmtree(self.root / absent)
         config = Config(data_dir=str(self.root / 'data'))
-        made = {s.name: s for s in sources(config, Budget(config.root), root=self.root)}
+        made = {s.name: s for s in sources(config, Budget(config.root, limit_bytes=20_000_000, free_margin_bytes=0), root=self.root)}
         self.assertEqual({s.component for s in made.values()},
                          {'cpu', 'memory', 'gpu', 'storage', 'network', 'power', 'heat', 'self'})
         # Probes and the resolver check send packets; tests never contact a network.

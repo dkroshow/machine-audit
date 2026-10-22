@@ -133,9 +133,22 @@ no user unit or linger is needed. Not yet validated on a target.
 `machine-audit-scan.service` hourly, and a run between 01:00 and 05:00 walks in
 full once a day. Every unit has `User=`, `ProtectSystem=strict`,
 `ReadWritePaths=` the data directory only, `NoNewPrivileges=yes`,
-`PrivateTmp=yes`, `UMask=0077` and `MemoryMax=1G`; the collector has
-`CPUWeight=20`, the scanner `Nice=10`, `IOSchedulingClass=idle` and
-`CPUWeight=10`. `stop` disables and stops all three and preserves recordings.
+`PrivateTmp=yes`, `UMask=0077`, `MemoryMax=1G` and `OOMPolicy=stop`; the
+collector has `CPUWeight=20`, the scanner `Nice=10`, `IOSchedulingClass=idle`
+and `CPUWeight=10`. Python runs with `-B`: the release is read-only to the
+units, and `-I` ignores `PYTHONDONTWRITEBYTECODE`. `stop` disables and stops
+all three and preserves recordings.
+
+`MemoryMax=1G`, from measurements. The scanner: about 30 MB of interpreter,
+a 16 MiB block-map cap (empty on ext4), a 2 MiB write buffer, and a working
+set the first Ubuntu walk measured at 60.7 MB peak for 613,000 entries
+(about 50 bytes an entry beyond the interpreter; a clean 13.6 M-entry Mac
+walk used 462 MB, 34 bytes an entry). 1 GB covers about 19 M entries. The
+collector: 137 MB measured on 2 vCPUs with 280 processes; its unsaved
+buffer stops at 64 MiB, and Linux passes carry far fewer fields than the
+Mac's 2,000-process passes. An OOM kill stops the unit with result
+`oom-kill`: the scanner's run record then reads `interrupted`, and the
+collector restarts with its unsaved span shown as a gap.
 Without root, `start` and `stop` print the exact `systemctl` commands.
 
 ## Big Mac first-user trial

@@ -23,9 +23,10 @@ class LinuxInstallTests(unittest.TestCase):
         for name, verb in ((COLLECTOR, 'run'), (SCANNER, 'scan')):
             lines = units[name].splitlines()
             for line in ('User=monitor', 'ProtectSystem=strict', 'ReadWritePaths=' + CANDIDATE['data'],
-                         'NoNewPrivileges=yes', 'PrivateTmp=yes', 'UMask=0077'):
+                         'NoNewPrivileges=yes', 'PrivateTmp=yes', 'UMask=0077', 'OOMPolicy=stop'):
                 self.assertIn(line, lines, name)
-            self.assertIn(f"ExecStart=/usr/bin/python3.12 -I {CANDIDATE['release']}/machine_audit/bootstrap.py "
+            # -B: the release is read-only to the unit, so no bytecode is written there.
+            self.assertIn(f"ExecStart=/usr/bin/python3.12 -I -B {CANDIDATE['release']}/machine_audit/bootstrap.py "
                           f"--config {CANDIDATE['config']} {verb}", lines)
         self.assertIn('IOSchedulingClass=idle', units[SCANNER].splitlines())
         self.assertIn('OnCalendar=hourly', units[TIMER].splitlines())

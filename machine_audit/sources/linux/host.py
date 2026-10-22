@@ -48,7 +48,6 @@ class Stat:
     system: int
     child_user: int
     child_system: int
-    threads: int
     resident_pages: int
 
     @classmethod
@@ -56,8 +55,7 @@ class Stat:
         # comm may hold spaces and parentheses; the fields after the last ')' are positional (proc(5)).
         head, _, tail = text.rpartition(')')
         f = tail.split()
-        return cls(pid, head.partition('(')[2], int(f[19]), int(f[11]), int(f[12]), int(f[13]), int(f[14]),
-                   int(f[17]), int(f[21]))
+        return cls(pid, head.partition('(')[2], int(f[19]), int(f[11]), int(f[12]), int(f[13]), int(f[14]), int(f[21]))
 
 
 class LinuxHost:
@@ -203,7 +201,6 @@ class LinuxHost:
                         rate_unit='CPUs', **kw)
                   for name, value in (('user_time', p.user), ('system_time', p.system),
                                       ('child_user_time', p.child_user), ('child_system_time', p.child_system))]
-        fields.append(field('process.threads', p.threads, 'threads', **kw))
         try:
             status = keyed(self.text(f'proc/{p.pid}/status'), ':')
             fields.append(field('process.resident_size', kib(status, 'VmRSS'), 'bytes', **kw))

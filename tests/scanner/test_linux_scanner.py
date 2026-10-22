@@ -102,7 +102,7 @@ class LinuxScannerTests(unittest.TestCase):
     def test_watched_change_is_relisted_by_the_next_run_without_a_walk(self):
         volume = self.scan()['volumes'][0]['volume_id']
         (self.root / 'a/new').write_text('n' * 4096)
-        record_dirty(self.data, Budget(self.data), {volume: {str(os.stat(self.root / 'a').st_ino)}})
+        record_dirty(self.data, Budget(self.data, limit_bytes=20_000_000, free_margin_bytes=0), {volume: {str(os.stat(self.root / 'a').st_ino)}})
         dirty = (self.data / DIRTY)
         self.assertEqual(dirty.stat().st_mode & 0o777, 0o600)
         self.assertIsNone(re.search(r'[A-Za-z/]', dirty.read_text().replace('version', '').replace('volumes', '')
@@ -116,7 +116,7 @@ class LinuxScannerTests(unittest.TestCase):
 
     def test_hot_set_is_largest_named_folders_and_events_dirty_folder_parent_or_all(self):
         tree = Path(self.tmp.name) / 'tree'
-        store = MapStore(self.data / 'scanner.sqlite', Budget(self.data, free_margin_bytes=0))
+        store = MapStore(self.data / 'scanner.sqlite', Budget(self.data, limit_bytes=20_000_000, free_margin_bytes=0))
         volume = Volume('v', 'Volume', str(tree), 'ext4', 1, 10**13, 1, 1, None)
         store.prepare(volume, lean=False)
         store.directory(Node('1', None, 'Volume', 'directory', 0, 0, 'observed', str(tree), 0))

@@ -16,8 +16,10 @@ from .config import Config
 from .installation import _command, _private_directory, _snapshot, _write
 
 COLLECTOR, SCANNER, TIMER = 'machine-audit.service', 'machine-audit-scan.service', 'machine-audit-scan.timer'
-# Hardening every unit shares; the data directory is the only writable path.
-HARDENING = 'UMask=0077\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nReadWritePaths={data}\nMemoryMax=1G\n'
+# Hardening every unit shares; the data directory is the only writable path. MemoryMax is
+# argued in installation.md; an OOM kill stops the unit with result oom-kill, never silently.
+HARDENING = ('UMask=0077\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nReadWritePaths={data}\n'
+             'MemoryMax=1G\nOOMPolicy=stop\n')
 
 
 def application_root() -> Path:
@@ -47,7 +49,8 @@ def unit_files(candidate: dict) -> dict[str, str]:
     paths = [candidate['python'], candidate['release'], candidate['config'], candidate['data'], candidate['user']]
     if not all(re.fullmatch(r'[A-Za-z0-9._/@+-]+', p) for p in paths):
         raise ValueError('unit_path_needs_review')
-    command = ' '.join([candidate['python'], '-I', candidate['release'] + '/machine_audit/bootstrap.py', '--config', candidate['config']])
+    # -B: the release is read-only under ProtectSystem=strict, and -I ignores PYTHONDONTWRITEBYTECODE.
+    command = ' '.join([candidate['python'], '-I', '-B', candidate['release'] + '/machine_audit/bootstrap.py', '--config', candidate['config']])
     hardening = HARDENING.format(data=candidate['data'])
     return {
         COLLECTOR: f'''[Unit]
