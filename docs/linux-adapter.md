@@ -124,6 +124,12 @@ The Mac's bundled `macos.process` record carries every own-user process, about
 
 ## Devices and network
 
+- Unit I/O needs the cgroup `io` controller. A stock Ubuntu box enables only
+  `cpu memory pids` at the root, so no unit has `io.stat`, and storage `who`
+  then shows only our own processes (other users' `/proc/<pid>/io` is denied).
+  An operator who wants unit I/O attribution sets `DefaultIOAccounting=yes`
+  in a drop-in under `/etc/systemd/system.conf.d/` and runs
+  `systemctl daemon-reexec`, or sets `IOAccounting=yes` on chosen units.
 - Disks: rows of `/proc/diskstats` whose `/sys/block/<name>/device` exists,
   entity `disk:<major>:<minor>`. Partitions, dm, loop and zram rows are
   skipped. Sectors are 512 bytes; busy time reads as percent busy. Unit
@@ -166,7 +172,8 @@ The Mac's bundled `macos.process` record carries every own-user process, about
   blocks: a complete map is `observed` with uses (hard links once) and the
   gap `physical_residual_not_computed`; no residual is claimed. A volume
   root the service user cannot read (an EFI partition) is a `denied` gap on
-  that volume; the run still completes.
+  that volume; the run still completes. It is retried on the full-walk
+  schedule (the night, or `scan --full`), not every hourly run.
 - Never entered: `/proc`, `/sys`, `/dev`, `/run`, `/tmp` (counted as
   `excluded`, unnamed like configured exclusions), other users' homes
   (`other_account`), the data directory (`own_store`), and a bind mount of

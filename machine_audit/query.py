@@ -325,13 +325,24 @@ class Query:
                 # pass, preserving source baselines and per-pass program groups.
                 yield from points([record],previous)
                 previous[record.reading.source]=record
+        # A field missing read after read (a closed ICMP path, an absent sensor) is one gap
+        # row spanning those reads, with their count; any good read of it ends the row.
+        open_rows={}
         for p in derived if derived is not None else streamed_points():
             if p["end_ns"]<start_ns or p["start_ns"]>end_ns:continue
+            key=(p["run_id"],p["source"],p["signal"],p["entity"])
             if p["status"] not in GOOD or p["sleep_s"]:
-                gaps.append({"status":p["status"] if not p["sleep_s"] else "unobserved",
-                             "reason":p.get("reason","window_contains_sleep" if p["sleep_s"] else "source_status"),
-                             "start_ns":max(start_ns,p["start_ns"]),"end_ns":min(end_ns,p["end_ns"]),
-                             "source":p["source"],"signal":p["signal"],"sleep_s":p["sleep_s"]})
+                status=p["status"] if not p["sleep_s"] else "unobserved"
+                reason=p.get("reason","window_contains_sleep" if p["sleep_s"] else "source_status")
+                row=open_rows.get(key)
+                if row and (row["status"],row["reason"])==(status,reason) and not p["sleep_s"]:
+                    row["end_ns"]=min(end_ns,p["end_ns"]);row["reads"]+=1
+                    continue
+                row={"status":status,"reason":reason,"start_ns":max(start_ns,p["start_ns"]),"end_ns":min(end_ns,p["end_ns"]),
+                     "source":p["source"],"signal":p["signal"],"entity":p["entity"],"sleep_s":p["sleep_s"],"reads":1}
+                gaps.append(row);open_rows[key]=row
+            else:
+                open_rows.pop(key,None)
         return {"sources":{k:dict(v) for k,v in states.items()},"gaps":gaps[:MAX_ROWS],"gap_count":len(gaps),"retention":retention[:MAX_ROWS],
                 "truncated":len(persisted)>MAX_SCAN or len(gaps)>MAX_ROWS or len(retention)>MAX_ROWS,"status_count_method":"overlapping saved source windows plus unsaved reads",
                 "mode":"store_and_tail" if captured else "store_only"}

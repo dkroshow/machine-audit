@@ -201,8 +201,11 @@ unavailable. The resolver is the systemd-resolved stub (5.6 ms lookup).
 `who` ranked one row per workload: CPU by unit and process totals, memory by
 unit `memory.current`. Storage showed only our own process: other users' I/O
 is denied, and with no `io` controller delegated no unit has `io.stat`.
-Coverage listed 3,833 gaps in ten minutes, 1,687 of them from sources that read
-`no_devices` every 5 s.
+Coverage listed 3,833 gap rows in ten minutes. About 1,700 of them repeated,
+every 5 s, fields that can never be observed here: router ping fields with ICMP
+closed, probe byte counts in TCP mode, the sentinel temperature and mains
+state. Sources reading `no_devices` add no rows. A later build lists such a
+run of reads as one row with its count.
 
 **Scanner.** `scan --full` as the service user walked 97,285 entries in 9.4 s
 wall, 4.2 s CPU, `peak_rss_bytes` 35.7 MB (`/usr/bin/time` agreed: 34.8 MB).

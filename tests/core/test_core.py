@@ -43,6 +43,19 @@ class CoreTests(unittest.TestCase):
         self.store.close()
         self.tmp.cleanup()
 
+    def test_a_field_missing_read_after_read_is_one_coverage_row(self):
+        # First Linux validation: ten minutes of router ping fields, with ICMP closed, listed
+        # 120 gap rows each. One good read in the middle ends the first row.
+        records=[]
+        for n in range(120):
+            c=Clock(n*5*S,n*5*S,n*5*S)
+            rtt=Field("network.ping_rtt",1,"ns",entity="router",scope="router") if n==60 else \
+                Field("network.ping_rtt",None,"ns",status="unobserved",entity="router",scope="router")
+            records.append(Record(Reading("synthetic.probes","network",c,c,(rtt,Field("network.dns",5,"ns"))),"boot","run",n+1,c.wall_ns,c))
+        self.store.append(records)
+        gaps=[g for g in Query(self.store).coverage(0,600*S)["gaps"] if g.get("signal")=="network.ping_rtt"]
+        self.assertEqual([(g["reads"],g["start_ns"],g["end_ns"]) for g in gaps],[(60,0,295*S),(59,305*S,595*S)])
+
     def test_hour_only_scope_writes_no_minute_summaries(self):
         # Per-scope summary resolution: Linux unit limits (scope unit_detail) were 10% of the first
         # Ubuntu run's summary payload while changing rarely.

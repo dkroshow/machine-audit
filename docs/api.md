@@ -75,7 +75,9 @@ store/tail snapshot. `/api/catalog` returns discovered signals and components.
 
 Every answer has `schema_version: 1`, `shape`, `status`, and `coverage`.
 Intervals have `requested: {start_ns,end_ns}`, `covered`, `resolution`, `rows`,
-`gaps`, `truncated`, `next_start_ns` when paging. Rows carry `start_ns`, `end_ns`,
+`gaps`, `truncated`, `next_start_ns` when paging. A field missing read after read
+is one gap row spanning those reads, with `entity` and a `reads` count; a good
+read of it ends the row. Rows carry `start_ns`, `end_ns`,
 `signal`, `entity`, `label`, `scope`, `unit`, `kind`, `status`, plus aggregate
 fields (`total`, `covered_s`, `mean`, `min`, `max`, `max_ns`, `last`, `count`,
 `peak_rate`, `peak_ns`, `above_s`, `histogram_s` as appropriate).

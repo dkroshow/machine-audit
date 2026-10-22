@@ -108,6 +108,12 @@ class LinuxScannerTests(unittest.TestCase):
         os.chmod(self.root, 0o311)  # traversable, not listable
         try:
             result = self.scan()
+            # Dev box: the denied EFI volume was walked again every hourly run. It now waits for the
+            # next night's walk, or an operator's scan --full.
+            self.assertEqual(self.scan()['volumes'][0], {'volume_id': result['volumes'][0]['volume_id'], 'status': 'current'})
+            with patch('machine_audit.scanner.linux.os.nice'):
+                forced = run_scan(self.data, root=str(self.root), force=True)['volumes'][0]
+            self.assertEqual((forced['status'], forced['action']), ('denied', 'full'))
         finally:
             os.chmod(self.root, 0o755)
         self.assertEqual((result['status'], result['volumes'][0]['status']), ('observed', 'denied'))
