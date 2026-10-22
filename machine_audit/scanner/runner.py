@@ -156,14 +156,17 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                 action,trigger=next_decision(now_ns=now,full_ns=old['full_ns'] if has_root else None,
                     update_ns=old['observed_ns'] if old else None,bookmark=old['bookmark'] if old else None,
                     no_progress=old['no_progress'] if old else 0,requested_full=full)
-                # The daily limit applies to completed maps. An explicit full
-                # request must retry an unsuccessful attempt, keeping the old
-                # map's observation times intact until publication succeeds.
+                # CLI --full can retry immediately. The persistent full setting
+                # retries a failed volume at most daily, from its last attempt
+                # rather than its last successful publication.
                 if full and old and old['status'] not in ('observed','partial','invalid','unavailable'):
-                    action,trigger='full','failed_volume_retry'
+                    if force or old['full_attempt_ns'] is None or now-old['full_attempt_ns']>=86400*10**9:
+                        action,trigger='full','failed_volume_retry'
+                    else:action,trigger='wait','failed_full_retry_cooldown'
                 if action=='wait':
                     store.phase('complete',action=action,trigger=trigger)
-                    results.append({'volume_id':volume.id,'status':'current','action':action,'trigger':trigger})
+                    status=old['status'] if trigger=='failed_full_retry_cooldown' else 'current'
+                    results.append({'volume_id':volume.id,'status':status,'action':action,'trigger':trigger})
                     continue
                 store.phase('events',action=action,trigger=trigger)
                 event_uuid=events.uuid(volume.device)

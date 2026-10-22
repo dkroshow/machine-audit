@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS volumes(
  key INTEGER PRIMARY KEY,id TEXT NOT NULL UNIQUE,label TEXT NOT NULL,mount TEXT NOT NULL,generation INTEGER,
  observed_ns INTEGER,full_ns INTEGER,volume_used INTEGER,capacity INTEGER,free INTEGER,available INTEGER,
  valid INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL,lean INTEGER NOT NULL,bookmark INTEGER,
- no_progress INTEGER NOT NULL DEFAULT 0,event_uuid TEXT,gaps TEXT NOT NULL DEFAULT '[]',mounted INTEGER NOT NULL DEFAULT 1);
+ no_progress INTEGER NOT NULL DEFAULT 0,event_uuid TEXT,gaps TEXT NOT NULL DEFAULT '[]',mounted INTEGER NOT NULL DEFAULT 1,full_attempt_ns INTEGER);
 CREATE TABLE IF NOT EXISTS nodes(
  generation INTEGER NOT NULL,volume INTEGER NOT NULL,id INTEGER NOT NULL,parent INTEGER,label TEXT,kind TEXT NOT NULL,
  own_listed INTEGER NOT NULL,own_uses INTEGER NOT NULL,listed INTEGER,uses INTEGER,status TEXT NOT NULL,mtime INTEGER,
@@ -131,6 +131,9 @@ class MapStore:
                 with self.write(rows=len(missing_columns)):
                     for column in sorted(missing_columns):
                         self.db.execute(f'ALTER TABLE runs ADD COLUMN {column} TEXT')
+            if 'full_attempt_ns' not in {r['name'] for r in self.db.execute('PRAGMA table_info(volumes)')}:
+                with self.write(rows=1):
+                    self.db.execute('ALTER TABLE volumes ADD COLUMN full_attempt_ns INTEGER')
         except BaseException:
             if self.db is not None:self.db.close()
             raise
@@ -191,10 +194,12 @@ class MapStore:
 
     def prepare(self,volume,full=True,lean=True):
         self.flush();self.prune_generations(full)
-        with self.write(rows=3):
+        with self.write(rows=4 if full else 3):
             self.db.execute('INSERT OR IGNORE INTO volumes(id,label,mount,status,lean) VALUES(?,?,?,?,?)',
                             (volume.id,volume.label,volume.mount,'building',int(lean)))
             old=self.db.execute('SELECT * FROM volumes WHERE id=?',(volume.id,)).fetchone()
+            if full:
+                self.db.execute('UPDATE volumes SET full_attempt_ns=? WHERE id=?',(time.time_ns(),volume.id))
             self.generation=self.db.execute("SELECT value FROM map_meta WHERE key='next_generation'").fetchone()[0]
             self.db.execute("UPDATE map_meta SET value=value+1 WHERE key='next_generation'")
             self.db.execute("INSERT INTO generations VALUES(?,?,'building')",(self.generation,old['key']))

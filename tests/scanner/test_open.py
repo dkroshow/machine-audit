@@ -104,6 +104,7 @@ class RootPublicationTests(unittest.TestCase):
             volume = dict(zip((column[0] for column in cursor.description),cursor.fetchone()))
             # Attempt status can change without changing the published map.
             volume.pop('status')
+            volume.pop('full_attempt_ns')
             generation = db.execute("SELECT generation FROM volumes WHERE id='v'").fetchone()[0]
             nodes = db.execute('SELECT * FROM nodes WHERE generation=? ORDER BY id', (generation,)).fetchall()
             points = db.execute("SELECT * FROM points WHERE volume='v' ORDER BY id,observed_ns").fetchall()
@@ -114,7 +115,7 @@ class RootPublicationTests(unittest.TestCase):
         children.pop('status')  # Last attempt status is checked separately.
         return volume, nodes, points, epochs, hierarchy, state, children
 
-    def scan(self, volumes, policy=None, events=None):
+    def scan(self, volumes, policy=None, events=None, force=False):
         native = SimpleNamespace(process=lambda pid: SimpleNamespace(proc_start_abstime=1, diskio_byteswritten=0))
         filesystem = SimpleNamespace(volumes=lambda: volumes, sharing=lambda *args: None)
         events = events or SimpleNamespace(uuid=lambda device: 'events', current_id=lambda: 20)
@@ -124,7 +125,7 @@ class RootPublicationTests(unittest.TestCase):
              patch('machine_audit.scanner.runner.FSEvents', return_value=events), \
              patch('machine_audit.scanner.runner.os.nice'), \
              patch('machine_audit.scanner.runner.Policy', return_value=policy or Policy(home=str(self.base), homes=[])):
-            result = run_scan(self.data, full=True)
+            result = run_scan(self.data, full=True, force=force)
         with sqlite3.connect(self.data / 'scanner.sqlite') as db:
             status, ended = db.execute('SELECT status,ended_ns FROM runs ORDER BY started_ns DESC LIMIT 1').fetchone()
         self.assertIsNotNone(ended)
@@ -150,7 +151,7 @@ class RootPublicationTests(unittest.TestCase):
                     walker.walk()
                     self.assertEqual(walker.listed, set())
                     self.assertEqual(sink.directory.call_args.args[0].status, 'denied')
-                result, status = self.scan([volume])
+                result, status = self.scan([volume],force=True)
                 self.assertEqual(self.published(), before)
                 self.assertEqual((result['status'], status), ('root_unreadable', 'root_unreadable'))
                 self.assertEqual(result['volumes'][0]['status'], 'root_unreadable')
@@ -178,7 +179,7 @@ class RootPublicationTests(unittest.TestCase):
                 (BudgetExceeded('synthetic private path'), 'budget_blocked', 'budget_blocked_BudgetExceeded'),
                 (sqlite3.OperationalError('synthetic private path'), 'write_failed', 'write_failed_OperationalError')):
             with self.subTest(reason=reason), patch.object(MapStore, 'finish_volume', side_effect=error):
-                result, status = self.scan([self.volume])
+                result, status = self.scan([self.volume],force=True)
                 self.assertEqual(result['status'], status_code)
                 self.assertEqual(result['reason'], reason)
                 self.assertEqual(result['exception_type'], type(error).__name__)
@@ -209,7 +210,7 @@ class RootPublicationTests(unittest.TestCase):
         before=self.published()
         with patch.object(MapStore,'_aggregate_full',side_effect=ScanError('missing_directory_ancestor')), \
              patch('machine_audit.scanner.runner.time.time_ns',return_value=110*10**9):
-            result,status=self.scan([self.volume])
+            result,status=self.scan([self.volume],force=True)
         self.assertEqual(result['action'],'full')
         self.assertEqual(result['trigger'],'failed_volume_retry')
         self.assertEqual(status,'missing_directory_ancestor_ScanError')
@@ -217,10 +218,35 @@ class RootPublicationTests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT status FROM volumes').fetchone()[0],status)
         self.assertEqual(self.published(),before)
         with patch('machine_audit.scanner.runner.time.time_ns',return_value=120*10**9):
-            result,status=self.scan([self.volume])
+            result,status=self.scan([self.volume],force=True)
         self.assertEqual((result['action'],result['trigger'],status),('full','failed_volume_retry','complete'))
         with sqlite3.connect(self.data/'scanner.sqlite') as db:
             self.assertEqual(db.execute('SELECT status,full_ns FROM volumes').fetchone(),('observed',120*10**9))
+
+    def test_scanner_full_retries_failed_volume_only_daily_unless_explicit(self):
+        day=86400*10**9
+        first=100*10**9+day
+        with patch.object(MapStore,'_aggregate_full',side_effect=ScanError('missing_directory_ancestor')) as aggregate:
+            with patch('machine_audit.scanner.runner.time.time_ns',return_value=first):
+                result,status=self.scan([self.volume])  # Persistent scanner_full, not CLI --full.
+            self.assertEqual(status,'missing_directory_ancestor_ScanError')
+            for hours in (1,2,23):
+                with patch('machine_audit.scanner.runner.time.time_ns',return_value=first+hours*3600*10**9):
+                    result,_=self.scan([self.volume])
+                self.assertEqual((result['action'],result['trigger']),('wait','failed_full_retry_cooldown'))
+                self.assertEqual(result['volumes'][0]['status'],'missing_directory_ancestor_ScanError')
+            self.assertEqual(aggregate.call_count,1)
+            with patch('machine_audit.scanner.runner.time.time_ns',return_value=first+day):
+                result,_=self.scan([self.volume])
+            self.assertEqual((result['action'],result['trigger']),('full','failed_volume_retry'))
+            self.assertEqual(aggregate.call_count,2)
+            with patch('machine_audit.scanner.runner.time.time_ns',return_value=first+day+10):
+                result,_=self.scan([self.volume],force=True)
+            self.assertEqual(result['action'],'full')
+            self.assertEqual(aggregate.call_count,3)
+        with sqlite3.connect(self.data/'scanner.sqlite') as db:
+            self.assertEqual(db.execute('SELECT full_ns,full_attempt_ns FROM volumes').fetchone(),
+                             (100*10**9,first+day+10))
 
     def test_root_must_scan_uses_full_writer_and_records_its_trigger(self):
         events = SimpleNamespace(uuid=lambda device:'events', current_id=lambda:30,

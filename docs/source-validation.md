@@ -374,8 +374,11 @@ publishes. Admission failure or transaction rollback keeps the refresh pending;
 unobserved folders are not cleared. Cleanup joins each dirty identity to the
 listing primary key and counts the deletions in the publication reservation.
 
-Failed-volume recovery: an explicit full request retries a failed attempt even
-inside the successful map's daily cooldown. Access checks still run first;
+Failed-volume recovery: CLI `scan --full` retries a failed attempt even inside
+the daily cooldown. Persistent `scanner_full` retries at most daily from the
+last full attempt, stored as `volumes.full_attempt_ns` at preparation. Legacy
+stores leave this unknown until an actual attempt; no history is invented.
+Hourly waits keep the prior failure code visible. Access checks still run first;
 published map times, points and hierarchy change only on successful publication.
 Unreadable root attempts now save their safe reason in `volumes.status`, while
 invariant exceptions already save their specific code there. A partial run at
