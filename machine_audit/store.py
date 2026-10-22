@@ -14,7 +14,7 @@ import time
 import zlib
 from .budget import Budget, BudgetExceeded
 from .derive import points, rollups, merge_summaries
-from .model import Record, field_component, is_series
+from .model import Record, field_component, is_series, who_rank
 
 MINUTE = 60_000_000_000
 QUARTER = 15 * MINUTE
@@ -43,7 +43,7 @@ CREATE INDEX IF NOT EXISTS reading_components_record ON reading_components(run_i
 CREATE INDEX IF NOT EXISTS readings_time ON readings(wall_ns,source);
 CREATE INDEX IF NOT EXISTS readings_source_time ON readings(source,wall_ns);
 CREATE TABLE IF NOT EXISTS signal_catalog(source TEXT NOT NULL, signal TEXT NOT NULL, component TEXT NOT NULL, kind TEXT NOT NULL, unit TEXT NOT NULL, scope TEXT NOT NULL, scale REAL NOT NULL, PRIMARY KEY(source,signal,scope));
-CREATE TABLE IF NOT EXISTS summaries(id INTEGER PRIMARY KEY, run_id TEXT NOT NULL, sequence_min INTEGER NOT NULL, sequence_max INTEGER NOT NULL, resolution TEXT NOT NULL, bucket_ns INTEGER NOT NULL, source TEXT NOT NULL, component TEXT NOT NULL, entity TEXT NOT NULL, payload BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS summaries(id INTEGER PRIMARY KEY, run_id TEXT NOT NULL, sequence_min INTEGER NOT NULL, sequence_max INTEGER NOT NULL, resolution TEXT NOT NULL, bucket_ns INTEGER NOT NULL, source TEXT NOT NULL, component TEXT NOT NULL, entity TEXT NOT NULL, payload BLOB NOT NULL, who_rank REAL);
 CREATE INDEX IF NOT EXISTS summaries_time ON summaries(resolution,component,bucket_ns);
 CREATE UNIQUE INDEX IF NOT EXISTS summaries_identity ON summaries(run_id,resolution,bucket_ns,source,component,entity);
 CREATE TABLE IF NOT EXISTS baselines(source TEXT PRIMARY KEY, run_id TEXT NOT NULL, payload BLOB NOT NULL);
@@ -66,9 +66,14 @@ def pack_summaries(rows):
     return zlib.compress(encode([2, [[keys,values] for keys,values in groups.items()]]).encode(), 1)
 
 
-UPSERT_SUMMARY = ("INSERT INTO summaries(run_id,sequence_min,sequence_max,resolution,bucket_ns,source,component,entity,payload) VALUES(?,?,?,?,?,?,?,?,?) "
+UPSERT_SUMMARY = ("INSERT INTO summaries(run_id,sequence_min,sequence_max,resolution,bucket_ns,source,component,entity,who_rank,payload) VALUES(?,?,?,?,?,?,?,?,?,?) "
                   "ON CONFLICT(run_id,resolution,bucket_ns,source,component,entity) DO UPDATE SET "
-                  "sequence_min=excluded.sequence_min,sequence_max=excluded.sequence_max,payload=excluded.payload")
+                  "sequence_min=excluded.sequence_min,sequence_max=excluded.sequence_max,who_rank=excluded.who_rank,payload=excluded.payload")
+
+
+def summary_values(run_id, lower, upper, resolution, bucket, source, component, entity, rows):
+    """One bundle to upsert, with the bound `who` ranks it by; the payload stays last."""
+    return (run_id, lower, upper, resolution, bucket, source, component, entity, who_rank(rows), pack_summaries(rows))
 
 
 def signal_key(row):
@@ -153,6 +158,11 @@ class Store:
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.execute("PRAGMA synchronous=FULL")
             self.db.executescript(SCHEMA)
+            if "who_rank" not in {row[1] for row in self.db.execute("PRAGMA table_info(summaries)")}:
+                # Rows saved before stay NULL and `who` decodes them as it always has.
+                self.db.execute("ALTER TABLE summaries ADD COLUMN who_rank REAL")
+            # The first ranked bucket dates the column: later NULLs mean nothing ranks.
+            self.db.execute("CREATE INDEX IF NOT EXISTS summaries_ranked ON summaries(resolution,bucket_ns) WHERE who_rank IS NOT NULL")
             self.db.execute("PRAGMA user_version=2")
             self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
@@ -195,7 +205,7 @@ class Store:
                     if row["entity"] in keep:groups[(row["source"],row["component"],row["entity"])].append(row)
                 for key,group in groups.items():
                     on_time(deadline)
-                    prepared.append((run_id,held["lower"],held["upper"],"minute",held["bucket"],*key,pack_summaries(group)))
+                    prepared.append(summary_values(run_id,held["lower"],held["upper"],"minute",held["bucket"],*key,group))
             def write():
                 with self.budget.sqlite_write(self.db,self.path,rows=1+len(prepared),payload_bytes=sum(len(row[-1]) for row in prepared)):
                     self.db.execute("BEGIN IMMEDIATE")
@@ -392,7 +402,7 @@ class Store:
                 k=signal_key(row)
                 merged[k]=merge_summaries([merged[k],row]) if k in merged else row
             if old:lower=min(lower,old[0])
-            prepared.append((first.run_id,lower,last.sequence,resolution,bucket,source,component,entity,pack_summaries(list(merged.values()))))
+            prepared.append(summary_values(first.run_id,lower,last.sequence,resolution,bucket,source,component,entity,list(merged.values())))
         for source in {r.reading.source for r in records}:
             old=self.db.execute('SELECT length(payload) FROM baselines WHERE source=?',(source,)).fetchone()
             if old:replaced_payload+=old[0]

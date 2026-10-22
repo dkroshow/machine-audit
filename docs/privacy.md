@@ -17,6 +17,10 @@ evidence behind it.
 | `entity` | `kind:id` where the id is numeric, a hash, a UUID or an interface index | Source discipline; `_NAME` bounds shape only |
 | `reason` | A code: letters, digits, underscore | `_CODE` in `model.py` |
 
+A summary row adds one derived number, `who_rank`: the largest value `who`
+ranks that bundle by, computed from the bundle's own measures (`who_rank` in
+`model.py`). It holds nothing new in kind and is not exported.
+
 Never, in any slot, export, log, error, test fixture or feedback: file or
 folder names, paths, command lines, arguments, environment values, host names,
 IP or hardware addresses, network names, user names, service, unit, container

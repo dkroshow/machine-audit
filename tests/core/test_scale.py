@@ -1,6 +1,7 @@
 """Review-scale regressions. Fixtures contain no machine observations or private labels."""
 from collections import defaultdict
 from dataclasses import replace
+from contextlib import nullcontext
 from pathlib import Path
 import ctypes
 import json
@@ -138,6 +139,17 @@ class ScaleTests(unittest.TestCase):
         self.assertEqual((brief['total_rows'],brief['accounting']),(full['total_rows'],full['accounting']))
         self.assertEqual(brief['coverage']['sources'],full['coverage']['sources'])
         self.assertNotIn('gaps',brief)
+        # Saved rows carry a who_rank bound: who reads entities from the highest bound
+        # down and stops, with the rows and totals of reading every entity.
+        def answer(full):
+            reads=[]
+            def counting(payload,keep=None):reads.append(1);return unpack_summaries(payload,keep)
+            with patch('machine_audit.query.unpack_summaries',side_effect=counting),\
+                 (patch.object(Query,'_who_ranked',return_value=None) if full else nullcontext()):
+                return query.who(end-3600*S,end,component='memory',limit=75),len(reads)
+        (every,every_reads),(ranked,ranked_reads)=answer(True),answer(False)
+        self.assertEqual((ranked['rows'],ranked['total_rows']),(every['rows'],every['total_rows']))
+        self.assertLess(ranked_reads,every_reads/4)
 
     def test_brief_now_gives_each_components_top_five_and_host_totals_under_20_kb(self):
         # A first user's agent read `now` at 833 KB; brief gives a few hundred tokens.

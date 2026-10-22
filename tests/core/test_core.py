@@ -149,6 +149,24 @@ class CoreTests(unittest.TestCase):
         gaps=[g for g in Query(self.store).coverage(0,720*S)["gaps"] if g.get("source")=="synthetic.probes"]
         self.assertEqual([(g["reads"],g["start_ns"],g["end_ns"]) for g in gaps],[(12,0,55*S),(12,660*S,715*S)])
 
+    def test_who_answers_rows_saved_before_who_rank_by_reading_them(self):
+        # An older store has no who_rank column: the collector's open adds it, empty, and
+        # who reads those rows as before, with the answer the ranked rows give.
+        records=[]
+        for t in range(0,2*3600,60):
+            c=Clock(t*S,t*S,t*S)
+            fields=tuple(Field("process.cpu",t*pid,"seconds","counter",entity=f"process:{pid}",label=f"p{pid}",scope="process",additive=True) for pid in range(1,7))
+            records.append(Record(Reading("synthetic.process","cpu",c,c,fields),"boot","run",len(records)+1,c.wall_ns,c))
+        self.store.append(records)
+        ranked=Query(self.store).who(1800*S,5400*S,component="cpu",limit=3)
+        self.store.close()
+        with sqlite3.connect(self.store.path) as db:
+            db.execute("DROP INDEX summaries_ranked");db.execute("ALTER TABLE summaries DROP COLUMN who_rank")
+        self.store=Store(Path(self.tmp.name)/"readings.sqlite",self.budget)
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM summaries WHERE who_rank IS NOT NULL").fetchone()[0],0)
+        self.assertEqual(Query(self.store).who(1800*S,5400*S,component="cpu",limit=3)["rows"],ranked["rows"])
+        self.assertEqual([r["entity"] for r in ranked["rows"]],["program:p6","program:p5","program:p4"])
+
     def test_hour_coverage_merges_a_sources_unmeasured_lanes_into_one_gap_row(self):
         # Big Mac's hour of coverage listed 1,540 gap rows, one per lane, and hit the scan
         # cap. A source's lanes with the same status share one row, its reads summed.

@@ -251,3 +251,35 @@ def is_process_evidence(entity: str, scope: str) -> bool:
 
 def is_series(component: str, entity: str, scope: str) -> bool:
     return component == "self" or not is_process_evidence(entity, scope)
+
+
+# Without a named signal, each workload ranks once, by its component total: CPU time, written
+# bytes, and the memory view's footprint (Mac footprint; a Linux unit's charge, which already
+# holds its processes' resident sets). Components need an explicit signal.
+WHO_TOTALS = {"cpu": {"process.cpu", "unit.cpu.stat.usage_usec"},
+              "storage": {"process.diskio_byteswritten", "unit.io.stat.wbytes"},
+              "memory": {"process.phys_footprint", "unit.memory.current"}}
+
+
+def who_ranks(signal: str, kind: str, component: str) -> bool:
+    """Without a named signal: the component total, plus states and events (failed
+    reads, identities), which remain evidence."""
+    return kind in ("state", "event") or signal in WHO_TOTALS.get(component, (signal,))
+
+
+def who_row(row: dict) -> bool:
+    return (is_process_evidence(row["entity"], row["scope"]) and row["scope"] != "unit_detail" and
+            (row["entity"].startswith("program:") or not row["additive"] or row["component"] == "self" or row["scope"] == "unit"))
+
+
+def who_value(row: dict) -> float:
+    """The value `who` ranks a row by."""
+    return row.get("mean_rate", row.get("mean")) or 0
+
+
+def who_rank(rows) -> float | None:
+    """A stored bundle's ranking bound: the largest value among its rows that `who`
+    ranks without a named signal; None when none does. Over a window, a merged row's
+    rate or mean is a weighted average of its buckets', so it never exceeds this."""
+    values = [who_value(r) for r in rows if who_ranks(r["signal"], r["kind"], r["component"]) and who_row(r)]
+    return max(values) if values else None

@@ -13,14 +13,9 @@ from dataclasses import replace
 from itertools import chain, groupby, takewhile
 from .derive import points, rollups, summarize, merge_summaries, GOOD, BUSY
 from .store import MINUTE, QUARTER, HOUR, WIDTHS, unpack_summaries
-from .model import PROCESS_ENTITIES, Record, field_component, is_process_evidence, is_series
+from .model import (PROCESS_ENTITIES, WHO_TOTALS, Record, field_component, is_process_evidence, is_series,
+                    who_ranks, who_row, who_value)
 
-# Without a named signal, each workload ranks once, by its component total: CPU time, written
-# bytes, and the memory view's footprint (Mac footprint; a Linux unit's charge, which already
-# holds its processes' resident sets). Components need an explicit signal.
-WHO_TOTALS = {"cpu": {"process.cpu", "unit.cpu.stat.usage_usec"},
-              "storage": {"process.diskio_byteswritten", "unit.io.stat.wbytes"},
-              "memory": {"process.phys_footprint", "unit.memory.current"}}
 # Beside each component's workload total, a brief answer gives these host totals; the
 # names cover both platforms, and a signal a platform lacks is simply absent.
 HOST_TOTALS = {"cpu": {"cpu.busy", "cpu.capacity"},
@@ -175,11 +170,10 @@ class Query:
         unique = {(r.run_id,r.sequence):r for r in records}
         return sorted(unique.values(),key=lambda r:(r.reading.end.wall_ns,r.sequence)),overflow
 
-    def _iter_summaries(self,db,captured,start_ns,end_ns,resolution,signals=None,
-                        component=None,program_only=False,series_only=False,spans=None,stored=None,keep=None):
-        """Matching summary rows in source, entity, bucket order. `stored`, a one-item
-        list, accumulates the stored payload bytes read, for callers that bound them;
-        `keep` is passed to unpack_summaries."""
+    @staticmethod
+    def _summary_clause(captured,start_ns,end_ns,resolution,signals=None,component=None,
+                        program_only=False,series_only=False,spans=None,entities=None):
+        """The WHERE clause and arguments selecting summary rows; None when no span is open."""
         width = WIDTHS[resolution]
         spans = spans or [(resolution,start_ns//width*width,end_ns)]
         args=[];parts=[]
@@ -187,7 +181,7 @@ class Query:
             if lo < hi:
                 parts.append("(resolution=? AND bucket_ns>=? AND bucket_ns<?)")
                 args.extend((res,lo,hi))
-        if not parts:return
+        if not parts:return None
         clause="("+" OR ".join(parts)+")"
         if captured:
             clause+=" AND (run_id != ? OR sequence_max<=?)"
@@ -204,6 +198,20 @@ class Query:
             args.extend(prefix+"%" for prefix in PROCESS_ENTITIES)
             clause+=" AND EXISTS(SELECT 1 FROM signal_catalog sc WHERE sc.source=summaries.source AND sc.component=summaries.component AND is_series(sc.component,summaries.entity,sc.scope))"
         if program_only:clause+=" AND entity LIKE 'program:%'"
+        if entities is not None:
+            if not entities:return None
+            clause+=" AND (source,entity) IN (VALUES "+",".join("(?,?)" for _ in entities)+")"
+            args.extend(value for pair in entities for value in pair)
+        return clause,args
+
+    def _iter_summaries(self,db,captured,start_ns,end_ns,resolution,signals=None,
+                        component=None,program_only=False,series_only=False,spans=None,stored=None,keep=None,entities=None):
+        """Matching summary rows in source, entity, bucket order. `stored`, a one-item
+        list, accumulates the stored payload bytes read, for callers that bound them;
+        `keep` is passed to unpack_summaries."""
+        selection=self._summary_clause(captured,start_ns,end_ns,resolution,signals,component,program_only,series_only,spans,entities)
+        if selection is None:return
+        clause,args=selection
         # Sort compact row identities, never compressed payloads, then fetch payloads
         # in batches. The snapshot keeps them stable while a writer replaces rows.
         selected=db.execute("SELECT id,bucket_ns,resolution,source FROM summaries WHERE "+clause+" ORDER BY source,entity,bucket_ns",args).fetchall()
@@ -267,23 +275,28 @@ class Query:
         """The finest stored resolution whose rows per lane fit the requested limit."""
         return next((r for r in RESOLUTIONS[:-1] if -(-(end_ns-start_ns)//WIDTHS[r])<=limit),"hour")
 
-    def _who_summaries(self,db,captured,start_ns,end_ns,signal,component):
-        # Full interior hours; 15-minute and minute rows only for the sides. No
-        # input LIMIT can silently turn the first part of a day into the whole day.
+    @staticmethod
+    def _who_spans(start_ns,end_ns):
+        """Full interior hours; 15-minute and minute rows only for the sides. No input
+        LIMIT can silently turn the first part of a day into the whole day."""
         lo=(start_ns+HOUR-1)//HOUR*HOUR;hi=end_ns//HOUR*HOUR
         sides=[(start_ns,lo),(hi,end_ns)] if lo<hi else [(start_ns,end_ns)]
         spans=[("hour",lo,hi)] if lo<hi else []
         for a,b in sides:
             spans+=[("15-minute",a//QUARTER*QUARTER,b),("minute",a//MINUTE*MINUTE,b)]
+        return spans
+
+    def _who_summaries(self,db,captured,start_ns,end_ns,signal,component,entities=None):
+        spans=self._who_spans(start_ns,end_ns)
         # Rows outside the window still show which minutes have a row; filter after choosing.
         # Without a named signal only component totals rank; skip the rest unbuilt.
-        keep=None if signal else self._ranks
-        wide=self._iter_summaries(db,captured,start_ns//QUARTER*QUARTER,end_ns+QUARTER,"hour",[signal] if signal else None,component,program_only=signal=="process.cpu",spans=spans,keep=keep)
+        keep=None if signal else who_ranks
+        wide=self._iter_summaries(db,captured,start_ns//QUARTER*QUARTER,end_ns+QUARTER,"hour",[signal] if signal else None,component,program_only=signal=="process.cpu",spans=spans,keep=keep,entities=entities)
         rows=(row for _,group in groupby(wide,key=lambda r:(r["source"],r["entity"])) for row in self._edge_rows(group,start_ns,end_ns)
               if row["start_ns"]<end_ns and row["end_ns"]>=start_ns)
         first=next(rows,None)
         if first is None:
-            rows=self._iter_summaries(db,captured,start_ns,end_ns,"hour",[signal] if signal else None,component,program_only=signal=="process.cpu",keep=keep)
+            rows=self._iter_summaries(db,captured,start_ns,end_ns,"hour",[signal] if signal else None,component,program_only=signal=="process.cpu",keep=keep,entities=entities)
         else:
             rows=chain((first,),rows)
         current=None;merged={};edges={}
@@ -369,7 +382,7 @@ class Query:
             for part,totals in WHO_TOTALS.items():
                 if component and part!=component:continue
                 top=heapq.nlargest(BRIEF_TOP,(p for p in latest if p["component"]==part and p["signal"] in totals
-                                               and p["status"] in GOOD and self._who_row(p)),key=lambda p:p["value"])
+                                               and p["status"] in GOOD and who_row(p)),key=lambda p:p["value"])
                 host=[p for p in latest if p["component"]==part and p["signal"] in HOST_TOTALS[part] and is_series(p["component"],p["entity"],p["scope"])]
                 if top or host:components[part]={"top":self._brief_rows(top),"host":self._brief_rows(host)}
             result.update(brief=True,components=components,
@@ -608,7 +621,7 @@ class Query:
             groups=defaultdict(list)
             for p in all_points:
                 if p["start_ns"]<start_ns or p["end_ns"]>end_ns or (signal and p["signal"]!=signal) or (component and p["component"]!=component):continue
-                if self._who_row(p):
+                if who_row(p):
                     groups[(p["source"],p["signal"],p["entity"],p["unit"],p["scale"],p["scope"])].append(p)
             raw_rows=[summarize(v) for v in groups.values()]
             resolution="raw"
@@ -634,23 +647,13 @@ class Query:
                         extra=tail.pop(k,None)
                         yield merge_summaries([r,extra]) if extra else r
                     yield from tail.values()
-                candidates=with_tail(candidates)
                 if signal=="process.cpu":
                     host_rows=list(self._who_summaries(db,captured,start_ns,end_ns,"cpu.busy","cpu"))
-            else:candidates=iter(raw_rows)
-            # Only output is paged. All candidate programs contribute to totals;
-            # each entity is merged and discarded before reading the next one.
-            heap=[];count=0;attributed=None;lo=None;hi=None;partial=False;boundary=False
-            for r in candidates:
-                if not self._who_row(r):continue
-                if signal is None and not self._ranks(r["signal"],r["kind"],r["component"]):continue
-                count+=1;lo=r["start_ns"] if lo is None else min(lo,r["start_ns"]);hi=r["end_ns"] if hi is None else max(hi,r["end_ns"])
-                partial=partial or r.get("partial_members",False);boundary=boundary or r.get("partial_boundary",False)
-                if signal=="process.cpu" and r["total"] is not None:attributed=(attributed or 0)+r["total"]*r["scale"]
-                entry=(r.get("mean_rate",r.get("mean")) or 0,count,r)
-                if len(heap)<limit:heapq.heappush(heap,entry)
-                elif entry[0]>heap[0][0]:heapq.heapreplace(heap,entry)
-            rows=[entry[2] for entry in sorted(heap,reverse=True)]
+                ranked=None if signal or tail else self._who_ranked(db,captured,start_ns,end_ns,component,limit)
+                totals=ranked or self._who_rank(enumerate(with_tail(candidates)),signal,limit)
+            else:totals=self._who_rank(enumerate(raw_rows),signal,limit)
+            heap,count,attributed,lo,hi,partial,boundary=(totals[k] for k in ("heap","count","attributed","lo","hi","partial","boundary"))
+            rows=[entry[2] for entry in sorted(heap,reverse=True,key=lambda e:e[:2])]
             coverage=self._coverage(db,captured,start_ns,end_ns,records,component,derived=all_points)
         accounting={"additive":False,"reason":"signal_scopes_not_additive"}
         if signal=="process.cpu":
@@ -676,6 +679,65 @@ class Query:
         return result
 
     @staticmethod
+    def _who_rank(candidates,signal,limit,totals=None):
+        """Rank (order, row) candidates; only output is paged, and every candidate counts
+        toward the totals. Among equal values the earlier order wins and is listed first."""
+        t=totals or dict(heap=[],count=0,attributed=None,lo=None,hi=None,partial=False,boundary=False)
+        heap=t["heap"]
+        for order,r in candidates:
+            if not who_row(r):continue
+            if signal is None and not who_ranks(r["signal"],r["kind"],r["component"]):continue
+            t["count"]+=1
+            t["lo"]=r["start_ns"] if t["lo"] is None else min(t["lo"],r["start_ns"]);t["hi"]=r["end_ns"] if t["hi"] is None else max(t["hi"],r["end_ns"])
+            t["partial"]=t["partial"] or r.get("partial_members",False);t["boundary"]=t["boundary"] or r.get("partial_boundary",False)
+            if signal=="process.cpu" and r["total"] is not None:t["attributed"]=(t["attributed"] or 0)+r["total"]*r["scale"]
+            entry=(who_value(r),Query._earlier(order),r)
+            if len(heap)<limit:heapq.heappush(heap,entry)
+            elif entry[:2]>heap[0][:2]:heapq.heapreplace(heap,entry)
+        return t
+
+    @staticmethod
+    def _earlier(order):
+        """A heap key under which an earlier order ranks higher."""
+        return tuple(-x for x in order) if isinstance(order,tuple) else -order
+
+    def _who_ranked(self,db,captured,start_ns,end_ns,component,limit):
+        """who without a named signal, from rows saved with a `who_rank` bound: entities are
+        read from the highest bound down until no unread one can enter the top `limit`.
+        Rows saved before the column (NULL up to its first ranked bucket) are always read;
+        a later NULL means nothing in that bundle ranks. An unread entity counts as one
+        row; `covered` and the partial flags describe the rows read. None when no saved
+        row carries a bound."""
+        if "who_rank" not in {row[1] for row in db.execute("PRAGMA table_info(summaries)")}:return None
+        selection=self._summary_clause(captured,start_ns,end_ns,"hour",component=component,spans=self._who_spans(start_ns,end_ns))
+        if selection is None:return None
+        clause,args=selection
+        old=[];old_args=[]
+        for resolution in RESOLUTIONS:
+            first=db.execute("SELECT MIN(bucket_ns) FROM summaries WHERE resolution=? AND who_rank IS NOT NULL",(resolution,)).fetchone()[0]
+            old.append("resolution=?"+(" AND bucket_ns<=?" if first is not None else ""))
+            old_args+=[resolution]+([first] if first is not None else [])
+        listing=db.execute("SELECT source,entity,MAX(who_rank),SUM(who_rank IS NULL AND ("+" OR ".join(f"({c})" for c in old)+")) "
+                           "FROM summaries WHERE "+clause+" GROUP BY source,entity ORDER BY source,entity",old_args+args).fetchall()
+        if not any(bound is not None for _,_,bound,_ in listing):return None
+        position={(source,entity):i for i,(source,entity,*_) in enumerate(listing)}
+        def read(entities):
+            seen=defaultdict(int)
+            for r in self._who_summaries(db,captured,start_ns,end_ns,None,component,entities=entities):
+                key=(r["source"],r["entity"]);seen[key]+=1
+                yield (position[key],seen[key]),r
+        totals=self._who_rank(read([(s,e) for s,e,_,unread in listing if unread]),None,limit)
+        bounded=sorted((i for i,(_,_,bound,unread) in enumerate(listing) if bound is not None and not unread),key=lambda i:(-listing[i][2],i))
+        heap=totals["heap"];at=0
+        while at<len(bounded):
+            i=bounded[at]
+            if len(heap)>=limit and (listing[i][2],self._earlier((i,0)))<heap[0][:2]:break
+            chunk=bounded[at:at+64];at+=len(chunk)
+            self._who_rank(read([listing[j][:2] for j in chunk]),None,limit,totals)
+        totals["count"]+=len(bounded)-at
+        return totals
+
+    @staticmethod
     def _who_records(records,signal):
         if not signal:return records
         wanted={signal}
@@ -683,15 +745,6 @@ class Query:
             prefix=signal.split(".")[0];wanted.update((prefix+".user_time",prefix+".system_time","cpu.busy")+BUSY)
         return [replace(r,reading=replace(r.reading,fields=tuple(f for f in r.reading.fields if f.name in wanted))) for r in records]
 
-    @staticmethod
-    def _ranks(signal,kind,component):
-        """Without a named signal: the component total, plus states and events (failed
-        reads, identities), which remain evidence."""
-        return kind in ("state","event") or signal in WHO_TOTALS.get(component,(signal,))
-
-    @staticmethod
-    def _who_row(row):
-        return is_process_evidence(row["entity"],row["scope"]) and row["scope"]!="unit_detail" and (row["entity"].startswith("program:") or not row["additive"] or row["component"]=="self" or row["scope"]=="unit")
 
     @measured
     def coverage(self,start_ns,end_ns,component=None,limit=600):

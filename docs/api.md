@@ -269,6 +269,18 @@ histograms apply only to `cpu.busy`, `process.cpu` and `self.cpu`; byte/page gau
 have empty CPU histograms. Component and signal filters still apply within each
 bundle. Queries decode matching interval/entity bundles, not the entire history.
 
+Each summary row also stores one number, `who_rank` (nullable): the largest
+value `who` ranks a row of that bundle by without a named signal (its mean
+rate, or mean for gauges), or NULL when nothing in it ranks. A window's merged
+rate or mean is a weighted average of its buckets', so this bounds it. `who`
+without a named signal over saved rows (an hour or more, or no unsaved tail)
+reads entities from the highest bound down and stops once no unread entity can
+enter the top `limit`; an unread entity counts once in `total_rows`, and
+`covered` and the partial flags describe the rows read. Rows saved before the
+column hold NULL up to its first ranked bucket and are always read, as before;
+opening an older store adds the column and rewrites nothing. Among equal values
+`who` keeps and lists the earlier source and entity first.
+
 `who` accepts intervals up to 31 days. It combines complete interior hours with
 15-minute and minute rows at the sides, merges one entity at a time, and ranks
 only the output. Minute rows hold only each minute's top processes and programs;
