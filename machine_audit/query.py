@@ -9,7 +9,7 @@ import math
 import zlib
 import heapq
 from dataclasses import replace
-from itertools import chain, groupby
+from itertools import chain, groupby, takewhile
 from .derive import points, rollups, summarize, merge_summaries, GOOD, BUSY
 from .store import MINUTE, QUARTER, HOUR, WIDTHS, unpack_summaries
 from .model import PROCESS_ENTITIES, Record, field_component, is_process_evidence, is_series
@@ -357,30 +357,37 @@ class Query:
 
     @staticmethod
     def _summary_gaps(rows,start_ns,end_ns):
-        """A lane's consecutive summary rows with the same unmeasured status, or with
-        sleep, form one gap row; `reads` counts those samples."""
-        gaps=[];open_rows={}
-        for row in sorted(rows,key=lambda r:r["summary_bucket_start_ns"]):
-            key=Query._lane(row)
+        """Summary rows with an unmeasured status, or with sleep, become gap rows per
+        source, status and reason over consecutive buckets. `reads` sums the samples of
+        every lane; sleep counts each bucket once, since its lanes share one sleep."""
+        buckets=defaultdict(dict)
+        for row in rows:
             bad={s:n for s,n in row["statuses"].items() if s not in GOOD}
-            if not bad and not row["sleep_s"]:
-                open_rows.pop(key,None);continue
-            status=max(bad,key=bad.get) if bad else "unobserved"
-            reason="summary_status" if bad else "window_contains_sleep"
-            gap,bucket_end=open_rows.get(key,(None,None))
-            if gap and (gap["status"],gap["reason"])==(status,reason) and bucket_end==row["summary_bucket_start_ns"]:
-                gap["end_ns"]=min(end_ns,row["end_ns"]);gap["reads"]+=sum(bad.values());gap["sleep_s"]+=row["sleep_s"]
-            else:
-                gap={"status":status,"reason":reason,"start_ns":max(start_ns,row["start_ns"]),"end_ns":min(end_ns,row["end_ns"]),
-                     "source":row["source"],"signal":row["signal"],"entity":row["entity"],"sleep_s":row["sleep_s"],
-                     "reads":sum(bad.values()),"summary_resolution":row["summary_resolution"]}
-                gaps.append(gap)
-            open_rows[key]=(gap,row["summary_bucket_end_ns"])
-        return gaps
+            if bad:key=(row["source"],max(bad,key=bad.get),"summary_status")
+            elif row["sleep_s"]:key=(row["source"],"unobserved","window_contains_sleep")
+            else:continue
+            span=buckets[key].setdefault(row["summary_bucket_start_ns"],
+                {"start_ns":row["start_ns"],"end_ns":row["end_ns"],"reads":0,"sleep_s":0.0,
+                 "bucket_end_ns":row["summary_bucket_end_ns"],"summary_resolution":row["summary_resolution"]})
+            span["start_ns"]=min(span["start_ns"],row["start_ns"]);span["end_ns"]=max(span["end_ns"],row["end_ns"])
+            span["reads"]+=sum(bad.values());span["sleep_s"]=max(span["sleep_s"],row["sleep_s"])
+        gaps=[]
+        for (source,status,reason),spans in buckets.items():
+            gap=None
+            for bucket in sorted(spans):
+                span=spans[bucket]
+                if gap and gap["bucket_end_ns"]==bucket:
+                    gap.update(end_ns=span["end_ns"],bucket_end_ns=span["bucket_end_ns"],reads=gap["reads"]+span["reads"],sleep_s=gap["sleep_s"]+span["sleep_s"])
+                else:
+                    gap=dict(span,source=source,status=status,reason=reason);gaps.append(gap)
+        for gap in gaps:
+            del gap["bucket_end_ns"]
+            gap.update(start_ns=max(start_ns,gap["start_ns"]),end_ns=min(end_ns,gap["end_ns"]))
+        return sorted(gaps,key=lambda g:(g["start_ns"],g["source"]))
 
-    def _coverage(self,db,captured,start_ns,end_ns,records=(),component=None,derived=None,summaries=None):
+    def _coverage(self,db,captured,start_ns,end_ns,records=(),component=None,derived=None,summary_gaps=None):
         """Reuse derived points only when they came from this exact record selection.
-        Gap rows come from `summaries` instead when the window was answered from them."""
+        A window answered from summaries passes their `summary_gaps` instead."""
         retention=[dict(r) for r in db.execute("SELECT * FROM retention WHERE end_ns>? AND start_ns<? LIMIT 2001",(start_ns,end_ns))]
         states=defaultdict(lambda:defaultdict(int))
         args=["minute" if end_ns-start_ns<=HOUR else "hour",start_ns,end_ns]
@@ -449,7 +456,7 @@ class Query:
                      "start_ns":max(start_ns,reading_start),"end_ns":min(end_ns,reading_end),"reads":1}
                 gaps.append(row)
                 empty_rows[reading.source]=(record.run_id,row)
-        if summaries is not None:gaps.extend(self._summary_gaps(summaries,start_ns,end_ns))
+        if summary_gaps is not None:gaps.extend(summary_gaps)
         def streamed_points():
             previous={}
             for record in records:
@@ -648,9 +655,18 @@ class Query:
             if end_ns-start_ns>10*MINUTE and self._saved(db,start_ns,end_ns):
                 # Longer windows take gap rows from host-series summaries and decode no
                 # pass; the unsaved tail still adds its status counts.
+                # Gap edges come from the coarsest resolution that still gives the window
+                # four buckets, so an hour reads quarter-hour rows, not every minute lane.
                 saved=dict(captured,tail=[]) if captured else None
-                summaries,overflow,_=self._summary(db,saved,start_ns,end_ns,self._resolution(start_ns,end_ns,limit),component=component)
-                coverage=self._coverage(db,captured,start_ns,end_ns,component=component,summaries=summaries)
+                resolution=next((r for r in reversed(RESOLUTIONS) if (end_ns-start_ns)//WIDTHS[r]>=4),RESOLUTIONS[0])
+                stored=[0]
+                rows=takewhile(lambda _:stored[0]<=MAX_QUERY_BYTES,
+                               (r for r in self._iter_summaries(db,saved,start_ns,end_ns,resolution,component=component,series_only=True,stored=stored)
+                                if not component or r["component"]==component))
+                # Read them before _coverage, which names the damaged rows they meet.
+                summary_gaps=self._summary_gaps(rows,start_ns,end_ns)
+                coverage=self._coverage(db,captured,start_ns,end_ns,component=component,summary_gaps=summary_gaps)
+                overflow=stored[0]>MAX_QUERY_BYTES
             else:
                 # Whole process passes cost a derived point per field; their saved
                 # status counts stay in coverage and per-process gaps stay in who.

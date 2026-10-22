@@ -146,8 +146,22 @@ class CoreTests(unittest.TestCase):
                 fields.append(Field("network.ping_rtt",None,"ns",status="unobserved",entity="router",scope="router"))
             records.append(Record(Reading("synthetic.probes","network",c,c,tuple(fields)),"boot","run",n+1,c.wall_ns,c))
         self.store.append(records)
-        gaps=[g for g in Query(self.store).coverage(0,720*S)["gaps"] if g.get("signal")=="network.ping_rtt"]
+        gaps=[g for g in Query(self.store).coverage(0,720*S)["gaps"] if g.get("source")=="synthetic.probes"]
         self.assertEqual([(g["reads"],g["start_ns"],g["end_ns"]) for g in gaps],[(12,0,55*S),(12,660*S,715*S)])
+
+    def test_hour_coverage_merges_a_sources_unmeasured_lanes_into_one_gap_row(self):
+        # Big Mac's hour of coverage listed 1,540 gap rows, one per lane, and hit the scan
+        # cap. A source's lanes with the same status share one row, its reads summed.
+        records=[]
+        for t in range(0,70*60,10):
+            c=Clock(t*S,t*S,t*S)
+            fields=tuple(Field(f"network.f{i}",None,"ns",status="unobserved") for i in range(30))
+            records.append(Record(Reading("synthetic.probes","network",c,c,fields+(Field("network.dns",5,"ns"),)),"boot","run",len(records)+1,c.wall_ns,c))
+        self.store.append(records)
+        answer=Query(self.store).coverage(0,3600*S)
+        gaps=[g for g in answer["gaps"] if g.get("source")=="synthetic.probes"]
+        self.assertEqual([(g["status"],g["start_ns"],g["end_ns"],g["reads"]) for g in gaps],[("unobserved",0,3590*S,30*360)])
+        self.assertFalse(answer["truncated"] or answer["coverage"]["truncated"])
 
     def test_hour_series_keeps_minute_rows_and_names_the_signal_with_only_hour_rows(self):
         # Board #630: a Last hour view answered one hour row while the overview, over the
@@ -332,7 +346,8 @@ class CoreTests(unittest.TestCase):
         self.store.append(rows)
         self.store.db.execute("UPDATE summaries SET payload=X'78da0300' WHERE resolution='hour' AND bucket_ns=?",(3600*S,))
         query=Query(self.store)
-        for answer in (query.series(0,7260*S,component='cpu',limit=2),query.coverage(0,7260*S)):
+        # Coverage reads hour rows once the window holds four hours.
+        for answer in (query.series(0,7260*S,component='cpu',limit=2),query.coverage(0,4*3600*S)):
             damaged=[g for g in answer['gaps'] if g['reason']=='summary_damaged']
             self.assertEqual([(g['status'],g['source'],g['start_ns'],g['end_ns'],g['summary_resolution']) for g in damaged],
                              [('unreadable','synthetic',3600*S,7200*S,'hour')])

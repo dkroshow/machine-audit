@@ -290,10 +290,14 @@ Answers of an hour or more come from summaries. The unsaved tail (at most the
 minute since the last save) is decoded only when no save covers the window yet,
 so `covered.end_ns` can stop at the last save. Once a save covers it, coverage
 of more than ten minutes takes its gap rows from host-series summaries without
-decoding readings; the tail still adds its status counts. One
-row per signal spans consecutive summary rows with the same unmeasured status,
-with reason `summary_status` (or `window_contains_sleep`), `reads` counting those
-samples and `summary_resolution`. Read-level reasons such as `baseline` appear
+decoding readings; the tail still adds its status counts. It reads the coarsest
+resolution that still gives the window four buckets (15-minute rows for one to
+four hours, hour rows beyond, minute rows below an hour), so gap edges fall on
+those buckets. One row per source, status and reason spans consecutive buckets
+whose host-series rows hold that unmeasured status (reason `summary_status`,
+the bucket's most frequent one) or sleep (`window_contains_sleep`); `reads` sums
+the unmeasured samples of all its signals, `sleep_s` counts each bucket's sleep
+once, and `summary_resolution` names the resolution read. Read-level reasons such as `baseline` appear
 in coverage of ten minutes or less and in `who`. A source that reports a status
 without fields (for example `unavailable` with `no_devices`) keeps its reason in
 saved coverage, so that gap row appears at every window length. A summary row
