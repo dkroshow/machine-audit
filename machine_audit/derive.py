@@ -6,6 +6,9 @@ from .model import Record, Field, field_component
 METHOD = "observed-windows-v1"
 LEVELS = (0.5, 1.0, 2.0, 4.0, 8.0)
 GOOD = {"observed", "measured_zero"}
+# Busy CPU states (cpu-view.md): user plus system; Linux nice is user time, and
+# Linux irq and softirq are system time. Absent states add nothing.
+BUSY = ("cpu.user","cpu.system","cpu.nice","cpu.irq","cpu.softirq")
 
 
 def source_fields(reading):
@@ -22,7 +25,7 @@ def source_fields(reading):
                 fields.append(Field(prefix+".cpu",user.value+system.value if good else None,user.unit,"counter",
                                     status="observed" if good else "invalid",entity=entity,label=user.label,
                                     scope=user.scope,additive=True,scale=user.scale,component="self" if prefix=="self" else "cpu",start=user.start,end=user.end,rate_unit="CPUs"))
-        cpu_parts = [indexed.get((name,entity)) for name in ("cpu.user","cpu.system","cpu.nice")]
+        cpu_parts = [indexed.get((name,entity)) for name in BUSY]
         if cpu_parts[0] and cpu_parts[1]:
             parts=[f for f in cpu_parts if f is not None]
             if all(f.status in GOOD and f.unit==parts[0].unit and f.scale==parts[0].scale for f in parts):
@@ -63,7 +66,7 @@ def points(records: list[Record], previous: dict[str, Record] | None = None) -> 
         for f in reading.fields:
             if f.name in {"process.user_time", "process.system_time", "self.user_time", "self.system_time"}:
                 inputs_by_entity[(f.name.split(".")[0], f.entity)].append(f)
-            elif f.name in {"cpu.user", "cpu.system", "cpu.nice"}:
+            elif f.name in BUSY:
                 busy_inputs.append(f)
         pass_points = []
         for field in source_fields(reading):

@@ -57,10 +57,12 @@ class Ping:
 
 class Pinger:
     """One unprivileged ICMP socket. Timestamp is Darwin uptime nanoseconds."""
+    timestamp_option = 0x0800  # SO_TIMESTAMP_MONOTONIC
+
     def __init__(self, awake_ns):
         self.awake_ns = awake_ns
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP)
-        self.sock.setsockopt(socket.SOL_SOCKET, 0x0800, 1)
+        self.sock.setsockopt(socket.SOL_SOCKET, self.timestamp_option, 1)
         self.sock.setblocking(False)
         self.sequence = 0
         self.nonce = os.urandom(16)
@@ -87,8 +89,7 @@ class Pinger:
             if key not in pending:continue
             scope,address,sent,sent_bytes=pending[key]
             if remote[0]!=address:continue
-            received=next((struct.unpack('=Q',d[:8])[0] for level,kind,d in ancillary
-                if level==socket.SOL_SOCKET and kind==4 and len(d)>=8),None)
+            received=self.received_ns(ancillary)
             size=len(raw)+(20 if offset==0 else 0)
             if received is None or received<sent:
                 results[scope]=Ping('timestamp_unavailable',None,sent_bytes,size,False)
@@ -98,6 +99,11 @@ class Pinger:
             del pending[key]
         for scope,address,sent,size in pending.values():results[scope]=Ping('lost',None,size,0,True)
         return results
+
+    @staticmethod
+    def received_ns(ancillary):
+        return next((struct.unpack('=Q',d[:8])[0] for level,kind,d in ancillary
+            if level==socket.SOL_SOCKET and kind==4 and len(d)>=8),None)
 
     def close(self):
         self.sock.close()
@@ -171,6 +177,10 @@ class Network:
                 yield field('network.' + name, getattr(data.data, key), unit, 'counter', entity=entity,
                             scope='interface', additive=True)
 
+        self.traffic(total)
+
+    def traffic(self,total):
+        """Own traffic of 10 Mbps or more tags the next probes as taken while busy."""
         now=self.clock().awake_ns
         if self.last_traffic is not None:
             before,t=self.last_traffic
@@ -196,14 +206,20 @@ class Network:
             self.io.release(k)
 
     def session_id(self,router):
+        hardware=self.hardware(router)
+        return hmac.new(self.salt,hardware,hashlib.sha256).hexdigest()[:16] if hardware else None
+
+    def hardware(self,router):
         mib=(I32*6)(4,17,0,socket.AF_INET,2,0x400)
         size=C.c_size_t()
         self.native.check(self.native.sysctl(mib,6,None,C.byref(size),None,0))
         if size.value>4*1024**2:raise OSError('route_table_limit')
         buf=C.create_string_buffer(size.value)
         self.native.check(self.native.sysctl(mib,6,buf,C.byref(size),None,0))
-        hardware=router_hardware(buf.raw[:size.value],router)
-        return hmac.new(self.salt,hardware,hashlib.sha256).hexdigest()[:16] if hardware else None
+        return router_hardware(buf.raw[:size.value],router)
+
+    def make_pinger(self):
+        return Pinger(lambda:self.clock().awake_ns)
 
     def probes(self):
         at=self.clock()
@@ -231,7 +247,7 @@ class Network:
         yield field('network.session_identity',self.session,'state','state',status='observed' if self.session else 'unavailable')
         results={}
         if router:
-            if self.pinger is None:self.pinger=Pinger(lambda:self.clock().awake_ns)
+            if self.pinger is None:self.pinger=self.make_pinger()
             target_index=self.target%2;self.target+=1
             results=self.pinger.ping_many({'router':router,'internet':INTERNET[target_index]})
         else:

@@ -31,6 +31,11 @@ def error_status(exc):
     return 'denied' if isinstance(exc, PermissionError) or getattr(exc, 'errno', None) in (errno.EACCES, errno.EPERM) else 'failed'
 
 
+def private_token(text, tokens):
+    """A user or host name inside a candidate label; short tokens match whole words."""
+    return any(t and (t.lower() in text.lower() if len(t)>=4 else re.search(r'\b'+re.escape(t)+r'\b',text,re.I)) for t in tokens)
+
+
 def field(name, value, unit, kind='gauge', **kw):
     if value is None:
         kw.setdefault('status', 'unavailable')
@@ -76,9 +81,8 @@ class MacOS:
         # Paths come from proc_pidpath and die inside this source. Only public
         # executable basenames pass, with identifying user/host tokens removed.
         public=path.startswith(('/System/','/usr/','/bin/','/sbin/','/Library/','/Applications/','/opt/homebrew/'))
-        tokens=self.private_tokens
         valid=re.fullmatch(r'[\w .()+-]{1,64}',base) and '..' not in base
-        private=any(t and (t.lower() in base.lower() if len(t)>=4 else re.search(r'\b'+re.escape(t)+r'\b',base,re.I)) for t in tokens)
+        private=private_token(base,self.private_tokens)
         return base if public and valid and not private else 'user program'
 
     def cpu(self):

@@ -78,7 +78,9 @@ and a TCP connect to it on port 443, with no application data sent.
 `macos.portal` makes an HTTP GET of
 `http://captive.apple.com/hotspot-detect.html` about 5 seconds after startup or
 a network path change, and after a new internet dropout, at most once every
-5 minutes.
+5 minutes. Linux uses the same targets through `linux.probes`,
+`linux.dns_connect` and `linux.portal`; where ping sockets are not permitted,
+its internet probe is a TCP connect to port 443 and the router is not probed.
 
 The optional speed test is off by default. It downloads and uploads synthetic
 data over HTTPS to `speed.cloudflare.com`, at most hourly, only when

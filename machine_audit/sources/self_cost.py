@@ -26,8 +26,9 @@ class ManagedProcesses:
 
 
 class SelfCost:
-    def __init__(self, mac, budget, operations=None, scanner=None, registry=None):
-        self.mac, self.budget = mac, budget
+    def __init__(self, mac, budget, operations=None, scanner=None, registry=None, memory='process.phys_footprint'):
+        # The host's own memory gauge: macOS footprint, Linux resident set (not equivalent).
+        self.mac, self.budget, self.memory = mac, budget, memory
         self.operations = operations if operations is not None else {}
         self.scanner = scanner
         self.registry = registry or ManagedProcesses(mac.native.process(os.getpid()).proc_start_abstime)
@@ -45,7 +46,7 @@ class SelfCost:
             pid = int(parts[2])
             role = roles[(pid,parts[3])]
             names = {'process.user_time':'self.user_time','process.system_time':'self.system_time',
-                     'process.phys_footprint':'self.memory','process.diskio_bytesread':'self.read',
+                     self.memory:'self.memory','process.diskio_bytesread':'self.read',
                      'process.diskio_byteswritten':'self.write','process.pkg_idle_wkups':'self.idle_wakeups',
                      'process.interrupt_wkups':'self.interrupt_wakeups'}
             if f.name in names:
