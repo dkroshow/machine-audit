@@ -14,6 +14,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+import machine_audit.store
 from machine_audit.budget import Budget
 from machine_audit.model import Clock,Field,Reading,Record
 from machine_audit.query import Query
@@ -46,22 +47,24 @@ def process_records(count,passes):
     return records
 
 
-def passes(count,seconds,cpu,label=lambda pid:f'program{pid%600}',written=lambda pid:pid,own=None):
-    """Synthetic 10 s passes: cumulative CPU from cpu(pid,t), footprint rising with pid and
-    written(pid) bytes a pass. `own` adds a collector self reading for that process."""
+def passes(count,seconds,cpu,label=lambda pid:f'program{pid%600}',written=lambda pid:pid,own=None,start=0,first=1):
+    """Synthetic 10 s passes from `start` s: cumulative CPU from cpu(pid,t), footprint rising
+    with pid and written(pid) bytes a pass. `own` adds a collector self reading for that
+    process. Sequences begin at `first`."""
     records=[];used=defaultdict(float)
-    for n,t in enumerate(range(0,seconds+1,10)):
-        c=Clock(t*S,t*S,t*S);fields=[]
+    for t in range(0,start+seconds+1,10):
+        for pid in range(count):used[pid]+=cpu(pid,t)
+        if t<start:continue
+        n=t//10;c=Clock(t*S,t*S,t*S);fields=[]
         for pid in range(count):
-            used[pid]+=cpu(pid,t)
             kw=dict(entity=f'process:{pid}',label=label(pid),scope='process')
             fields+=[Field('process.cpu',used[pid],'seconds','counter',additive=True,rate_unit='CPUs',**kw),
                      Field('process.phys_footprint',pid,'bytes',component='memory',**kw),
                      Field('process.diskio_byteswritten',written(pid)*n,'bytes','counter',component='storage',additive=True,**kw)]
-        records.append(Record(Reading('synthetic.process','cpu',c,c,tuple(fields)),'boot','run',len(records)+1,c.wall_ns,c))
+        records.append(Record(Reading('synthetic.process','cpu',c,c,tuple(fields)),'boot','run',len(records)+first,c.wall_ns,c))
         if own is not None:
             fields=(Field('self.user_time',used[own],'seconds','counter',entity=f'process:{own}',label='collector',scope='managed_process'),)
-            records.append(Record(Reading('self.process','self',c,c,fields),'boot','run',len(records)+1,c.wall_ns,c))
+            records.append(Record(Reading('self.process','self',c,c,fields),'boot','run',len(records)+first,c.wall_ns,c))
     return records
 
 
@@ -171,6 +174,40 @@ class ScaleTests(unittest.TestCase):
         with patch('machine_audit.store.TOP_N',0):self.store.append(new)
         row=Query(self.store).who(30*S,810*S,signal='process.cpu',component='cpu')['rows'][0]
         self.assertEqual((row['summary_resolution'],row['total']),('15-minute',42.0+41.0))  # 10-420 s, 440-840 s
+
+    def test_a_save_at_the_cap_prepares_once_and_prunes_only_until_it_fits(self):
+        # Big Mac at the cap during a full scanner walk: each failed admission pruned one
+        # raw minute and then re-merged every summary row, about 20 s a round for 165
+        # rounds. A 2,000-process save must merge once and prune only until it fits.
+        save=passes(2000,50,lambda pid,t:0.5,start=1810,first=1801)
+        with tempfile.TemporaryDirectory(dir=Path(self.tmp.name).parent) as fresh:
+            sized=Store(Path(fresh)/'readings.sqlite',Budget(fresh,limit_bytes=10**9,free_margin_bytes=0))
+            empty=sized.db.execute('PRAGMA page_count').fetchone()[0]
+            sized.append(save)
+            growth=sized.db.execute('PRAGMA page_count').fetchone()[0]-empty
+            sized.close()
+        # Thirty minutes of raw-heavy host readings, all covered by summaries.
+        history=[]
+        for t in range(1800):
+            c=Clock(t*S,t*S,t*S)
+            fields=tuple(Field(f'cpu.f{i}',t*(i+1)*7919%10**9,'count') for i in range(20))
+            history.append(Record(Reading('synthetic.host','cpu',c,c,fields),'boot','run',t+1,c.wall_ns,c))
+        for lo in range(0,1800,60):self.store.append(history[lo:lo+60])
+        page,pages=(self.store.db.execute(f'PRAGMA {name}').fetchone()[0] for name in ('page_size','page_count'))
+        # Admission reserves the database plus one WAL frame per page: this fits only
+        # after about half of the history is pruned, and stays under proactive pruning.
+        self.store.budget.limit_bytes=(growth+pages//2)*(2*page+24)+65536
+        packed=[];rounds=[]
+        pack,prune=machine_audit.store.pack_summaries,Store.prune_oldest
+        def counting_pack(rows):packed.append(1);return pack(rows)
+        def counting_prune(store):rounds.append(1);return prune(store)
+        with patch('machine_audit.store.pack_summaries',counting_pack),patch.object(Store,'prune_oldest',counting_prune):
+            self.store.append(save)
+        written=self.store.db.execute('SELECT count(*) FROM summaries WHERE sequence_max=?',(save[-1].sequence,)).fetchone()[0]
+        self.assertEqual(len(packed),written)  # one merge per saved row, however many rounds
+        self.assertGreater(len(rounds),1,rounds)
+        oldest=self.store.db.execute('SELECT min(wall_ns) FROM readings').fetchone()[0]
+        self.assertTrue(0<oldest<1800*S,oldest)  # pruned, then stopped once the save fit
 
     def test_large_ordinary_record_exports_at_explicit_64_mib_bound(self):
         record=process_records(2000,1)[0]

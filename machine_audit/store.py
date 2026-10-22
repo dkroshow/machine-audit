@@ -192,9 +192,11 @@ class Store:
                 summaries[key[:5]].append(merge_summaries(rows) if len(rows)>1 else rows[0])
             self.maintain()
             deletes=self._top_minutes(records[0].run_id,minutes,own,summaries)
+            # Prepare once: a save that must prune to fit repeats only admission and commit.
+            batch=self._prepare(records,raw,summaries,deletes)
             while True:
                 try:
-                    self._write(records,raw,summaries,deletes,commit_lock,on_commit)
+                    self._write(records,raw,batch,commit_lock,on_commit)
                     return
                 except (sqlite3.OperationalError,BudgetExceeded) as exc:
                     if not self._capacity_error(exc) or not self.prune_oldest():raise
@@ -233,7 +235,8 @@ class Store:
                 if row["entity"] in keep:summaries[("minute",bucket,row["source"],row["component"],row["entity"])].append(row)
         return deletes
 
-    def _write(self,records,raw,summaries,deletes,commit_lock,on_commit):
+    def _prepare(self,records,raw,summaries,deletes):
+        """Merge each summary row with its saved row and count the write's bound."""
         first,last=records[0],records[-1]
         prepared=[];replaced_payload=0
         for (resolution,bucket,source,component,entity),rows in summaries.items():
@@ -254,6 +257,10 @@ class Store:
             old=self.db.execute('SELECT length(payload) FROM baselines WHERE source=?',(source,)).fetchone()
             if old:replaced_payload+=old[0]
         payload=3*sum(len(p) for _,p in raw)+sum(len(row[-1]) for row in prepared)+sum(size for _,size in deletes)+replaced_payload
+        return prepared,catalog,deletes,count,payload
+
+    def _write(self,records,raw,batch,commit_lock,on_commit):
+        prepared,catalog,deletes,count,payload=batch
         with self.budget.sqlite_write(self.db,self.path,rows=count,payload_bytes=payload):
             self.db.execute("BEGIN IMMEDIATE")
             try:
