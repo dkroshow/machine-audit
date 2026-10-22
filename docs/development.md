@@ -229,6 +229,17 @@ collector. `install --upgrade --yes` to the installed revision refused with
 full walk under the timer, growth beyond ten minutes, and any hardware sensor,
 GPU or ICMP path (absent here).
 
+**Upgrade to 6a06973** on the same box: `stop`, checkout as the service user,
+`install --upgrade --yes` (exit 0), the two root commands, `start`. The old
+markers took the 614fb7f suffix, and both releases remained. `doctor` reported
+ready within 20 s, after the new index was built on first open. The same
+ten-minute coverage answer took 1.7 s with 1,925 rows (3,833 on 614fb7f).
+`who` took 4.0 s for CPU and 4.6 s for memory. Those queries raised the
+collector's cgroup peak from 35.6 MB to 353.6 MB, and 217 MB stayed
+resident: one short-interval query decodes up to its 32 MiB bound inside the
+collector, and the server runs up to four at once. `scan --full` walked 97,486
+entries in 2.9 s (warm caches) with `peak_rss_bytes` 35.6 MB.
+
 ## Review regressions and scale measurements
 
 Run the portable boundary checks in a complete source checkout with Python 3.12:
