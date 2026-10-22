@@ -107,6 +107,37 @@ and the predecessor installation were preserved. These checks do not establish
 complete filesystem access, correct folder totals or acceptable monitoring cost.
 The scanner and full process workload require their own native measurements.
 
+### Linux (Ubuntu) install
+
+The collector and scanner run as a dedicated system user under system units;
+no user unit or linger is needed. Not yet validated on a target.
+
+1. As an administrator, create the user, with its home under `/var/lib`:
+   `sudo useradd --system --create-home --home-dir /var/lib/machine-audit --shell /usr/sbin/nologin machine-audit`.
+2. Clone the source as that user, so Git trusts the checkout:
+   `sudo -u machine-audit -H git clone <repository> /var/lib/machine-audit/source`.
+3. From that checkout, run `sudo -u machine-audit -H python3.12 -m machine_audit setup`.
+   Linux setup asks only about the helper and dashboard hosts, and maps folders
+   and large files (`scanner_grain: folders`).
+4. Add `scanner_exclusions` to that user's
+   `~/.local/share/machine-audit/config.json` if needed. `/proc`, `/sys`, `/dev`,
+   `/run`, `/tmp` and other users' homes are never entered.
+5. Run `sudo -u machine-audit -H python3.12 -m machine_audit install`. It
+   writes a release, a CLI (`~/.local/bin/machine-audit`) and three unit files,
+   then prints the two root commands that place them in `/etc/systemd/system`.
+6. Start with `sudo /var/lib/machine-audit/.local/bin/machine-audit start`,
+   which runs `systemctl enable --now machine-audit.service machine-audit-scan.timer`.
+   Check with `sudo -u machine-audit -H /var/lib/machine-audit/.local/bin/machine-audit doctor`.
+
+`machine-audit.service` runs the collector; `machine-audit-scan.timer` runs
+`machine-audit-scan.service` hourly, and a run between 01:00 and 05:00 walks in
+full once a day. Every unit has `User=`, `ProtectSystem=strict`,
+`ReadWritePaths=` the data directory only, `NoNewPrivileges=yes`,
+`PrivateTmp=yes`, `UMask=0077` and `MemoryMax=1G`; the collector has
+`CPUWeight=20`, the scanner `Nice=10`, `IOSchedulingClass=idle` and
+`CPUWeight=10`. `stop` disables and stops all three and preserves recordings.
+Without root, `start` and `stop` print the exact `systemctl` commands.
+
 ## Big Mac first-user trial
 
 1. Prepare the complete installable product and verify it against disposable data.

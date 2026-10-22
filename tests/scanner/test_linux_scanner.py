@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import struct
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -75,6 +76,17 @@ class LinuxScannerTests(unittest.TestCase):
         self.assertEqual((row['status'], row['valid'], row['uses'], row['not_attributed']), ('observed', True, row['listed'], None))
         self.assertIn('physical_residual_not_computed', row['gaps'])
         self.assertEqual(self.scan()['volumes'][0]['status'], 'current')  # the same night, nothing changed
+
+    def test_hourly_runs_walk_in_full_only_at_night_once_a_day(self):
+        self.scan()
+        later = time.time_ns() + 21 * 3600 * 10**9
+
+        def at(hour):
+            with patch('machine_audit.scanner.linux.time.time_ns', return_value=later), \
+                 patch('machine_audit.scanner.linux.time.localtime', return_value=time.struct_time((2026, 10, 22, hour, 0, 0, 3, 295, -1))):
+                return self.scan()['volumes'][0].get('action', 'current')
+        self.assertEqual(at(14), 'current')  # the afternoon run, nothing dirty
+        self.assertEqual(at(2), 'full')
 
     def test_volume_root_the_service_user_cannot_read_is_a_denied_gap_not_a_failed_run(self):
         # First Linux scan: /boot/efi (mode 0700, root) made every nightly run end partial.

@@ -155,6 +155,9 @@ def job_plists(candidate: dict) -> dict[str, dict]:
 
 
 def install(config: Config, *, json_output=False) -> int:
+    if sys.platform != 'darwin':
+        from .installation_linux import install as linux
+        return linux(config, json_output=json_output)
     try:
         candidate = plan(config)
     except (ValueError, RuntimeError, OSError) as exc:
@@ -250,8 +253,11 @@ def _stop_jobs(domain: str, labels) -> list[str]:
 
 def control(config: Config, action: str) -> int:
     """Explicit CLI action; never called by install or setup."""
-    if sys.platform != 'darwin' or action not in {'start', 'stop'}:
+    if action not in {'start', 'stop'}:
         return 2
+    if sys.platform != 'darwin':
+        from .installation_linux import control as linux
+        return linux(config, action)
     root = application_root()
     if not (root / 'current.json').is_file():
         print('Run machine-audit install first.')

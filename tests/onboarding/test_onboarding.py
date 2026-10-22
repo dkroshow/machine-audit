@@ -21,6 +21,10 @@ def free_bytes(free):
 
 
 class SetupTests(unittest.TestCase):
+    def setUp(self):
+        # These tests answer the Mac questions; Linux setup asks fewer (test_linux_install.py).
+        self.enterContext(patch("sys.platform", "darwin"))
+
     def test_identity_salt_is_private_random_and_never_the_exported_device_id(self):
         # Security review P1: the router hardware hash was keyed by device_id, which every export
         # carries, so the 48-bit address could be brute-forced from exported records.

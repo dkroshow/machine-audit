@@ -2,7 +2,7 @@
 
 This is source for a coding agent to adapt on the target machine. **It is not
 an Ubuntu installer.** Linux collection is built for all seven components
-but not yet validated on a target; service installation is not built.
+and installs as system units, but neither is validated on a target yet.
 [The Linux adapter](linux-adapter.md) tracks both. The Mac build is in its first live trial; a successful Mac scan
 does not establish Ubuntu correctness.
 
