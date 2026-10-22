@@ -106,7 +106,7 @@ Raw records, measured options not taken. On c8adc93 Target A grew 1.07 MB a
 minute; the raw `linux.workloads` record was 25.7 KB a pass (48% of readings
 payload). Packed with our encoder, `unit_detail` is 39 of 50 fields a unit
 and about 55% of that record's bytes. The cadence row is decided against the
-first user's 24 h growth figure, with Kenny if the contract moves.
+first user's 24 h growth figure, with the operator if the contract moves.
 
 - **A: `unit_detail` at 60 s** in the existing unit source; the 10 s pass
   keeps CPU time, `memory.current`, `io.stat` and sampled processes. Raw
