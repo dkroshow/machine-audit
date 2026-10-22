@@ -285,6 +285,19 @@ class CoreTests(unittest.TestCase):
             with self.assertRaises(HTTPError):urlopen(base+"/%2e%2e/secret.txt")
         finally:server.shutdown();server.server_close();thread.join()
 
+    def test_fieldless_source_coverage_retains_its_permanent_gap_reason(self):
+        """A no-device reading must explain an empty component instead of losing its reason."""
+        rows=[]
+        for sequence,second in enumerate((0,10),1):
+            clock=Clock(second*S,second*S,second*S)
+            gap=Reading('synthetic.gpu','gpu',clock,clock,(),'unavailable','no_devices')
+            rows.append(Record(gap,'boot','run',sequence,clock.wall_ns,clock))
+        self.store.append(rows)
+        query=Query(self.store)
+        for coverage in (query.coverage(0,20*S,'gpu')['coverage'],query.series(0,20*S,component='gpu')['coverage']):
+            reasons=[g['reason'] for g in coverage['gaps'] if g.get('source')=='synthetic.gpu']
+            self.assertEqual(reasons,['no_devices'])
+
     def test_memory_from_bundled_cpu_pass_is_queryable_without_another_read(self):
         c=Clock(10*S,10*S,10*S)
         fields=(Field("process.phys_footprint",100,"bytes",entity="process:1",label="Editor",scope="footprint",component="memory"),)

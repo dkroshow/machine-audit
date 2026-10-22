@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {readToken,makeApi,queryPool,chartRuns,rowValue,format,seriesGroups,ranksInWho} from '../model.mjs';
+import {readToken,makeApi,queryPool,componentEmptyState,chartRuns,rowValue,format,seriesGroups,ranksInWho} from '../model.mjs';
 
 test('query pool delivers each result and reuses a free slot before the slow peer finishes',async()=>{
   const pending=new Map(),painted=[];let active=0,peak=0;
@@ -28,6 +28,30 @@ test('query pool does not start queued work after its view is aborted',async()=>
   assert.equal(started,3);
   assert.deepEqual(results.map(result=>result.status),['fulfilled','fulfilled','fulfilled','rejected']);
   assert.equal(results[3].reason.name,'AbortError');
+});
+
+test('permanent component gaps explain unavailable devices and disabled collection',()=>{
+  for(const [status,reason,message] of [
+    ['unavailable','no_devices','No supported graphics device on this machine.'],
+    ['not_enabled','source_disabled','Graphics collection is not enabled.'],
+    ['not_enabled','exclusive_gpu_reader_required','Graphics collection is not enabled. Choose it in machine-audit setup.'],
+    ['not_enabled','shipped_helper_required','Graphics detail needs the optional helper, which is not shipped yet.'],
+  ]) {
+    const coverage={sources:{'synthetic.gpu':{[status]:2}},gaps:[{source:'synthetic.gpu',status,reason}]};
+    assert.deepEqual(componentEmptyState('gpu',coverage),{message,sources:[{source:'synthetic.gpu',status,reason}]});
+  }
+  const sources=[{source:'synthetic.gpu',status:'unavailable',reason:'no_devices'},
+    {source:'synthetic.clients',status:'not_enabled',reason:'source_disabled'}];
+  assert.deepEqual(componentEmptyState('gpu',{sources:{'synthetic.gpu':{unavailable:1},'synthetic.clients':{not_enabled:1}},gaps:sources}),
+    {message:'Graphics is not collected on this machine.',sources});
+});
+
+test('an ordinary source among permanent gaps retains the data outage explanation',()=>{
+  const coverage={sources:{'synthetic.gpu':{unavailable:2},'synthetic.clients':{observed:1}},
+    gaps:[{source:'synthetic.gpu',status:'unavailable',reason:'no_devices'}]};
+  assert.deepEqual(componentEmptyState('gpu',coverage),{
+    message:'No host or device readings cover this interval. Workload readings and coverage are shown separately.',sources:[],
+  });
 });
 
 test('fragment bootstrap removes the secret before navigation and API uses a header',async()=>{

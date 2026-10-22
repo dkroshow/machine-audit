@@ -1,4 +1,4 @@
-import {views,label,time,format,readToken,makeApi,queryPool,tokenKey,seriesGroups,rowValue,rowUnit,statusText,ranksInWho} from './model.mjs';
+import {views,label,time,format,readToken,makeApi,queryPool,tokenKey,componentEmptyState,seriesGroups,rowValue,rowUnit,statusText,ranksInWho} from './model.mjs';
 import {el,card,empty,metric,signalsView,liveView,whoView,coverageView,statusView,intervalEvidence} from './render.mjs';
 import {storageView} from './storage.mjs';
 const $=id=>document.getElementById(id);
@@ -49,7 +49,6 @@ function contentGroups(answer,component,onAround) {
   }
   if(remaining.length)root.append(el('h2',{class:'group-separator'},'Additional source evidence'),signalsView({...answer,rows:remaining.flatMap(g=>g.rows)},onAround));
   if(perCore.length)root.append(el('details',{class:'disclosure'},el('summary',{},`Per-core source readings (${perCore.length} signals)`),signalsView({...answer,rows:perCore.flatMap(g=>g.rows)},onAround)));
-  if(!root.children.length)root.append(empty('No host or device readings cover this interval. Workload readings and coverage are shown separately.'));
   return root;
 }
 function loading() {
@@ -101,7 +100,7 @@ async function workloadSection(component,params,abort,query) {
   const update=async()=>{
     const request=++version;
     try {const answer=await query('who',{...params,component,signal:select.value},abort);if(request===version&&!abort?.aborted)body.replaceChildren(whoView(answer,at=>around(at,component)));}
-    catch(e){if(e.name!=='AbortError'&&request===version)body.replaceChildren(empty(e.message));}
+    catch(e){if(e.status===401 || e.status===403)throw e;if(e.name!=='AbortError'&&request===version)body.replaceChildren(empty(e.message));}
   };
   select.addEventListener('change',()=>{state.whoSignal=select.value;update();});
   await update();return block;
@@ -145,7 +144,12 @@ async function load() {
       const publish=()=>{if(!root.isConnected)$('view').replaceChildren(root);};
       const pending=[fill(series,async()=>{
         answer=await query('series',{...params,component},controller.signal);
-        return contentGroups(answer,component,at=>around(at,component));
+        const content=contentGroups(answer,component,at=>around(at,component));
+        if(content.children.length)return content;
+        const coverage=answer.coverage ?? await query('coverage',{...params,component},controller.signal);
+        const explanation=componentEmptyState(component,coverage);
+        return el('div',{},empty(explanation.message),explanation.sources.length ? el('ul',{},explanation.sources.map(source=>
+          el('li',{},`${label(source.source)}: ${statusText(source.status)} · ${label(source.reason ?? 'reason_not_reported')}`))):null);
       },controller.signal,publish)];
       if(state.view==='storage') {
         const block=card('Storage map',loading());root.prepend(block);

@@ -347,6 +347,24 @@ class Query:
             cursor=max(cursor,effective_stop if not stopped else min(stopped,end_ns))
         if cursor<end_ns:gaps.append(dict(status="unobserved",reason="no_collector",start_ns=cursor,end_ns=end_ns))
         gaps.extend(dict(r,status="pruned") for r in retention if r['kind']!='raw_preserved')
+        empty_rows={}
+        for record in records:
+            reading=record.reading
+            if reading.fields or reading.status in GOOD:
+                empty_rows.pop(reading.source,None)
+                continue
+            reading_start,reading_end=reading.start.wall_ns,reading.end.wall_ns
+            if reading_end<start_ns or reading_start>end_ns:continue
+            reason=reading.reason or "source_status"
+            previous=empty_rows.get(reading.source)
+            if previous and previous[0]==record.run_id and (previous[1]["status"],previous[1]["reason"])==(reading.status,reason):
+                previous[1]["end_ns"]=min(end_ns,reading_end)
+                previous[1]["reads"]+=1
+            else:
+                row={"source":reading.source,"status":reading.status,"reason":reason,
+                     "start_ns":max(start_ns,reading_start),"end_ns":min(end_ns,reading_end),"reads":1}
+                gaps.append(row)
+                empty_rows[reading.source]=(record.run_id,row)
         def streamed_points():
             previous={}
             for record in records:

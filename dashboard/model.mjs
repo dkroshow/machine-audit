@@ -13,6 +13,27 @@ export const views = {
   coverage: {title:'Coverage & status', description:'Measured, missing, denied and pruned evidence, including collection and retention status.'},
 };
 export const statusText = code => ({measured_zero:'Measured zero',not_enabled:'Not enabled',unobserved:'Not observed',unavailable:'Unavailable',observed:'Observed',invalid:'Invalid window',pruned:'Pruned',denied:'Access denied',failed:'Read failed'}[code] ?? String(code ?? 'Not observed').replaceAll('_',' '));
+export function componentEmptyState(component,answer) {
+  const coverage=answer?.coverage ?? answer ?? {},gaps=coverage.gaps ?? [];
+  const sources=Object.entries(coverage.sources ?? {}).flatMap(([source,counts])=>
+    Object.keys(counts).filter(status=>counts[status]>0).flatMap(status=>{
+      const reasons=new Set(gaps.filter(gap=>gap.source===source&&gap.status===status).map(gap=>gap.reason));
+      return [...(reasons.size ? reasons : [null])].map(reason=>({source,status,reason}));
+    }));
+  if(!sources.length)return {message:'No source coverage is available for this component.',sources:[]};
+  if(coverage.truncated||answer?.truncated)return {message:'Source coverage is incomplete for this interval.',sources:[]};
+  const kinds=new Set(sources.map(source=>source.reason==='shipped_helper_required' ? 'helper' :
+    source.status==='not_enabled' ? 'disabled' : source.status==='unavailable'&&source.reason==='no_devices' ? 'devices' : null));
+  if(kinds.has(null))return {message:'No host or device readings cover this interval. Workload readings and coverage are shown separately.',sources:[]};
+  const title=views[component]?.title ?? label(component);
+  const messages={
+    devices:`No supported ${component==='gpu' ? 'graphics device' : title.toLowerCase()+' device'} on this machine.`,
+    disabled:`${title} collection is not enabled.`+(sources.some(source=>source.reason==='exclusive_gpu_reader_required') ? ' Choose it in machine-audit setup.' : ''),
+    helper:`${title} detail needs the optional helper, which is not shipped yet.`,
+    mixed:`${title} is not collected on this machine.`,
+  };
+  return {message:messages[kinds.size===1 ? [...kinds][0] : 'mixed'],sources};
+}
 const signalLabels = {
   'cpu.busy':'CPU used', 'cpu.capacity':'Usable CPUs', 'cpu.usable':'Usable CPUs',
   'cpu.runnable':'Runnable demand', 'cpu.excess_runnable':'Excess runnable demand', 'cpu.wait':'CPU waiting',
