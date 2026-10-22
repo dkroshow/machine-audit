@@ -224,6 +224,21 @@ Origins are admitted. Setup does not configure the proxy. An older
 `tailscale_host` setting is read as a one-entry list and saved in the new form
 at the next setup. See the
 [architecture](architecture.md#permissions-private-data-and-dashboard-access).
+For example, expose the dashboard through Tailscale on port 8443:
+
+```sh
+tailscale serve --https=8443 http://127.0.0.1:8765
+```
+
+In `config.json`, set `"allowed_hosts": ["<host>.ts.net:8443"]`, replacing
+`<host>` with your Tailscale host name, then restart with `machine-audit stop`
+and `machine-audit start`. Loopback plus a proxy is the default; there is no
+bind-address option.
+
+The token stays in this tab's sessionStorage until the tab closes, a 401 or 403
+response, or a status answer reports a new collector run. Browsers that restore
+sessions can restore it, so close the tab on a shared machine.
+
 Keep the per-run application token requirement through the proxy; do not place
 credentials in logs, ordinary query strings or shared setup notes.
 
