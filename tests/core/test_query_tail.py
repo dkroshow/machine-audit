@@ -146,6 +146,14 @@ class QueryTailTests(unittest.TestCase):
             for key in ('rows', 'covered', 'total_rows', 'truncated', 'accounting'):
                 self.assertEqual(live[component][key], saved[key], key)
 
+    def test_unsaved_tail_keeps_who_to_the_requested_component(self):
+        # A summary-window who under an hour merges the unsaved tail; without a
+        # component filter its CPU rows ranked inside the memory answer.
+        self.populate(count=2)
+        who = self.query.who(0, 1200*S, component='memory', limit=75)
+        self.assertTrue(who['rows'])
+        self.assertEqual({r['component'] for r in who['rows']}, {'memory'})
+
     def test_denied_pid_scope_is_workload_evidence_in_tail_and_saved_answers(self):
         self.populate(count=2)
         for saved in (False, True):

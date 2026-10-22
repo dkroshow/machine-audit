@@ -419,14 +419,19 @@ class Store:
                 for source,(r,p) in latest.items():
                     self.db.execute("INSERT OR REPLACE INTO baselines VALUES(?,?,?)",(source,r.run_id,p))
                 for (resolution,source,component,_), group in coverage.items():
-                    statuses=defaultdict(int)
+                    statuses=defaultdict(int);gaps=defaultdict(int)
                     for r in group:
                         statuses[r.reading.status]+=1
                         for f in r.reading.fields:
                             if f.status not in {"observed","measured_zero"}:statuses[f.status]+=1
+                        # A fieldless reading's reason (no device, helper missing) is
+                        # the explanation coverage gives without decoding the reading.
+                        if not r.reading.fields and r.reading.status not in {"observed","measured_zero"}:
+                            gaps[(r.reading.status,r.reading.reason or "source_status")]+=1
                     first_ns=min(r.reading.start.wall_ns for r in group)
                     last_ns=max(r.reading.end.wall_ns for r in group)
                     data={"statuses":dict(statuses),"reads":len(group)}
+                    if gaps:data["gaps"]=[[status,reason,count] for (status,reason),count in sorted(gaps.items())]
                     self.db.execute("INSERT INTO coverage VALUES(?,?,?,?,?,?,?,?)",(first.run_id,last.sequence,resolution,source,component,first_ns,last_ns,encode(data)))
                 self.db.execute("UPDATE runs SET last_sequence=?,last_saved_ns=? WHERE run_id=?",(last.sequence,max(r.reading.end.wall_ns for r in records),first.run_id))
                 with commit_lock if commit_lock is not None else nullcontext():

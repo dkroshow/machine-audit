@@ -375,9 +375,22 @@ class Query:
             clause+=" AND (run_id!=? OR sequence_max<=?)";args.extend([captured["run_id"],captured["committed"]])
         if component:
             clause+=" AND component=?";args.append(component)
-        persisted=db.execute("SELECT source,payload,start_ns,end_ns FROM coverage WHERE resolution=? AND end_ns>=? AND start_ns<=?"+clause+" ORDER BY start_ns LIMIT ?",args+[MAX_SCAN+1]).fetchall()
-        for source,payload,_,_ in persisted[:MAX_SCAN]:
-            for status,count in json.loads(payload)["statuses"].items():states[source][status]+=count
+        persisted=db.execute("SELECT source,payload,start_ns,end_ns,run_id FROM coverage WHERE resolution=? AND end_ns>=? AND start_ns<=?"+clause+" ORDER BY start_ns LIMIT ?",args+[MAX_SCAN+1]).fetchall()
+        gaps=[];saved_gaps={}
+        for source,payload,row_start,row_end,run_id in persisted[:MAX_SCAN]:
+            data=json.loads(payload)
+            for status,count in data["statuses"].items():states[source][status]+=count
+            if records:continue  # decoded readings explain their own gaps below
+            # Saved fieldless reasons; one run's consecutive rows with the same
+            # reason form one gap, as decoded readings do.
+            for status,reason,count in data.get("gaps",()):
+                gap=saved_gaps.get((source,status,reason))
+                if gap and gap["run_id"]==run_id:
+                    gap["end_ns"]=min(end_ns,row_end);gap["reads"]+=count
+                else:
+                    gap={"source":source,"status":status,"reason":reason,"start_ns":max(start_ns,row_start),"end_ns":min(end_ns,row_end),"reads":count,"run_id":run_id}
+                    saved_gaps[(source,status,reason)]=gap;gaps.append(gap)
+        for gap in saved_gaps.values():del gap["run_id"]
         if captured:
             for record in captured["tail"]:
                 if start_ns<=record.end_ns<=end_ns and record.matches(component):
@@ -385,7 +398,6 @@ class Query:
                     for status,count in record.field_statuses:
                         if status not in GOOD:states[record.source][status]+=count
         runs=[dict(r) for r in db.execute("SELECT * FROM runs WHERE started_ns<? ORDER BY started_ns",(end_ns,))]
-        gaps=[]
         cursor=start_ns
         for index,run in enumerate(runs):
             start=max(start_ns,run["started_ns"])
@@ -546,7 +558,7 @@ class Query:
                     # CPU rank ties inherit the full pass's entity order.
                     # Preserve that input, including entities without CPU fields.
                     tail_records=pending if signal in {"process.cpu","self.cpu"} else self._who_records(pending,signal)
-                    pending_points=[p for p in points(tail_records) if p["run_id"]==captured["run_id"] and p["sequence"]>captured["committed"] and (not signal or p["signal"]==signal)]
+                    pending_points=[p for p in points(tail_records) if p["run_id"]==captured["run_id"] and p["sequence"]>captured["committed"] and (not signal or p["signal"]==signal) and (not component or p["component"]==component)]
                     for _,r in rollups(pending_points,end_ns-start_ns):
                         k=tuple(r[x] for x in ("source","signal","entity","unit","scale","scope"))
                         tail[k]=merge_summaries([tail[k],r]) if k in tail else r

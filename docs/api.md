@@ -294,7 +294,9 @@ decoding readings; the tail still adds its status counts. One
 row per signal spans consecutive summary rows with the same unmeasured status,
 with reason `summary_status` (or `window_contains_sleep`), `reads` counting those
 samples and `summary_resolution`. Read-level reasons such as `baseline` appear
-in coverage of ten minutes or less and in `who`.
+in coverage of ten minutes or less and in `who`. A source that reports a status
+without fields (for example `unavailable` with `no_devices`) keeps its reason in
+saved coverage, so that gap row appears at every window length.
 
 Summary selection uses aligned bucket identities. An observed counter window
 may cross a requested edge; it is retained whole and marked `partial_boundary`.

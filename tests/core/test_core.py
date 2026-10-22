@@ -313,6 +313,17 @@ class CoreTests(unittest.TestCase):
         for coverage in (query.coverage(0,20*S,'gpu')['coverage'],query.series(0,20*S,component='gpu')['coverage']):
             reasons=[g['reason'] for g in coverage['gaps'] if g.get('source')=='synthetic.gpu']
             self.assertEqual(reasons,['no_devices'])
+        # Longer saved windows answer from summaries and decode no reading: the
+        # reason must survive in saved coverage, as one row per unbroken stretch.
+        rows=[Record(reading(s,s,name='cpu.busy'),'boot','run',10+i,s*S,Clock(s*S,s*S,s*S)) for i,s in enumerate(range(60,3600,60))]
+        for i,second in enumerate(range(60,3600,10)):
+            clock=Clock(second*S,second*S,second*S)
+            rows.append(Record(Reading('synthetic.gpu','gpu',clock,clock,(),'unavailable','no_devices'),'boot','run',200+i,clock.wall_ns,clock))
+        self.store.append(rows)
+        for coverage in (query.coverage(0,3600*S,'gpu')['coverage'],query.series(0,3600*S,component='gpu')['coverage']):
+            gaps=[g for g in coverage['gaps'] if g.get('source')=='synthetic.gpu']
+            self.assertEqual([(g['reason'],g['status']) for g in gaps],[('no_devices','unavailable')])
+            self.assertEqual((gaps[0]['start_ns'],gaps[0]['end_ns']),(0,3590*S))
 
     def test_memory_from_bundled_cpu_pass_is_queryable_without_another_read(self):
         c=Clock(10*S,10*S,10*S)
