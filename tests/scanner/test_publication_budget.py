@@ -110,3 +110,34 @@ class PublicationBudgetTests(unittest.TestCase):
         store.finish_volume(self.volume, Blocks(), [], full=False, lean=True,
                             bookmark=10, event_progress=True)
         self.assertEqual(store.db.execute('SELECT no_progress FROM volumes').fetchone()[0], 0)
+
+    def test_removed_tracked_subtree_is_included_in_the_points_reservation(self):
+        store = MapStore(self.path, Budget(self.root, free_margin_bytes=0))
+        self.addCleanup(store.close)
+        store.prepare(self.volume)
+        self.node(store, 0)
+        for identity, parent, size in (('2', '1', 0), ('3', '2', GB), ('4', '2', GB)):
+            store.directory(Node(identity, parent, 'Folder '+identity, 'directory', size, size, 'observed', None, 0))
+        store.finish_volume(self.volume, Blocks(), [], full=True, lean=True)
+        self.assertEqual(store.db.execute('SELECT count(*) FROM tracked').fetchone()[0], 4)
+        store.prepare(self.volume, full=False)
+        store.clear_subtree('2')
+        writes = []
+        original = store.write
+
+        @contextmanager
+        def record(*args, **kwargs):
+            writes.append(kwargs['rows'])
+            with original(*args, **kwargs):yield
+
+        store.write = record
+        store.finish_volume(self.volume, Blocks(), [], full=False, lean=True)
+        # Four changed identities require eight point slots plus four possible
+        # terminal points; only the root remains in the staged nodes table.
+        # Six map, six hierarchy and six metadata/marker slots are also needed.
+        self.assertGreaterEqual(writes[-1], 8+4+6+6+6)
+        self.assertEqual(len(store.changed), 4)
+        for identity in ('2', '3', '4'):
+            point = store.db.execute('SELECT size,status FROM points WHERE id=? ORDER BY observed_ns DESC LIMIT 1',
+                                     (identity,)).fetchone()
+            self.assertEqual(tuple(point), (None, 'not_observed'))

@@ -202,6 +202,8 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
             else:
                 status='scan_failed'
                 reason='os_error' if isinstance(exc,OSError) else 'invalid_scan_state' if isinstance(exc,ValueError) else 'unexpected_error'
+            exception_type=type(exc).__name__
+            reason=f'{reason}_{exception_type}'
             # Never print exception text: native/file errors can contain paths.
             # A separate failure to persist the reason is visible in the JSON.
             recorded=False
@@ -214,6 +216,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                                                (store.run,reason)).fetchone())
             except Exception:
                 pass
-            return {'status':status,'reason':reason,'failure_recorded':recorded,'entries':store.entries}
+            return {'status':status,'reason':reason,'exception_type':exception_type,
+                    'failure_recorded':recorded,'entries':store.entries}
         finally:
             store.close()

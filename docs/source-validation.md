@@ -307,10 +307,13 @@ the shared write contract in `storage-approach.md`.
 The synthetic 64%-full store regression keeps 8 MiB of unrelated payload,
 reopens the existing schema, and publishes a changed folder. It checks every
 write's declared row count and actual WAL frame count against the shared bound.
-Its final transaction made 28 row mutations under a 37-row declaration and
+Its final transaction made 28 row mutations under a 39-row declaration and
 wrote 19 WAL frames. Peak managed bytes were 8.64 MB under a 13.32 MB cap.
 Existing rollback tests still preserve published children, points and hierarchy
 after a failure in the final transaction. No live store or native scan was used.
+Update point reservations count every changed identity, including removed
+subtree identities absent from the staged nodes. The removed-subtree regression
+keeps terminal unknown points for all three removed tracked folders.
 
 Three quiet replay updates keep the no-progress count unchanged. An update
 with events and an unchanged bookmark increments it; advancing that bookmark
@@ -319,10 +322,12 @@ not request a full map, and killed unpublished runs change neither counter nor
 bookmark. Missing roots/bookmarks, seven-day age, changed event UUID, and kernel
 drop/wrap/root-change indications retain their existing full-scan fallbacks.
 
-An ordinary exception during a started macOS run now records `os_error`,
-`invalid_scan_state` or `unexpected_error`, ends its run row, and returns
-`status=scan_failed` plus that reason. Budget/SQLite failures retain their
-existing codes. JSON reports `failure_recorded=false` if failure persistence
+An ordinary exception during a started macOS run now records a reason such as
+`os_error_OSError`, `invalid_scan_state_ValueError` or `unexpected_error_TypeError`,
+ends its run row, and returns `status=scan_failed` plus that reason and the
+separate `exception_type`. Budget/SQLite failures retain their status codes and
+append the exception type to their reason too. Messages are never included.
+JSON reports `failure_recorded=false` if failure persistence
 also fails; exception text and paths are never returned. Both scanner CLI
 entry points emit the result and return nonzero on failure. A process killed
 outside Python still cannot finalize its own run; the next start marks it

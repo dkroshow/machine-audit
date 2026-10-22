@@ -573,11 +573,13 @@ class MapStore:
             where+=f' AND ({metric}>=1000000000 OR EXISTS(SELECT 1 FROM tracked WHERE volume=? AND id=source_id(nodes.id)))'
             params+=self.volume,
         candidates,payload=self._row_size('nodes',where,params)
+        point_candidates=candidates if full else len(self.changed)
         tracked,tracked_payload=self._row_size('tracked','volume=?',(self.volume,))
-        # Points: two writes per candidate, one terminal point per old identity.
+        # Points also visit removed identities absent from the staged nodes.
+        # Reserve two writes per candidate and a terminal point per old identity.
         # Hierarchy: at most old+new identities, plus one epoch. Count deleted
         # stage markers and both sides of every REPLACE in the map switch.
-        rows=sum(p[2] for p in plan)+3*candidates+2*tracked+5
+        rows=sum(p[2] for p in plan)+2*point_candidates+candidates+2*tracked+5
         payload=3*payload+3*tracked_payload+sum(p[3] for p in plan)
         payload+=(candidates+tracked)*(len(self.volume.encode())+64)  # volume and hierarchy version
         payload+=self.db.execute('''SELECT coalesce(sum(length(CAST(p.label AS BLOB))),0)
