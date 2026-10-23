@@ -300,6 +300,19 @@ run's end. `who` (raw, 75 rows) took 5.2 s for CPU and 5.1 s for memory,
 raising the collector's peak to 288 MB. `scan --full` walked 97,894 entries in
 2.9 s with `peak_rss_bytes` 35.7 MB, and retried the denied EFI volume.
 
+**A day on a small Ubuntu box.** A first user's 2-vCPU VM (about 80 unit
+cgroups, 280 processes, hardened units, Ubuntu 24.04) recorded for 25.1 h
+across eleven runs and upgrades: 1,441.5 MB on disk, 0.957 MB a minute,
+1.35 GB a day. Readings payload was a flat 0.320 MB a minute in every run;
+summaries fell from 0.339 to 0.256 MB a minute when minutes started keeping
+only each minute's top consumers; disk is about 1.66 times payload. The
+service ran the day at 6.9% of a core and 234 MB with no restarts, the hourly
+scans all ran, and the scanner store was 9.4 MB. Its first scheduled nightly
+full walk, under the timer rather than `scan --full`, walked 222,707 entries
+with `peak_rss_bytes` 44.4 MB, the same as a forced walk; the hourly runs
+around it were updates. At that rate the 10 GB cap holds about 7.4 days of
+raw and minute history before pruning starts.
+
 ## Review regressions and scale measurements
 
 Run the portable boundary checks in a complete source checkout with Python 3.12:
