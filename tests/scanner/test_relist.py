@@ -213,6 +213,19 @@ class RelistTests(unittest.TestCase):
                 self.assertEqual(self.store.db.execute('SELECT count(*) FROM dirty').fetchone()[0],0)
                 with self.store.write(rows=1):
                     self.store.db.execute('INSERT INTO dirty VALUES(?,?,?,0)',(self.volume.id,identity,due))
+        # A recursive event on the due shallow folder: the shallow listing used to
+        # discharge both, losing the nested change.
+        (big/'sub'/'nested').write_bytes(b'new')
+        self.store.prepare(self.volume,full=False)
+        with self.store.write(rows=1):
+            self.store.db.execute('UPDATE listings SET count=30000 WHERE id=inode_key(?)',(identity,))
+        walker=Walker(self.volume,self.policy,self.store,Blocks())
+        self.assertTrue(relist(self.store,walker,self.policy,self.volume,due,[(str(big),True)]))
+        self.assertEqual(walker.entries,35)
+        self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=False,lean=True)
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM files WHERE generation=?',
+                                               (self.store.generation,)).fetchone()[0],33)
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM dirty').fetchone()[0],0)
 
     def test_shallow_parent_keeps_private_child_without_copying_its_subtree(self):
         private=self.tree/'browser';(private/'inner').mkdir(parents=True)

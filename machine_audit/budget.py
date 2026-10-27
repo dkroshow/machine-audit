@@ -97,6 +97,17 @@ class Budget:
         usage = self.usage()
         return usage['bytes'] + usage['checkpoint_reservation_bytes'] <= retry_bytes
 
+    def page_limit_refusal(self) -> BudgetExceeded:
+        """The refusal for a transaction that ran out of a page limit the cap had
+        shortened. The missing amount is unknown, so its retry level asks only
+        that managed bytes plus uncheckpointed WAL fall below their level now,
+        without the reservation records that vanish when writers finish."""
+        refused = BudgetExceeded('sqlite_page_limit')
+        usage = self.usage()
+        records = sum(size for name, size in usage['parts'].items() if name.startswith('.budget-') and name.endswith('.claim'))
+        refused.retry_bytes = max(0, usage['bytes'] - records + usage['checkpoint_reservation_bytes'] - 1)
+        return refused
+
     @contextmanager
     def _guard(self):
         # Only admission metadata is protected here. Never execute SQLite or
@@ -263,11 +274,13 @@ class Budget:
                     return pages*page + 32 + frames*(page+24) + ((frames+4061)//4062+1)*32768
                 # Counted transactions reserve their own pages. Legacy callers
                 # retain the whole-DB fallback until their rows are bounded.
-                cap = (self.limit_bytes-other)//page
-                if dirty_pages is not None:
-                    cap=min(cap,existing+dirty_pages)
+                # The pages this writer asked for; the cap may shorten them.
+                limits=[existing+dirty_pages] if dirty_pages is not None else []
                 if max_growth_bytes is not None:
-                    cap=min(cap,existing+(max_growth_bytes+page-1)//page)
+                    limits.append(existing+(max_growth_bytes+page-1)//page)
+                wanted=min(limits,default=None)
+                cap = (self.limit_bytes-other)//page
+                if wanted is not None:cap=min(cap,wanted)
                 if cap < existing or other+bound(existing)>self.limit_bytes:
                     raise BudgetExceeded("sqlite_checkpoint_headroom",other+bound(existing)-self.limit_bytes)
                 low=existing
@@ -277,7 +290,8 @@ class Budget:
                     else:cap=middle-1
                 cap=low
                 admission.update(max_pages=cap,peak_bytes=other+bound(cap),page_size=page,
-                                 dirty_pages=dirty_pages,starting_pages=existing)
+                                 dirty_pages=dirty_pages,starting_pages=existing,
+                                 budget_limited=wanted is None or cap<wanted)
                 return bound(cap)
             self._admit(claim,peak)
             connection.execute(f"PRAGMA max_page_count={admission['max_pages']}")

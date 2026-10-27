@@ -146,13 +146,18 @@ class MapStore:
 
     @contextmanager
     def write(self,growth=None,*,rows=None,payload_bytes=0):
-        with self.budget.sqlite_write(self.db,self.path,max_growth_bytes=growth,rows=rows,payload_bytes=payload_bytes):
+        with self.budget.sqlite_write(self.db,self.path,max_growth_bytes=growth,rows=rows,payload_bytes=payload_bytes) as admitted:
             self.db.execute('BEGIN IMMEDIATE')
             try:
                 yield
                 self.db.execute('COMMIT')
-            except BaseException:
+            except BaseException as exc:
                 if self.db.in_transaction:self.db.execute('ROLLBACK')
+                # The transaction ran out of the page limit the cap had shortened:
+                # storage pressure, not a failed write. Other errors stay as raised.
+                if (getattr(exc,'sqlite_errorcode',None)==sqlite3.SQLITE_FULL and admitted['budget_limited']
+                        and self.db.execute('PRAGMA max_page_count').fetchone()[0]==admitted['max_pages']):
+                    raise self.budget.page_limit_refusal() from None
                 raise
 
     def _row_size(self,table,where='1',args=()):
@@ -203,17 +208,22 @@ class MapStore:
             self.db.execute('UPDATE runs SET volumes=? WHERE id=?',(data,self.run))
 
     def prepare(self,volume,full=True,lean=True):
-        self.flush();self.prune_generations(full)
-        with self.write(rows=4 if full else 3):
+        self.flush()
+        # This attempt owns any failure from here on, including a refused prune,
+        # and a full attempt is recorded before the cleanup that can refuse it.
+        self.volume,self.generation,self.base_gen=volume.id,None,None
+        with self.write(rows=2 if full else 1):
             self.db.execute('INSERT OR IGNORE INTO volumes(id,label,mount,status,lean) VALUES(?,?,?,?,?)',
                             (volume.id,volume.label,volume.mount,'building',int(lean)))
-            old=self.db.execute('SELECT * FROM volumes WHERE id=?',(volume.id,)).fetchone()
             if full:
                 self.db.execute('UPDATE volumes SET full_attempt_ns=? WHERE id=?',(time.time_ns(),volume.id))
+        self.prune_generations(full)
+        with self.write(rows=2):
+            old=self.db.execute('SELECT * FROM volumes WHERE id=?',(volume.id,)).fetchone()
             self.generation=self.db.execute("SELECT value FROM map_meta WHERE key='next_generation'").fetchone()[0]
             self.db.execute("UPDATE map_meta SET value=value+1 WHERE key='next_generation'")
             self.db.execute("INSERT INTO generations VALUES(?,?,'building')",(self.generation,old['key']))
-        self.volume,self.vid,self.mount=volume.id,old['key'],volume.mount
+        self.vid,self.mount=old['key'],volume.mount
         self.base_gen=old['generation'] if not full else None
         self.changed=set()
         self.pending_resets.clear()
@@ -641,8 +651,8 @@ class MapStore:
         tracked,tracked_payload=self._row_size('tracked','volume=?',(self.volume,))
         # Points also visit removed identities absent from the staged nodes.
         # Reserve two writes per candidate and a terminal point per old identity.
-        # Hierarchy: at most old+new identities, plus one epoch. Count deleted
-        # stage markers and both sides of every REPLACE in the map switch.
+        # Hierarchy: at most old+new identities, plus one epoch. Count both
+        # sides of every REPLACE in the map switch.
         rows=sum(p[2] for p in plan)+2*point_candidates+candidates+2*tracked+5
         payload=3*payload+3*tracked_payload+sum(p[3] for p in plan)
         payload+=(candidates+tracked)*(len(self.volume.encode())+64)  # volume and hierarchy version

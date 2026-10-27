@@ -23,7 +23,7 @@ from .walker import Walker, shown_path
 
 # Refusals that more managed storage would admit; reader contention and the
 # filesystem free-space margin are retried as before.
-CAPACITY_REFUSALS=('managed_storage_limit','sqlite_checkpoint_headroom')
+CAPACITY_REFUSALS=('managed_storage_limit','sqlite_checkpoint_headroom','sqlite_page_limit')
 
 
 @contextmanager
@@ -68,10 +68,12 @@ def relist(store,walker,policy,volume,now,changes):
     """Re-list changed folders, given as (absolute path, recursive), plus deferred ones now due."""
     roots_to_update={}
     recursive_roots=set()
+    due_paths={}
     for due,recursive in store.db.execute('SELECT id,recursive FROM dirty WHERE volume=? AND due_ns<=?',(volume.id,now)):
         saved=store.known_directory(due)
         if saved and saved['path']:
             roots_to_update[saved['path']]=saved
+            due_paths[saved['id']]=saved['path']
             if recursive is None or recursive:recursive_roots.add(saved['path'])
     for path,recursive in changes:
         if os.path.commonpath([path,volume.mount])!=volume.mount:
@@ -88,9 +90,12 @@ def relist(store,walker,policy,volume,now,changes):
         else:continue
         path,found=resolve_mapped(store,walker,volume,path)
         if found:
-            # A >20k-entry directory is visited at most daily.
+            # A >20k-entry directory is visited at most daily. One already due
+            # is re-listed now, with this event's scope merged in: its listing
+            # discharges the deferral, so it must cover what the event needs.
+            path=due_paths.get(found['id'],path)
             listing=store.listing(found['id'])
-            if listing and listing['count']>20_000 and now-listing['listed_ns']<86400*10**9:
+            if path not in roots_to_update and listing and listing['count']>20_000 and now-listing['listed_ns']<86400*10**9:
                 store.defer(found['id'],listing['listed_ns']+86400*10**9,recursive)
                 walker.gaps.add('large_directory_deferred')
                 continue
@@ -220,6 +225,8 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                 if action=='wait':
                     store.phase('complete',action=action,trigger=trigger)
                     status=old['status'] if trigger in ('failed_full_retry_cooldown','budget_retry_gate') else 'current'
+                    if trigger=='budget_retry_gate':  # Blocked, not up to date.
+                        root_failed=True;blocked=status
                     results.append({'volume_id':volume.id,'status':status,'action':action,'trigger':trigger})
                     continue
                 store.phase('events',action=action,trigger=trigger)

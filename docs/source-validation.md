@@ -377,8 +377,10 @@ listing primary key and counts the deletions in the publication reservation.
 A deferral keeps its event's scope (`dirty.recursive`). Merged deferrals keep
 the earliest due time and are never narrowed by a later shallow event. A row
 recorded before the flag existed (null) counts as recursive. A due shallow
-folder is re-listed shallowly; new subfolders are still walked whole. Only a
-recursive or unknown root deferral forces a full walk (`deferred_root_due`).
+folder is re-listed shallowly; new subfolders are still walked whole. A new
+event on a folder already due joins that re-listing with its own scope, since
+the listing discharges the deferral. Only a recursive or unknown root deferral
+forces a full walk (`deferred_root_due`).
 
 Failed-volume recovery: CLI `scan --full` retries a failed attempt even inside
 the daily cooldown. Persistent `scanner_full` retries at most daily from the
@@ -418,22 +420,32 @@ does not prove which exception caused the historical Big Mac failure.
 
 ### Scanner budget recovery
 
-A budget refusal ends only that volume's attempt. Its pending writes are
-dropped, the run continues with the other volumes, and the run row and
-`runs.volumes` record the code, stage and entries walked. The volume keeps its
-published map, points, hierarchy and bookmark. When the managed-storage cap
-refused the attempt (`managed_storage_limit` or `sqlite_checkpoint_headroom`),
-the next attempt for that volume is one full walk, trigger `budget_recovery`.
+A budget refusal ends only that volume's attempt, including a refusal while
+preparing it. Its pending writes are dropped, the run continues with the other
+volumes, and the run row and `runs.volumes` record the code, stage and entries
+walked. The volume keeps its published map, points, hierarchy and bookmark.
+When the managed-storage cap refused the attempt (`managed_storage_limit`,
+`sqlite_checkpoint_headroom`, or `sqlite_page_limit`: a transaction ran out of
+the page limit the cap had shortened), the next attempt for that volume is one
+full walk, trigger `budget_recovery`. A full attempt is recorded before its
+cleanup, so a refusal there still counts as a failed full walk.
 That walk prunes retired generations first and publishes by a small counted
 pointer switch. If the cap refuses that full walk too, the volume waits
 (trigger `budget_retry_gate`). It waits until managed bytes plus uncheckpointed
 WAL fall to `volumes.budget_retry_bytes`. That level comes from the refusal's
 own admission snapshot: there the same peak would have fit. A level of 0
-means it cannot fit under the cap at all. The hourly schedule, the weekly full
+means it cannot fit under the cap at all. For `sqlite_page_limit` the missing
+amount is unknown, so its level asks only that storage fall below where it
+was. A held volume makes the run `partial`, or its blocked status when nothing
+else published; it never reports success. The hourly schedule, the weekly full
 walk, the persistent `scanner_full` setting and a restart all wait. Only the
 operator's CLI `scan --full` retries regardless. A successful publication clears
 the level. Reader contention and the free-space margin keep their hourly retry.
 To resume a gated volume, free managed storage or run `scan --full`.
+The store gains nullable `volumes.budget_retry_bytes` and `dirty.recursive` on
+first open. A release before them inserted `dirty` rows positionally and fails
+on a migrated store; rolling back needs a release that names `dirty`'s columns,
+whose rows then read as unknown scope.
 
 Disposable regressions reproduce Big Mac's three causes with the real Budget:
 a re-listed folder's unchanged files refused at publication

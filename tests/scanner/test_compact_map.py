@@ -41,9 +41,9 @@ class StartupBudgetTests(unittest.TestCase):
             def capture(*args,**kwargs):
                 db=connect(*args,**kwargs);connections.append(db);return db
             with patch('machine_audit.scanner.store.sqlite3.connect',side_effect=capture):
-                with self.assertRaises(sqlite3.OperationalError) as failure:
+                # Running out of the cap-shortened page limit is a capacity refusal.
+                with self.assertRaisesRegex(BudgetExceeded,'sqlite_page_limit'):
                     MapStore(Path(temp)/'scanner.sqlite',budget)
-            self.assertEqual(failure.exception.sqlite_errorcode,sqlite3.SQLITE_FULL)
             self.assertLessEqual(budget.usage()['bytes'],budget.limit_bytes)
             self.assertEqual(len(connections),1)
             with self.assertRaises(sqlite3.ProgrammingError):connections[0].execute('SELECT 1')

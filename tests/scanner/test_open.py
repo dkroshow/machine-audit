@@ -218,15 +218,15 @@ class RootPublicationTests(unittest.TestCase):
         before = self.published()
         with sqlite3.connect(self.data/'scanner.sqlite') as db:
             start, hour = db.execute('SELECT max(observed_ns) FROM volumes').fetchone()[0], 3600*10**9
-        def run(after, **kwargs):
+        def run(after, chosen=None, **kwargs):
             with patch('machine_audit.scanner.runner.time.time_ns', return_value=start+after):
-                result, status = self.scan(volumes, events=events, limit=limit, **{'full':False, **kwargs})
-            return status, {r['volume_id']:r for r in result['volumes']}
+                result, status = self.scan(chosen or volumes, events=events, limit=limit, **{'full':False, **kwargs})
+            return status, {r['volume_id']:r for r in result['volumes']}, result['status']
         def volume(column):
             with sqlite3.connect(self.data/'scanner.sqlite') as db:
                 return db.execute(f"SELECT {column} FROM volumes WHERE id='v'").fetchone()[0]
 
-        status, results = run(hour)
+        status, results, outcome = run(hour)
         self.assertEqual(status, 'partial')
         self.assertIn(results['v']['status'], ('budget_blocked_sqlite_checkpoint_headroom','budget_blocked_managed_storage_limit'))
         self.assertGreaterEqual(results['v']['entries'], 3000, 'failed work must still be counted')
@@ -236,31 +236,96 @@ class RootPublicationTests(unittest.TestCase):
             generation = db.execute("SELECT generation FROM volumes WHERE id='w'").fetchone()[0]
             self.assertEqual(db.execute('SELECT count(*) FROM files WHERE generation=?', (generation,)).fetchone()[0], 1,
                              'the refused volume\'s pending rows were published as another volume\'s work')
-        status, results = run(2*hour)
+        status, results, outcome = run(2*hour)
         self.assertEqual((results['v']['action'], results['v']['trigger']), ('full', 'budget_recovery'))
         self.assertTrue(results['v']['status'].startswith('budget_blocked_'))
         level = volume('budget_retry_bytes')
         self.assertIsNotNone(level)
-        for after, full in ((3*hour, False), (3*hour+86400*10**9, True)):  # Hourly and persistent full settings.
-            status, results = run(after, full=full)
+        day = 86400*10**9
+        for after, full in ((3*hour, False), (day+3*hour, True)):  # Hourly and persistent full settings.
+            status, results, outcome = run(after, full=full)
             self.assertEqual((results['v']['action'], results['v']['trigger']), ('wait', 'budget_retry_gate'))
-            self.assertEqual(results['w']['status'], 'observed')
-        status, results = run(4*hour, force=True)  # The operator's explicit retry.
+            self.assertEqual((results['w']['status'], status, outcome), ('observed', 'partial', 'partial'))
+        status, results, outcome = run(day+4*hour, force=True)  # The operator's explicit retry.
         self.assertEqual(results['v']['action'], 'full')
         self.assertTrue(results['v']['status'].startswith('budget_blocked_'))
         level = volume('budget_retry_bytes')
         usage = Budget(self.data).usage()
         with open(collector, 'r+b') as file:
             file.truncate(16*1024**2-(usage['bytes']+usage['checkpoint_reservation_bytes']-level)+65536)
-        status, results = run(5*hour)
+        status, results, outcome = run(day+5*hour, chosen=[self.volume])
         self.assertEqual(results['v']['trigger'], 'budget_retry_gate')
+        # A run whose only volume is held must not report success.
+        self.assertEqual((status, outcome), (volume('status'),)*2)
         collector.unlink()  # Synthetic file created by this test.
-        status, results = run(6*hour)
+        status, results, outcome = run(day+6*hour)
         self.assertEqual((status, results['v']['action'], results['v']['status']), ('complete', 'full', 'observed'))
         self.assertIsNone(volume('budget_retry_bytes'))
-        status, results = run(7*hour)
+        status, results, outcome = run(day+7*hour)
         self.assertEqual((results['v']['action'], results['v']['trigger'], results['v']['status']),
                          ('update', 'hourly_update', 'observed'))
+
+    def test_refused_preparation_is_recorded_on_its_own_volume(self):
+        # A prune refused before preparation named its volume recorded the failure
+        # and retry level on the previous volume, or on none for the first one.
+        other = self.base/'other';other.mkdir()
+        second = replace(self.volume, id='w', mount=str(other), device=2)
+        self.scan([self.volume, second])
+        events = SimpleNamespace(uuid=lambda device:'events', current_id=lambda:30,
+                                 replay=lambda device,since:Replay(up_to=30))
+        with sqlite3.connect(self.data/'scanner.sqlite') as db:
+            start = db.execute('SELECT max(observed_ns) FROM volumes').fetchone()[0]
+        original = MapStore.prune_generations
+        def refuse_on(call):
+            calls = []
+            def prune(store, full=True):
+                calls.append(full)
+                if len(calls)==call:
+                    refused = BudgetExceeded('sqlite_checkpoint_headroom', 1)
+                    refused.retry_bytes = 1
+                    raise refused
+                return original(store, full)
+            return prune
+        def stored():
+            with sqlite3.connect(self.data/'scanner.sqlite') as db:
+                return dict((r[0], r[1:]) for r in db.execute('SELECT id,status,budget_retry_bytes FROM volumes'))
+        blocked = ('budget_blocked_sqlite_checkpoint_headroom', 1)
+        for hours, order, call, expected in ((1, [self.volume, second], 2, {'v':('observed', None), 'w':blocked}),
+                                             (2, [second, self.volume], 1, {'v':('observed', None), 'w':blocked})):
+            with patch.object(MapStore, 'prune_generations', refuse_on(call)), \
+                 patch('machine_audit.scanner.runner.time.time_ns', return_value=start+hours*3600*10**9):
+                result, status = self.scan(order, events=events, full=False)
+            self.assertEqual(stored(), expected)
+        # The recovery full walk was refused before its walk; it still counts as a
+        # failed full attempt, so the next scheduled run waits instead of repeating it.
+        self.assertEqual({r['volume_id']:r['trigger'] for r in result['volumes']}['w'], 'budget_recovery')
+        with patch('machine_audit.scanner.runner.time.time_ns', return_value=start+3*3600*10**9):
+            result, status = self.scan([second], events=events, full=False)
+        self.assertEqual((result['volumes'][0]['trigger'], status), ('budget_retry_gate', blocked[0]))
+
+    def test_cap_shortened_page_limit_gates_a_full_walk_until_storage_falls(self):
+        # Running out of an admitted page limit was write_failed: ungated, so each
+        # scheduled run could repeat the full walk.
+        filler = self.data/'synthetic-collector.sqlite'
+        filler.write_bytes(bytes(1024**2))
+        limit = Budget(self.data).usage()['bytes']+3*1024**2
+        def overflow(store, affected):
+            with store.write(rows=100_000):
+                store.db.execute('CREATE TABLE fill(value BLOB)')
+                store.db.execute('INSERT INTO fill VALUES(zeroblob(?))', (8*1024**2,))
+        before = self.published()
+        with patch.object(MapStore, '_aggregate_full', overflow), \
+             patch('machine_audit.scanner.runner.time.time_ns', return_value=8*86400*10**9):
+            result, status = self.scan([self.volume], full=False, limit=limit)
+        self.assertEqual((result['action'], status), ('full', 'budget_blocked_sqlite_page_limit'))
+        self.assertEqual(self.published()[1:6], before[1:6])
+        with patch('machine_audit.scanner.runner.time.time_ns', return_value=9*86400*10**9):
+            result, status = self.scan([self.volume], full=False, limit=limit)
+        self.assertEqual((result['volumes'][0]['trigger'], status), ('budget_retry_gate', 'budget_blocked_sqlite_page_limit'))
+        filler.unlink()  # Synthetic file created by this test.
+        with patch('machine_audit.scanner.runner.time.time_ns', return_value=9*86400*10**9+1):
+            result, status = self.scan([self.volume], full=False, limit=limit)
+        self.assertEqual((result['volumes'][0]['trigger'], status), ('budget_recovery', 'complete'))
 
     def test_specific_invariant_and_chosen_action_survive_a_failed_run(self):
         def fail_aggregate(store, affected):

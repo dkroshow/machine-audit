@@ -43,19 +43,22 @@ class PublicationBudgetTests(unittest.TestCase):
         return evidence
 
     def test_run_diagnostics_migrate_without_changing_prior_run_evidence(self):
-        legacy = SCHEMA.replace(',\n volume_id TEXT,action TEXT,trigger TEXT,stage TEXT,volumes TEXT', '').replace(',full_attempt_ns INTEGER','')
+        legacy = (SCHEMA.replace(',\n volume_id TEXT,action TEXT,trigger TEXT,stage TEXT,volumes TEXT', '')
+                  .replace(',full_attempt_ns INTEGER,budget_retry_bytes INTEGER', '').replace('due_ns INTEGER,recursive INTEGER', 'due_ns INTEGER'))
         original = ('old',1,2,2,123,'start','complete',10,20,30,40,'scheduled')
         with sqlite3.connect(self.path) as db:
             db.executescript(legacy)
             db.execute('PRAGMA user_version=2')
             db.execute('INSERT INTO runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',original)
             db.execute("INSERT INTO volumes(id,label,mount,status,lean,full_ns) VALUES('v','Volume','/synthetic','observed',1,17)")
+            db.execute("INSERT INTO dirty VALUES('v','9',5)")  # The previous release's positional insert.
         store = MapStore(self.path, Budget(self.root, free_margin_bytes=0))
         self.addCleanup(store.close)
         row = tuple(store.db.execute("SELECT * FROM runs WHERE id='old'").fetchone())
         self.assertEqual(row[:12],original)
         self.assertEqual(row[12:],(None,None,None,None,None))
-        self.assertEqual(tuple(store.db.execute('SELECT full_ns,full_attempt_ns FROM volumes').fetchone()),(17,None))
+        self.assertEqual(tuple(store.db.execute('SELECT full_ns,full_attempt_ns,budget_retry_bytes FROM volumes').fetchone()),(17,None,None))
+        self.assertEqual(tuple(store.db.execute('SELECT * FROM dirty').fetchone()),('v','9',5,None))
         store.start('scheduled')
         store.phase('walk',volume_id='v',action='full',trigger='event_kernel_drop')
         self.assertEqual(tuple(store.db.execute('SELECT volume_id,action,trigger,stage FROM runs WHERE id=?',
@@ -149,6 +152,26 @@ class PublicationBudgetTests(unittest.TestCase):
         for table in ('files', 'nodes', 'reset_dirs', 'removed'):
             self.assertEqual(store.db.execute(f'SELECT count(*) FROM {table} WHERE generation=?',
                                               (staged[0][0],)).fetchone()[0], 0)
+
+    def test_page_limit_shortened_by_the_cap_is_a_capacity_refusal(self):
+        # A transaction that ran out of the page limit the cap had shortened failed
+        # as write_failed, outside recovery and its retry gate.
+        store = MapStore(self.path, Budget(self.root, free_margin_bytes=0))
+        self.addCleanup(store.close)
+        with store.write(rows=1):store.db.execute('CREATE TABLE fill(value BLOB)')
+        filler = self.root/'synthetic-collector.sqlite';filler.write_bytes(bytes(4096))
+        store.budget.limit_bytes = store.budget.usage()['bytes']+2*1024**2
+        with self.assertRaisesRegex(BudgetExceeded, 'sqlite_page_limit') as refused:
+            with store.write(rows=100_000):store.db.execute('INSERT INTO fill VALUES(zeroblob(?))', (4*1024**2,))
+        self.assertEqual(store.db.execute('SELECT count(*) FROM fill').fetchone()[0], 0)
+        self.assertIsNone(refused.exception.shortfall_bytes, 'the missing amount is unknown')
+        self.assertFalse(store.budget.retry_level_reached(refused.exception.retry_bytes))
+        filler.unlink()
+        self.assertTrue(store.budget.retry_level_reached(refused.exception.retry_bytes))
+        # Running past pages the writer declared itself is a contract error, not pressure.
+        store.budget.limit_bytes = 10**10
+        with self.assertRaisesRegex(sqlite3.OperationalError, 'full'):
+            with store.write(rows=1):store.db.execute('INSERT INTO fill VALUES(zeroblob(?))', (4*1024**2,))
 
     def test_quiet_updates_leave_counter_unchanged_and_never_force_full(self):
         store = MapStore(self.path, Budget(self.root, free_margin_bytes=0))
