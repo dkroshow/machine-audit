@@ -1,9 +1,11 @@
 """Exercise permission boundaries without installing jobs or reading user files."""
 import json
+import inspect
 import io
 from contextlib import redirect_stdout
 import os
 from pathlib import Path
+import plistlib
 import subprocess
 import sys
 import tempfile
@@ -12,7 +14,8 @@ import unittest
 from unittest.mock import patch
 
 from machine_audit.config import Config
-from machine_audit.installation import build_scanner, scanner_executable, _install_files, control, COLLECTOR, SCANNER
+from machine_audit.collector import Collector
+from machine_audit.installation import build_scanner, scanner_executable, _install_files, control, job_plists, COLLECTOR, SCANNER
 from machine_audit.onboarding import observed_permissions
 from machine_audit.scanner.permissions import AccessObservation
 from machine_audit.scanner_entry import main
@@ -29,6 +32,16 @@ class InstallationTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_collector_job_configures_a_60_s_exit_grace_beyond_its_close_deadline(self):
+        # Big Mac's job had no ExitTimeOut: launchd sent SIGKILL 5 s after SIGTERM,
+        # before the stopping collector had saved, and unsaved readings were lost.
+        candidate = {'release': '/synthetic/release', 'python': '/synthetic/python3.12',
+                     'config': '/synthetic/config.json', 'scanner': '/synthetic/scanner'}
+        job = plistlib.loads(plistlib.dumps(job_plists(candidate)[COLLECTOR]))
+        close_deadline = inspect.signature(Collector.close).parameters['timeout_s'].default
+        self.assertEqual(job.get('ExitTimeOut'), 60)
+        self.assertGreater(job['ExitTimeOut'], close_deadline)
 
     def test_permission_check_never_becomes_a_scan_when_request_expires(self):
         """A delayed one-shot check must not fall through into a full disk walk."""

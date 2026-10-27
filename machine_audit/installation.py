@@ -19,6 +19,11 @@ import uuid
 from .config import Config
 
 COLLECTOR = 'local.machine-audit.collector'
+# launchd sends SIGKILL this long after SIGTERM; without it Big Mac used 5 s and
+# killed a stopping collector. 60 s gives a periodic save already running, then
+# close()'s own deadline to save or spill, more time. It is a configured
+# allowance, not a proven maximum: a running periodic save has no deadline.
+COLLECTOR_EXIT_GRACE_S = 60
 SCANNER = 'local.machine-audit.scanner'
 PERMISSION = 'local.machine-audit.permission-check'
 
@@ -147,7 +152,7 @@ def job_plists(candidate: dict) -> dict[str, dict]:
         COLLECTOR: {'Label': COLLECTOR,
                     'ProgramArguments': [candidate['python'], '-I', bootstrap, '--config', candidate['config'], 'run'],
                     'RunAtLoad': True, 'KeepAlive': True, 'Disabled': True,
-                    'ThrottleInterval': 30, 'Umask': 0o077},
+                    'ThrottleInterval': 30, 'ExitTimeOut': COLLECTOR_EXIT_GRACE_S, 'Umask': 0o077},
         SCANNER: {'Label': SCANNER, 'ProgramArguments': [candidate['scanner']],
                   'StartInterval': 3600, 'ProcessType': 'Background', 'LowPriorityIO': True,
                   'Disabled': True, 'Nice': 10, 'Umask': 0o077},

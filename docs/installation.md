@@ -47,6 +47,10 @@ The CLI separates saved choices (`setup`), a read-only installation plan
 the last permission observation and recording status. Installation creates
 disabled job definitions; it does not start either process. Existing installations
 are refused until the update/recovery path has been reviewed.
+The collector job sets `ExitTimeOut` to 60 s; launchd's own wait before SIGKILL
+was 5 s on Big Mac and cut a stop short. This reduces that early-kill risk but is
+not a no-loss guarantee: a periodic save already running at the stop has no
+deadline. A job loaded from an older definition keeps its old wait until reloaded.
 
 Setup records the GPU reader choice; starting jobs never changes it. Doctor shows
 when a saved choice needs a restart. Scheduled scans preserve the last explicit
