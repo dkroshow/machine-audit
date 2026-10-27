@@ -322,25 +322,37 @@ class RootPublicationTests(unittest.TestCase):
                 result, status = self.scan([self.volume], limit=limit, **{'full':False, **kwargs})
             return result['volumes'][0]['trigger'], status, result['status']
         blocked = 'budget_blocked_sqlite_page_limit'
+        events = SimpleNamespace(uuid=lambda device:'events', current_id=lambda:30,
+                                 replay=lambda device,since:Replay(up_to=30))
+        minute = 60*10**9
+        self.assertEqual(scan(8*day)[1:], ('complete', 'observed'))
+        self.assertEqual(scan(9*day+hour, events=events), ('hourly_update', 'complete', 'observed'))
+        before = self.published()
+        self.assertEqual(scan(9*day+hour+5*minute), ('update_not_due', 'complete', 'observed'))  # Healthy and current.
+        failed = 9*day+hour+10*minute
         with patch.object(MapStore, '_aggregate_full', overflow):
-            self.assertEqual(scan(8*day), ('weekly_full', blocked, blocked))
+            # The operator's full walk, inside the hour after an update.
+            self.assertEqual(scan(failed, force=True), ('requested_full', blocked, blocked))
             self.assertEqual(self.published()[1:6], before[1:6])
+            # Not yet due either way, but blocked: never reported as current.
+            self.assertEqual(scan(failed+10*minute), ('update_not_due', blocked, blocked))
+            with sqlite3.connect(self.data/'scanner.sqlite') as db:
+                volumes = db.execute('SELECT volumes FROM runs ORDER BY started_ns DESC LIMIT 1').fetchone()[0]
+            self.assertEqual(json.loads(volumes)[0]['status'], blocked)
             # Each run is a fresh process. Hourly, persistent full inside and
             # after its daily cooldown, and small freed space all keep waiting
             # and never report success.
-            for now, full, trigger in ((8*day+hour, False, 'budget_retry_gate'),
-                                       (8*day+2*hour, True, 'failed_full_retry_cooldown'),
-                                       (9*day+3*hour, True, 'budget_retry_gate'),
-                                       (9*day+4*hour, False, 'budget_retry_gate')):
+            for now, full, trigger in ((failed+hour, False, 'budget_retry_gate'),
+                                       (failed+2*hour, True, 'failed_full_retry_cooldown'),
+                                       (failed+day+3*hour, True, 'budget_retry_gate'),
+                                       (failed+day+4*hour, False, 'budget_retry_gate')):
                 with open(filler, 'r+b') as file:file.truncate(filler.stat().st_size-64*1024)
                 self.assertEqual(scan(now, full=full), (trigger, blocked, blocked))
             self.assertEqual(len(walks), 1)
-            self.assertEqual(scan(9*day+5*hour, force=True), ('budget_recovery', blocked, blocked))
+            self.assertEqual(scan(failed+day+5*hour, force=True), ('budget_recovery', blocked, blocked))
             self.assertEqual(len(walks), 2)
-        self.assertEqual(scan(9*day+6*hour, force=True)[1:], ('complete', 'observed'))
-        events = SimpleNamespace(uuid=lambda device:'events', current_id=lambda:30,
-                                 replay=lambda device,since:Replay(up_to=30))
-        self.assertEqual(scan(10*day+7*hour, events=events), ('hourly_update', 'complete', 'observed'))
+        self.assertEqual(scan(failed+day+6*hour, force=True)[1:], ('complete', 'observed'))
+        self.assertEqual(scan(failed+2*day+7*hour, events=events), ('hourly_update', 'complete', 'observed'))
 
     def test_specific_invariant_and_chosen_action_survive_a_failed_run(self):
         def fail_aggregate(store, affected):

@@ -226,7 +226,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     else:action,trigger='full','budget_recovery'
                 if action=='wait':
                     store.phase('complete',action=action,trigger=trigger)
-                    status=old['status'] if trigger in ('failed_full_retry_cooldown','budget_retry_gate') else 'current'
+                    status=old['status'] if capacity or trigger=='failed_full_retry_cooldown' else 'current'
                     if capacity:  # Blocked, not up to date, whichever wait held it.
                         root_failed=True;blocked=status
                     results.append({'volume_id':volume.id,'status':status,'action':action,'trigger':trigger})
