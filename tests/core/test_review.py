@@ -107,37 +107,46 @@ class ReviewTests(unittest.TestCase):
         self.assertTrue(any(r.get('partial_boundary') for r in observed))
         self.assertTrue(all(r['signal']=='cpu.busy' for r in answer['rows']))
 
-    def test_close_has_one_deadline_and_holds_lock_until_native_read_finishes(self):
-        entered=threading.Event();release=threading.Event()
-        class Source:
-            name='slow';component='cpu';cadence_s=1
-            def read(self):
-                entered.set();release.wait(5)
-                c=Clock(1,1,1)
-                return Reading(self.name,self.component,c,c)
-        collector=Collector(self.store,[Source()]);collector.start();self.assertTrue(entered.wait(1))
-        c=Clock(2,2,2)
-        collector.ingest(Reading('completed','cpu',c,c,(Field('cpu.ready',1,'count'),)))
-        saved=threading.Event();append=self.store.append
-        def observe_save(*args,**kwargs):
-            append(*args,**kwargs);saved.set()
-        replacement=Collector(self.store)
-        try:
-            with patch.object(self.store,'append',side_effect=observe_save):
-                began=time.monotonic()
-                self.assertFalse(collector.close(timeout_s=.03))
-                self.assertLess(time.monotonic()-began,.2)
-                # A hung native read must not keep already-completed evidence
-                # solely in RAM when the caller's close deadline expires.
-                self.assertTrue(saved.wait(.5),'shutdown waited for the native read before saving')
-                with self.store.read() as db:
-                    self.assertEqual(db.execute("SELECT count(*) FROM readings WHERE source='completed'").fetchone()[0],1)
-                with self.assertRaisesRegex(RuntimeError,'collector_already_running'):replacement.acquire()
-        finally:
-            release.set();self.assertTrue(collector.close(timeout_s=2))
-        with self.store.read() as db:
-            self.assertEqual(db.execute("SELECT count(*) FROM readings WHERE source='slow'").fetchone()[0],1)
-        replacement.acquire();self.assertTrue(replacement.close())
+    def test_stop_cuts_off_admission_and_holds_lock_until_native_read_finishes(self):
+        # A stop waited for a hung native read before saving, and the process exited with
+        # completed evidence only in RAM. One cutoff now ends admission: completed readings
+        # are checkpointed at once and the hung read is an explicit unobserved gap; its
+        # result, early or late, is not admitted. The lock is held until it returns.
+        def stop(during_checkpoint):
+            entered=threading.Event();release=threading.Event()
+            class Source:
+                name='slow';component='cpu';cadence_s=1
+                def read(self):
+                    entered.set();release.wait(5)
+                    c=Clock(1,1,1)
+                    return Reading(self.name,self.component,c,c,(Field('cpu.ready',1,'count'),))
+            collector=Collector(self.store,[Source()],run_id=f'run-{during_checkpoint}');collector.start()
+            self.assertTrue(entered.wait(1))
+            c=Clock(2,2,2)
+            collector.ingest(Reading('completed','cpu',c,c,(Field('cpu.ready',1,'count'),)))
+            spill=self.store.spill
+            def completing(*args):
+                # The read returns while its checkpoint is being written.
+                release.set();collector.threads[0].join(2);return spill(*args)
+            replacement=Collector(self.store)
+            try:
+                with patch.object(self.store,'spill',completing) if during_checkpoint else patch.object(Store,'close',Store.close):
+                    self.assertTrue(collector.close(timeout_s=2))
+                self.assertEqual(collector.stop_code,'stop_checkpointed')
+                if not during_checkpoint:
+                    with self.assertRaisesRegex(RuntimeError,'collector_already_running'):replacement.acquire()
+            finally:
+                release.set()
+            collector._closer.join(5);self.assertFalse(collector._closer.is_alive())
+            replacement.start()  # The lock is free now; this saves the checkpoint.
+            self.assertTrue(replacement.close())
+            with self.store.read() as db:
+                saved={source:[Record.unpack(payload).reading.status for payload, in db.execute(
+                    'SELECT payload FROM readings WHERE run_id=? AND source=? ORDER BY sequence',(collector.run_id,source))]
+                    for source in ('completed','slow')}
+            self.assertEqual(saved,{'completed':['observed'],'slow':['unobserved']})
+        for during_checkpoint in (False,True):
+            with self.subTest(during_checkpoint=during_checkpoint):stop(during_checkpoint)
 
     def test_field_contract_rejects_host_names_and_addresses_in_units_and_reasons(self):
         # Security review P2: syntax-only checks let a dotted host name or ip:port ride out in

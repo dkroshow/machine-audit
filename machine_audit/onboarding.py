@@ -108,7 +108,7 @@ def inspect(config: Config) -> dict:
         actions.append('The dashboard port is unavailable. Resolve the conflict before starting collection.')
     if running and not any(source.get("status") in {"observed", "measured_zero"} for source in source_states):
         actions.append("The collector has not confirmed any successful source readings; inspect machine-audit status.")
-    if collector.get("save_error"):
+    if collector.get("save_error") or collector.get("recovery_error"):
         actions.append("Resolve the recording error shown by machine-audit status.")
     return {
         "schema_version": 1,

@@ -84,32 +84,38 @@ initialization also run synchronously before collection starts. HTTP has its
 own server and request threads, but storage contention can separately delay
 queries or the writer.
 
-Shutdown attempts to save completed buffered readings before joining source
-threads.
-`close()` returns failure after its deadline if a native read or the final
-write remains stuck; it neither cancels the call nor records a clean stop.
-The daemon finalizer retains the store and instance lock until old reads return
-and their final readings are saved, preventing an overlapping collector while
-that process remains alive; process exit abandons remaining daemon threads.
-This preserves the deadline without claiming the blocked measurement completed.
+Shutdown sets one cutoff under the collector lock. Every reading admitted before
+it is kept; a read still running is recorded as a fieldless `unobserved` reading
+with reason `stop_read_in_flight`, from its own start to the cutoff, and its result
+is not admitted when it returns. The stop then writes the unsaved readings, the held
+minute and the saved sequence to a checkpoint and merges nothing. `close()` waits
+up to its deadline (10 s) for that checkpoint and returns whether it is durable.
+The daemon finalizer keeps the instance lock until every read returns, preventing
+an overlapping collector while that process remains alive; process exit abandons
+remaining daemon threads. Storage is not closed while the finalizer runs.
 
-Final saves do not prune: at the storage limit, pruning until a save fits can
-outlast any stop deadline. A final save is checked against the limit before it
-merges its summary rows (about 15 s at 2,000 processes), so a refusal is quick.
-The final saves also give up 2 s before the stop deadline (`close()`, 10 s by
-default): merging a 2,000-process save takes about 15 s. A deadline of 2 s or
-less leaves no time to spill, so saving then continues in the background. If the limit refuses
-a final save, or it runs out of time, the collector
-writes the unsaved readings and the held minute to its own private spill file
-in the data directory (`unsaved-<run>-<time>.json`, mode 0600, created
-exclusively within the budget, never replacing an earlier one). It then stops
-cleanly and records `stop_unsaved_budget` or `stop_unsaved_deadline` in
-`startup.json`. The next start
-saves each spill file under its original run, with ordinary pruning, records
-that run's stop, and removes the file; readings already saved are not saved
-twice. If that fails, the file stays for a later start and collection still
-begins. If even the spill file does not fit, the stop fails with
-`stop_unsaved_lost` and those readings are lost.
+The checkpoint is a private file in the data directory
+(`unsaved-<run>-<cutoff>.json`, mode 0600, inside the budget). It is written under a
+hidden `.partial` name, synced, then published by a hard link that never replaces
+another file, and the directory is synced; a stop killed while writing leaves only
+the hidden file, which recovery ignores and nothing removes. A published checkpoint
+records `stop_checkpointed` in `startup.json`. If it cannot be written the stop fails
+with `stop_unsaved_lost`; if it is still waiting at the deadline, `shutdown_incomplete`.
+Two waits come before it and have no deadline of their own: a periodic save already
+running, and admission behind another writer's reservation. Either can still lose
+the unsaved readings, explicitly.
+
+The next start saves each checkpoint under its original run in one transaction:
+its readings, the held minute and the run's stop marker, set to the cutoff. A run
+already carrying that stop marker has saved it, so the file is only removed;
+readings are never saved twice and the marker never moves. A checkpoint that does
+not match its run (for example one an older release half-recovered: readings saved,
+stop not) is kept, not saved with a stale held minute. Such a file, or one that fails
+to save, stays for a later start, collection still begins, and status reports
+`recovery_error` until a start saves it. Recovery decodes and merges a checkpoint's
+whole tail at once, so its memory and reservation grow with that tail; this has not
+been measured at Big Mac scale. Until the next start, saved-history queries report
+the stop's last minutes as `after_last_save` gaps.
 
 | Transition | Action and visible evidence |
 | --- | --- |
@@ -120,9 +126,10 @@ begins. If even the spill file does not fit, the stop fails with
 | pending batch → committed | Commit raw readings and rollups, then advance the watermark under the query lock |
 | save fails before commit | Keep the pending batch and watermark; retry at the next flush |
 | buffer high-water reached | Suspend new reads, preserve completed ones, expose skipped coverage and the suspension span |
-| stop requested with a read in flight | Save completed readings first, then wait for that read within the caller's close deadline |
-| clean stop | Save, write a stop marker, release the instance lock |
-| hung read or failed final save | Leave the run unclean; the next query shows the gap |
+| stop requested with a read in flight | At the cutoff, record that read as `unobserved`; never admit its result; keep the instance lock until it returns |
+| stop | Checkpoint admitted readings and the held minute (`stop_checkpointed`); release the instance lock once reads return |
+| next start finds a checkpoint | Save readings, held minute and stop marker in one transaction, then remove the file; keep a mismatched one and report `recovery_error` |
+| checkpoint not durable by the deadline | `close()` fails (`shutdown_incomplete` or `stop_unsaved_lost`); the run stays unstopped and queries show the gap |
 
 A query opens its SQLite read transaction under the same short lock that
 protects commit/watermark advancement. It copies immutable packed references,

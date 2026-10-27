@@ -106,15 +106,9 @@ def top_consumers(rows):
     return keep
 
 
-def on_time(deadline):
-    """A stopping save gives up once its deadline passes; the stop then spills."""
-    if deadline is not None and time.monotonic()>=deadline:raise TimeoutError("stop_deadline")
-
-
-def held_rows(held,deadline=None):
+def held_rows(held):
     rows=[]
     for payload in held["rows"].values():
-        on_time(deadline)
         rows.extend(unpack_summaries(payload))
     return rows
 
@@ -191,61 +185,34 @@ class Store:
                     self.db.execute("INSERT INTO runs(run_id,boot_id,started_ns) VALUES(?,?,?)", (run_id, boot_id, started_ns))
             self._pruning_until_admitted(write)
 
-    def stop_run(self, run_id, stopped_ns, prunes=None, deadline=None):
+    def stop_run(self, run_id, stopped_ns):
         """Mark the run stopped and save its held minute, which is now complete."""
-        with self._mutex:
-            on_time(deadline)
-            prepared=[]
-            held=self._held if self._held is not None and self._held["run_id"]==run_id else None
-            if held:
-                rows=held_rows(held,deadline)
-                keep=top_consumers(rows)|held["own"]
-                groups=defaultdict(list)
-                for row in rows:
-                    if row["entity"] in keep:groups[(row["source"],row["component"],row["entity"])].append(row)
-                for key,group in groups.items():
-                    on_time(deadline)
-                    prepared.append(summary_values(run_id,held["lower"],held["upper"],"minute",held["bucket"],*key,group))
-            def write():
-                with self.budget.sqlite_write(self.db,self.path,rows=1+len(prepared),payload_bytes=sum(len(row[-1]) for row in prepared)):
-                    self.db.execute("BEGIN IMMEDIATE")
-                    try:
-                        self._interrupt_at(deadline)
-                        self.db.executemany(UPSERT_SUMMARY,prepared)
-                        self.db.execute("UPDATE runs SET stopped_ns=? WHERE run_id=?", (stopped_ns,run_id))
-                        self.db.execute("COMMIT")
-                    except BaseException as exc:
-                        self._rollback(exc,deadline)
-                        raise
-                    finally:
-                        self.db.set_progress_handler(None,0)
-            self._pruning_until_admitted(write,prunes)
-            if held:self._held=None
+        self.append([],run_id=run_id,stopped_ns=stopped_ns)
 
-    def _interrupt_at(self,deadline):
-        """Interrupt SQLite work that would outlast a stopping save's deadline."""
-        if deadline is not None:self.db.set_progress_handler(lambda:time.monotonic()>=deadline,1000)
+    def _stop_rows(self,held,run_id):
+        """The held minute's top consumers, saved when its run stops."""
+        if not held:return []
+        rows=held_rows(held)
+        keep=top_consumers(rows)|held["own"]
+        groups=defaultdict(list)
+        for row in rows:
+            if row["entity"] in keep:groups[(row["source"],row["component"],row["entity"])].append(row)
+        return [summary_values(run_id,held["lower"],held["upper"],"minute",held["bucket"],*key,group) for key,group in groups.items()]
 
-    def _rollback(self,exc,deadline):
-        self.db.set_progress_handler(None,0)
-        if self.db.in_transaction:self.db.execute("ROLLBACK")
-        if isinstance(exc,sqlite3.OperationalError):on_time(deadline)
-
-    def _pruning_until_admitted(self,write,prunes=None):
-        """Run a write, pruning the oldest history between attempts until it fits,
-        or until `prunes` batches have been pruned."""
+    def _pruning_until_admitted(self,write):
+        """Run a write, pruning the oldest history between attempts until it fits."""
         while True:
             try:
                 return write()
             except (sqlite3.OperationalError,BudgetExceeded) as exc:
-                if not self._capacity_error(exc) or prunes==0 or not self.prune_oldest():raise
-                if prunes is not None:prunes-=1
+                if not self._capacity_error(exc) or not self.prune_oldest():raise
 
     def spill(self, run_id, stopped_ns, payloads):
-        """Keep a stopping run's unsaved readings and held minute for the next start.
-
-        Each stop writes its own private file, created exclusively inside the
-        budget, so it never replaces an earlier stop's file."""
+        """Checkpoint a stopping run: its unsaved readings, held minute and saved
+        sequence, for the next start to save. The file is written under a hidden name
+        and published only once complete and synced, so a stop killed mid-write never
+        leaves a partial checkpoint for recovery. Publication never replaces another
+        stop's file. A killed write leaves its hidden file, which recovery ignores."""
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}",run_id):raise ValueError("invalid run id")
         with self._mutex:
             held=self._held if self._held is not None and self._held["run_id"]==run_id else None
@@ -254,34 +221,61 @@ class Store:
                          "records":[base64.b64encode(p).decode() for p in payloads],
                          "held":None if held is None else {"bucket":held["bucket"],"lower":held["lower"],"upper":held["upper"],
                              "own":sorted(held["own"]),"rows":[[*key,base64.b64encode(payload).decode()] for key,payload in held["rows"].items()]}}).encode()
-            path=self.path.parent/f"unsaved-{run_id}-{stopped_ns}.json"
-            with self.budget.reserve(len(data)):
-                fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+            directory=self.path.parent
+            path=directory/f"unsaved-{run_id}-{stopped_ns}.json"
+            partial=directory/f".{path.name}.partial"
+            # Until the partial name is removed the file has two names, counted twice.
+            with self.budget.reserve(2*len(data)):
+                fd=os.open(partial,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
                 try:
                     with os.fdopen(fd,"wb") as stream:
                         stream.write(data);stream.flush();os.fsync(stream.fileno())
-                except BaseException:
-                    path.unlink(missing_ok=True);raise
+                    os.link(partial,path)
+                    directory_fd=os.open(directory,os.O_RDONLY)
+                    try:os.fsync(directory_fd)
+                    finally:os.close(directory_fd)
+                finally:
+                    partial.unlink(missing_ok=True)
             return path
 
     def recover_unsaved(self):
-        """Save each spilled stop under its own run, as its next save would have, then
-        remove the file. Readings saved since the spill are not saved twice."""
+        """Save each checkpoint under its own run, then remove it, and return the
+        errors of checkpoints kept. Each is saved in one transaction with its run's
+        stop, so a run with a stop marker has already saved it."""
+        kept=[]
         with self._mutex:
             for path in sorted(self.path.parent.glob("unsaved-*.json")):
-                with os.fdopen(os.open(path,os.O_RDONLY|os.O_NOFOLLOW),"rb") as stream:
-                    data=json.loads(stream.read())
-                if data.get("format")!="machine-audit-unsaved-v1":raise ValueError("unsupported_unsaved_file")
-                run_id,held=data["run_id"],data["held"]
-                last=self.db.execute("SELECT last_sequence FROM runs WHERE run_id=?",(run_id,)).fetchone()[0]
-                records=[r for r in (Record.unpack(base64.b64decode(p)) for p in data["records"]) if r.sequence>last]
-                # A save after the spill already merged newer data; that held minute is stale.
-                self._held=None if held is None or last!=data["committed"] else dict(
-                    run_id=run_id,bucket=held["bucket"],lower=held["lower"],upper=held["upper"],own=set(held["own"]),
-                    rows={tuple(row[:3]):base64.b64decode(row[3]) for row in held["rows"]})
-                self.append(records)
-                self.stop_run(run_id,data["stopped_ns"])
-                path.unlink()
+                try:
+                    with os.fdopen(os.open(path,os.O_RDONLY|os.O_NOFOLLOW),"rb") as stream:
+                        data=json.loads(stream.read())
+                    if data.get("format")!="machine-audit-unsaved-v1":raise ValueError("unsupported_unsaved_file")
+                    run_id,stopped_ns,held=data["run_id"],data["stopped_ns"],data["held"]
+                    records=[Record.unpack(base64.b64decode(p)) for p in data["records"]]
+                    row=self.db.execute("SELECT last_sequence,stopped_ns,boot_id FROM runs WHERE run_id=?",(run_id,)).fetchone()
+                    sequences=[r.sequence for r in records]
+                    # Its readings must be this run's own unsaved tail, before anything
+                    # is saved or the file removed.
+                    if (row is None or any(r.run_id!=run_id or r.boot_id!=row[2] for r in records)
+                            or sequences!=sorted(set(sequences)) or any(s<=data["committed"] for s in sequences)):
+                        raise ValueError("unsaved_checkpoint_mismatch")
+                    last,stopped,_=row
+                    if stopped is not None:
+                        # Saved by an earlier recovery that stopped before removing the file.
+                        if stopped!=stopped_ns or last<max((r.sequence for r in records),default=data["committed"]):
+                            raise ValueError("unsaved_checkpoint_mismatch")
+                    else:
+                        # A save after the checkpoint (an older release's recovery) leaves
+                        # its held minute stale; it is kept rather than saved wrong.
+                        if last!=data["committed"]:raise ValueError("unsaved_checkpoint_mismatch")
+                        self._held=None if held is None else dict(
+                            run_id=run_id,bucket=held["bucket"],lower=held["lower"],upper=held["upper"],own=set(held["own"]),
+                            rows={tuple(row[:3]):base64.b64decode(row[3]) for row in held["rows"]})
+                        try:self.append(records,run_id=run_id,stopped_ns=stopped_ns)
+                        finally:self._held=None
+                    path.unlink()
+                except Exception as exc:
+                    kept.append(exc)
+        return kept
 
     def _previous(self, records):
         result = {}
@@ -296,50 +290,53 @@ class Store:
                 result[source] = Record.unpack(row[0])
         return result
 
-    def append(self, records: list[Record], *, commit_lock=None, on_commit=None, prunes=None, deadline=None):
-        """Save records. `prunes` bounds the pruning a stopping save may do; it then
-        skips proactive pruning as well. A save still unfinished at `deadline`
-        raises TimeoutError("stop_deadline") and saves nothing."""
-        if not records:
+    def append(self, records: list[Record], *, run_id=None, stopped_ns=None, commit_lock=None, on_commit=None):
+        """Save records. With `stopped_ns`, the same transaction also saves the held
+        minute and marks the run stopped; `run_id` names the run when there are no
+        records."""
+        if not records and stopped_ns is None:
             return
         with self._mutex:
             for i, r in enumerate(records):
                 if r.sequence < 1 or (i and (r.run_id != records[0].run_id or r.boot_id != records[0].boot_id or r.sequence <= records[i-1].sequence)):
                     raise ValueError("one append requires one run and increasing positive sequences")
+            if records and run_id is not None and run_id!=records[0].run_id:
+                raise ValueError("records belong to another run")
+            run_id=records[0].run_id if records else run_id
+            if run_id is None:raise ValueError("a stop requires its run")
             raw = [(r, r.packed) for r in records]
-            derived = points(records, self._previous(records))
             summaries = defaultdict(list)
-            minutes=defaultdict(list)
-            own=set()
-            coarser=defaultdict(list)
-            for bucket,row in rollups(derived,MINUTE):
-                if row["scope"] not in HOUR_ONLY_SCOPES:
-                    if ranked(row["component"],row["entity"]):minutes[bucket].append(row)
-                    else:summaries[("minute",bucket,row["source"],row["component"],row["entity"])].append(row)
-                    if row["scope"]=="managed_process":own.add(row["entity"])
-                    coarser[("15-minute",bucket//QUARTER*QUARTER,row["source"],row["component"],row["entity"],row["signal"],row["unit"],row["scope"],row["kind"],row["scale"])].append(row)
-                coarser[("hour",bucket//HOUR*HOUR,row["source"],row["component"],row["entity"],row["signal"],row["unit"],row["scope"],row["kind"],row["scale"])].append(row)
-            for key,rows in coarser.items():
-                on_time(deadline)
-                summaries[key[:5]].append(merge_summaries(rows) if len(rows)>1 else rows[0])
-            if prunes is None:self.maintain()
-            held,lowers=self._top_minutes(records,minutes,own,summaries,deadline)
-            on_time(deadline)
-            if prunes==0:
-                # A stopping save the limit refuses before merging fails now, not after
-                # merging every row: its full reservation is larger still.
-                _,count,payload=self._bound(records,raw,summaries)
-                with self.budget.sqlite_write(self.db,self.path,rows=count,payload_bytes=payload):pass
+            held=self._held if self._held is not None and self._held["run_id"]==run_id else None
+            lowers={}
+            if records:
+                derived = points(records, self._previous(records))
+                minutes=defaultdict(list)
+                own=set()
+                coarser=defaultdict(list)
+                for bucket,row in rollups(derived,MINUTE):
+                    if row["scope"] not in HOUR_ONLY_SCOPES:
+                        if ranked(row["component"],row["entity"]):minutes[bucket].append(row)
+                        else:summaries[("minute",bucket,row["source"],row["component"],row["entity"])].append(row)
+                        if row["scope"]=="managed_process":own.add(row["entity"])
+                        coarser[("15-minute",bucket//QUARTER*QUARTER,row["source"],row["component"],row["entity"],row["signal"],row["unit"],row["scope"],row["kind"],row["scale"])].append(row)
+                    coarser[("hour",bucket//HOUR*HOUR,row["source"],row["component"],row["entity"],row["signal"],row["unit"],row["scope"],row["kind"],row["scale"])].append(row)
+                for key,rows in coarser.items():
+                    summaries[key[:5]].append(merge_summaries(rows) if len(rows)>1 else rows[0])
+                self.maintain()
+                held,lowers=self._top_minutes(records,minutes,own,summaries)
+            stop=None
+            if stopped_ns is not None:
+                stop=(stopped_ns,self._stop_rows(held,run_id));held=None
             # Prepare once: a save that must prune to fit repeats only admission and commit.
-            batch=self._prepare(records,raw,summaries,lowers,deadline)
-            self._pruning_until_admitted(lambda:self._write(records,raw,batch,commit_lock,on_commit,deadline),prunes)
+            batch=self._prepare(records,raw,summaries,lowers) if records else ([],set(),0,0)
+            self._pruning_until_admitted(lambda:self._write(records,raw,batch,commit_lock,on_commit,run_id,stop))
             self._held=held
 
     @staticmethod
     def _capacity_error(exc):
         return getattr(exc,"sqlite_errorcode",None)==sqlite3.SQLITE_FULL or str(exc) in {"managed_storage_limit","sqlite_checkpoint_headroom"}
 
-    def _top_minutes(self,records,minutes,own,summaries,deadline=None):
+    def _top_minutes(self,records,minutes,own,summaries):
         """Add each complete minute's top consumers to summaries; return the minute to hold.
 
         Saves are not aligned with minutes. The run's newest minute is held here,
@@ -357,16 +354,14 @@ class Store:
             if bucket==newest and bucket not in minutes:continue  # only older data arrived
             rows=minutes.get(bucket,[]);mine=own;lower=first.sequence
             if held and held["bucket"]==bucket:
-                rows=held_rows(held,deadline)+rows;mine=own|held["own"];lower=held["lower"]
+                rows=held_rows(held)+rows;mine=own|held["own"];lower=held["lower"]
             if bucket==newest:
                 groups=defaultdict(dict)
                 for row in rows:
-                    on_time(deadline)
                     group=groups[(row["source"],row["component"],row["entity"])];k=signal_key(row)
                     group[k]=merge_summaries([group[k],row]) if k in group else row
                 packed={}
                 for key,group in groups.items():
-                    on_time(deadline)
                     packed[key]=pack_summaries(list(group.values()))
                 held=dict(run_id=first.run_id,bucket=bucket,own=mine,lower=lower,upper=last.sequence,rows=packed)
                 continue
@@ -387,13 +382,12 @@ class Store:
         count=2+len(records)+3*components+len(summaries)+len(catalog)+len({r.reading.source for r in records})+sum(any(f.kind=='event' for f in r.reading.fields) for r in records)
         return catalog,count,3*sum(len(p) for _,p in raw)
 
-    def _prepare(self,records,raw,summaries,lowers,deadline=None):
+    def _prepare(self,records,raw,summaries,lowers):
         """Merge each summary row with its saved row and count the write's bound."""
         first,last=records[0],records[-1]
         catalog,count,payload=self._bound(records,raw,summaries)
         prepared=[];replaced_payload=0
         for (resolution,bucket,source,component,entity),rows in summaries.items():
-            on_time(deadline)
             lower=lowers.get((resolution,bucket,source,component,entity),first.sequence)
             old=self.db.execute("SELECT sequence_min,payload FROM summaries WHERE run_id=? AND resolution=? AND bucket_ns=? AND source=? AND component=? AND entity=?",(first.run_id,resolution,bucket,source,component,entity)).fetchone()
             if old:replaced_payload+=len(old[1])
@@ -409,57 +403,63 @@ class Store:
         payload+=sum(len(row[-1]) for row in prepared)+replaced_payload
         return prepared,catalog,count,payload
 
-    def _write(self,records,raw,batch,commit_lock,on_commit,deadline=None):
+    def _write(self,records,raw,batch,commit_lock,on_commit,run_id,stop=None):
         prepared,catalog,count,payload=batch
+        if stop is not None:
+            count+=1+len(stop[1]);payload+=sum(len(row[-1]) for row in stop[1])
         with self.budget.sqlite_write(self.db,self.path,rows=count,payload_bytes=payload):
             self.db.execute("BEGIN IMMEDIATE")
             try:
-                self._interrupt_at(deadline)
-                first, last = records[0], records[-1]
-                self.db.execute("INSERT OR IGNORE INTO runs(run_id,boot_id,started_ns) VALUES(?,?,?)", (first.run_id,first.boot_id,first.reading.start.wall_ns))
-                saved, boot = self.db.execute("SELECT last_sequence,boot_id FROM runs WHERE run_id=?",(first.run_id,)).fetchone()
-                if boot!=first.boot_id:raise ValueError("run boot identity changed")
-                if first.sequence <= saved:
-                    raise ValueError("sequence already committed")
-                self.db.executemany("INSERT INTO readings VALUES(?,?,?,?,?,?)",[(r.run_id,r.sequence,r.reading.end.wall_ns,r.reading.source,r.reading.component,p) for r,p in raw])
-                self.db.executemany("INSERT INTO reading_components VALUES(?,?,?,?)",[(r.run_id,r.sequence,c,int(not r.reading.fields or any(field_component(f,r.reading.component)==c and is_series(c,f.entity,f.scope) for f in r.reading.fields))) for r,_ in raw for c in {r.reading.component,*(field_component(f,r.reading.component) for f in r.reading.fields)}])
-                self.db.executemany(UPSERT_SUMMARY,prepared)
-                self.db.executemany("INSERT OR REPLACE INTO signal_catalog VALUES(?,?,?,?,?,?,?)",sorted(catalog))
-                latest = {}
-                coverage = defaultdict(list)
-                for r,p in raw:
-                    latest[r.reading.source]=(r,p)
-                    for resolution,width in (("minute",MINUTE),("hour",HOUR)):
-                        for component in {r.reading.component,*(field_component(f,r.reading.component) for f in r.reading.fields)}:
-                            coverage[(resolution,r.reading.source,component,r.reading.end.wall_ns//width)].append(r)
-                    if any(f.kind=="event" for f in r.reading.fields):
-                        self.db.execute("INSERT INTO incidents VALUES(?,?,?,?)",(r.run_id,r.sequence,r.reading.end.wall_ns,p))
-                for source,(r,p) in latest.items():
-                    self.db.execute("INSERT OR REPLACE INTO baselines VALUES(?,?,?)",(source,r.run_id,p))
-                for (resolution,source,component,_), group in coverage.items():
-                    statuses=defaultdict(int);gaps=defaultdict(int)
-                    for r in group:
-                        statuses[r.reading.status]+=1
-                        for f in r.reading.fields:
-                            if f.status not in {"observed","measured_zero"}:statuses[f.status]+=1
-                        # A fieldless reading's reason (no device, helper missing) is
-                        # the explanation coverage gives without decoding the reading.
-                        if not r.reading.fields and r.reading.status not in {"observed","measured_zero"}:
-                            gaps[(r.reading.status,r.reading.reason or "source_status")]+=1
-                    first_ns=min(r.reading.start.wall_ns for r in group)
-                    last_ns=max(r.reading.end.wall_ns for r in group)
-                    data={"statuses":dict(statuses),"reads":len(group)}
-                    if gaps:data["gaps"]=[[status,reason,count] for (status,reason),count in sorted(gaps.items())]
-                    self.db.execute("INSERT INTO coverage VALUES(?,?,?,?,?,?,?,?)",(first.run_id,last.sequence,resolution,source,component,first_ns,last_ns,encode(data)))
-                self.db.execute("UPDATE runs SET last_sequence=?,last_saved_ns=? WHERE run_id=?",(last.sequence,max(r.reading.end.wall_ns for r in records),first.run_id))
+                if records:self._save_records(records,raw,prepared,catalog)
+                if stop is not None:
+                    self.db.executemany(UPSERT_SUMMARY,stop[1])
+                    if self.db.execute("UPDATE runs SET stopped_ns=? WHERE run_id=?",(stop[0],run_id)).rowcount!=1:
+                        raise ValueError("unknown run")
                 with commit_lock if commit_lock is not None else nullcontext():
                     self.db.execute("COMMIT")
                     if on_commit is not None:on_commit()
-            except BaseException as exc:
-                self._rollback(exc,deadline)
+            except BaseException:
+                if self.db.in_transaction:self.db.execute("ROLLBACK")
                 raise
-            finally:
-                self.db.set_progress_handler(None,0)
+
+    def _save_records(self,records,raw,prepared,catalog):
+        first, last = records[0], records[-1]
+        self.db.execute("INSERT OR IGNORE INTO runs(run_id,boot_id,started_ns) VALUES(?,?,?)", (first.run_id,first.boot_id,first.reading.start.wall_ns))
+        saved, boot = self.db.execute("SELECT last_sequence,boot_id FROM runs WHERE run_id=?",(first.run_id,)).fetchone()
+        if boot!=first.boot_id:raise ValueError("run boot identity changed")
+        if first.sequence <= saved:
+            raise ValueError("sequence already committed")
+        self.db.executemany("INSERT INTO readings VALUES(?,?,?,?,?,?)",[(r.run_id,r.sequence,r.reading.end.wall_ns,r.reading.source,r.reading.component,p) for r,p in raw])
+        self.db.executemany("INSERT INTO reading_components VALUES(?,?,?,?)",[(r.run_id,r.sequence,c,int(not r.reading.fields or any(field_component(f,r.reading.component)==c and is_series(c,f.entity,f.scope) for f in r.reading.fields))) for r,_ in raw for c in {r.reading.component,*(field_component(f,r.reading.component) for f in r.reading.fields)}])
+        self.db.executemany(UPSERT_SUMMARY,prepared)
+        self.db.executemany("INSERT OR REPLACE INTO signal_catalog VALUES(?,?,?,?,?,?,?)",sorted(catalog))
+        latest = {}
+        coverage = defaultdict(list)
+        for r,p in raw:
+            latest[r.reading.source]=(r,p)
+            for resolution,width in (("minute",MINUTE),("hour",HOUR)):
+                for component in {r.reading.component,*(field_component(f,r.reading.component) for f in r.reading.fields)}:
+                    coverage[(resolution,r.reading.source,component,r.reading.end.wall_ns//width)].append(r)
+            if any(f.kind=="event" for f in r.reading.fields):
+                self.db.execute("INSERT INTO incidents VALUES(?,?,?,?)",(r.run_id,r.sequence,r.reading.end.wall_ns,p))
+        for source,(r,p) in latest.items():
+            self.db.execute("INSERT OR REPLACE INTO baselines VALUES(?,?,?)",(source,r.run_id,p))
+        for (resolution,source,component,_), group in coverage.items():
+            statuses=defaultdict(int);gaps=defaultdict(int)
+            for r in group:
+                statuses[r.reading.status]+=1
+                for f in r.reading.fields:
+                    if f.status not in {"observed","measured_zero"}:statuses[f.status]+=1
+                # A fieldless reading's reason (no device, helper missing) is
+                # the explanation coverage gives without decoding the reading.
+                if not r.reading.fields and r.reading.status not in {"observed","measured_zero"}:
+                    gaps[(r.reading.status,r.reading.reason or "source_status")]+=1
+            first_ns=min(r.reading.start.wall_ns for r in group)
+            last_ns=max(r.reading.end.wall_ns for r in group)
+            data={"statuses":dict(statuses),"reads":len(group)}
+            if gaps:data["gaps"]=[[status,reason,count] for (status,reason),count in sorted(gaps.items())]
+            self.db.execute("INSERT INTO coverage VALUES(?,?,?,?,?,?,?,?)",(first.run_id,last.sequence,resolution,source,component,first_ns,last_ns,encode(data)))
+        self.db.execute("UPDATE runs SET last_sequence=?,last_saved_ns=? WHERE run_id=?",(last.sequence,max(r.reading.end.wall_ns for r in records),first.run_id))
 
     def maintain(self, required_bytes=0):
         """Prune raw, then minute, 15-minute, hour and finally rare incident history.

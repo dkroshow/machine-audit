@@ -415,9 +415,9 @@ belong to the unpublished generation; final publication remains atomic. Both
 collector and scanner must use this reservation protocol together. Do not run
 an older writer concurrently: it cannot account for active reservation records.
 
-Shutdown waits at most ten seconds total, including readers and the final save.
-If that deadline expires, it returns failure and keeps the instance lock. A
-finalizer releases it only after old readers finish and the final save succeeds.
+Shutdown admits nothing after one cutoff and checkpoints the unsaved tail for the
+next start, waiting at most ten seconds for that checkpoint. The instance lock is
+kept until old readers return.
 The unsaved tail holds compressed evidence; only the recent two process reads
 remain decoded for live queries. Interval snapshots capture immutable packed
 references and selection/status metadata under the collector lock. Decoding
@@ -427,7 +427,7 @@ same byte bound and report overflow in `coverage.truncated`.
 Each flush captures a sequence after its health
 readings, then drains through that sequence in bounded transactions (4 MiB of
 compressed records, allowing one complete larger record). Later arrivals wait
-for the next flush. Shutdown drains pending evidence under the same deadline.
+for the next flush. Shutdown checkpoints pending evidence instead of saving it.
 Failed saves retain the pending readings and expose safe SQLite/budget cause
 codes. The unsaved-buffer suspension decision remains provisional.
 

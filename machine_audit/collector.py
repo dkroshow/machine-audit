@@ -17,6 +17,7 @@ class SourceState:
     source: object
     due_ns: int = 0
     started_ns: int | None = None
+    started: Clock | None = None  # Wall-clock start of the running read.
     completed_ns: int | None = None
     running: bool = False
     skipped: int = 0
@@ -65,13 +66,6 @@ class _Pending:
         return component in components if component else bool(components)
 
 
-# Save errors that mean the budget, not the store, refused the write.
-BUDGET_ERRORS = frozenset({"managed_storage_limit","sqlite_checkpoint_headroom","prune_precheck_limit","free_space_margin","sqlite_full"})
-# The part of a stop's deadline kept for writing the spill file once the final
-# save gives up. A spill writes packed bytes; merging is what takes time.
-SPILL_MARGIN_S = 2.0
-
-
 class Collector:
     def __init__(self, store, sources=(), *, boot_id="unknown", run_id=None,
                  clock=Clock.now, tail_limit_bytes=64*1024**2, flush_s=60):
@@ -109,13 +103,18 @@ class Collector:
         self._transitions = {}
         self._closer = None
         self._close_result = False
+        self._durable = threading.Event()
+        # Set once by close(): no reading is admitted after it.
+        self._cutoff = None
         self.stop_code = None
+        # Kept apart from save errors, which a later successful save clears.
+        self.recovery_error = None
 
     @staticmethod
     def _save_error(exc):
         if isinstance(exc, sqlite3.Error):
             return getattr(exc,"sqlite_errorname","sqlite_storage_error").lower()
-        if isinstance(exc, (OSError, RuntimeError)) and str(exc) in {"managed_storage_limit","free_space_margin","checkpoint_pinned_by_reader","sqlite_checkpoint_headroom","prune_precheck_limit","stop_deadline"}:
+        if isinstance(exc, (OSError, RuntimeError, ValueError)) and str(exc) in {"managed_storage_limit","free_space_margin","checkpoint_pinned_by_reader","sqlite_checkpoint_headroom","prune_precheck_limit","unsaved_checkpoint_mismatch","unsupported_unsaved_file"}:
             return str(exc)
         return type(exc).__name__
 
@@ -133,11 +132,13 @@ class Collector:
         if self._started:
             raise RuntimeError("collector already started")
         self.acquire()
+        # A checkpoint that cannot be saved stays on disk for a later start, and
+        # collection still begins.
         try:
-            self.store.recover_unsaved()
+            kept=self.store.recover_unsaved()
         except Exception as exc:
-            # Spilled readings stay on disk for a later start; collection still begins.
-            self.last_save_error=self._save_error(exc)
+            kept=[exc]
+        self.recovery_error=self._save_error(kept[0]) if kept else None
         self.store.start_run(self.run_id,self.boot_id,self.clock().wall_ns)
         self._started = True
         for source in self.sources:
@@ -146,8 +147,11 @@ class Collector:
             thread.start()
 
     def ingest(self, reading: Reading, due_wall_ns=None):
-        """Keep completed evidence even when concurrent reads reach the high-water mark."""
+        """Keep completed evidence even when concurrent reads reach the high-water mark.
+        After the stop's cutoff nothing is admitted."""
         with self.lock:
+            if self._cutoff is not None:
+                return None
             received = self.clock()
             self.sequence += 1
             record = Record(reading,self.boot_id,self.run_id,self.sequence,
@@ -168,6 +172,8 @@ class Collector:
             if self.stop_event.is_set():
                 break
             with self.lock:
+                if self._cutoff is not None:
+                    break
                 state = self.states[source.name]
                 if self.tail_bytes >= self.tail_limit_bytes:
                     state.status = "buffer_suspended"
@@ -177,9 +183,9 @@ class Collector:
                     continue
                 state.due_ns = due
                 state.started_ns = time.monotonic_ns()
+                state.started = before = self.clock()
                 state.running = True
                 state.lateness_s = max(0,(state.started_ns-due)/1e9)
-            before = self.clock()
             cpu_before = time.thread_time()
             try:
                 reading = source.read()
@@ -189,8 +195,11 @@ class Collector:
                 reading = Reading(source.name,getattr(source,"component","unknown"),before,self.clock(),
                                   status="denied" if isinstance(exc,PermissionError) else "failed",
                                   reason=type(exc).__name__)
-            self.ingest(reading, before.wall_ns-int(state.lateness_s*1e9))
             with self.lock:
+                # The stop's cutoff recorded this read as unobserved; its result is not admitted.
+                if self._cutoff is not None:
+                    break
+                self.ingest(reading, before.wall_ns-int(state.lateness_s*1e9))
                 state.reads_done += 1
                 state.late_reads += int(state.lateness_s > 0.001)
                 state.cpu_s += time.thread_time()-cpu_before
@@ -251,9 +260,12 @@ class Collector:
                 fields.append(Field("self."+key,value,"bytes" if key.endswith("bytes") else "seconds" if key.endswith("_s") else "operations","counter"))
         self.ingest(Reading("collector.health","self",now,now,tuple(fields)))
 
-    def flush(self, prunes=None, deadline=None):
-        """Drain the entry snapshot; keep later arrivals for the next flush."""
+    def flush(self):
+        """Drain the entry snapshot; keep later arrivals for the next flush. After the
+        stop's cutoff the unsaved readings belong to its checkpoint."""
         with self._flush_lock:
+            if self._cutoff is not None:
+                return False
             self._status_events()
             self._health_reading()
             with self.lock:
@@ -277,7 +289,7 @@ class Collector:
                     self.tail_bytes=sum(size for _,size in self.tail)
                 try:
                     records=[Record.unpack(p.payload) for p,_ in batch]
-                    self.store.append(records,commit_lock=self.lock,on_commit=committed,prunes=prunes,deadline=deadline)
+                    self.store.append(records,commit_lock=self.lock,on_commit=committed)
                 except Exception as exc:
                     with self.lock:
                         self.last_save_error = self._save_error(exc)
@@ -334,6 +346,7 @@ class Collector:
                     "tail_bytes":self.tail_bytes,"tail_limit_bytes":self.tail_limit_bytes,
                     "unsaved_since_ns":self.tail[0][0].start_ns if self.tail else None,
                     "buffer_suspended_since_ns":self._paused_since,"save_error":self.last_save_error,
+                    "recovery_error":self.recovery_error,
                     "last_save_ns":self.last_save_ns,"sources":self.source_status(),
                     "operations":dict(self.operations,queries={name:dict(op) for name,op in self.query_operations.items()})}
 
@@ -347,53 +360,46 @@ class Collector:
         return clean
 
     def close(self, timeout_s=10):
-        """One deadline covers every reader and the final write.
+        """Stop at one cutoff and checkpoint the unsaved readings for the next start.
 
-        Save completed evidence before waiting for an uncancellable native call.
-        A timed-out close leaves the instance lock held. The finalizer can only
-        release it after all old native reads and the writer have completed.
+        After the cutoff no reading is admitted: a read still running is recorded as
+        unobserved and its later result is dropped. The checkpoint is the stop's only
+        write; nothing is merged. close() waits up to `timeout_s` for it and returns
+        whether it is durable. The instance lock is kept until every read has
+        returned, or until the process exits.
         """
         self.stop_event.set()
-        # The final saves give up in time to spill what they could not save. A deadline
-        # too short to spill cannot end clean anyway; then saving continues as before.
-        deadline=time.monotonic()+timeout_s-SPILL_MARGIN_S if timeout_s>SPILL_MARGIN_S else None
         with self.lock:
-            if self._closer is None or (not self._closer.is_alive() and not self._close_result):
-                def finish():
-                    try:
-                        # Final saves do not prune: pruning to make room can outlast
-                        # any stop deadline. What does not fit is spilled below.
-                        saved=self.flush(prunes=0,deadline=deadline)
-                        for thread in self.threads:thread.join()
-                        # An in-flight read can finish during the first save or
-                        # the joins. Preserve its completion before clean stop.
-                        if self.tail:saved=self.flush(prunes=0,deadline=deadline)
-                        while saved and self.tail:saved=self.flush(prunes=0,deadline=deadline)
-                        if self._started and saved:self.store.stop_run(self.run_id,self.clock().wall_ns,prunes=0,deadline=deadline)
-                    except Exception as exc:
-                        self.last_save_error=self._save_error(exc);saved=False
-                    if self._started and not saved and self.last_save_error in BUDGET_ERRORS|{"stop_deadline"}:
-                        saved=self._spill("stop_unsaved_deadline" if self.last_save_error=="stop_deadline" else "stop_unsaved_budget")
-                    with self.lock:
-                        self._close_result=saved
-                        if saved and self._instance_fd is not None:
-                            fcntl.flock(self._instance_fd,fcntl.LOCK_UN)
-                            os.close(self._instance_fd);self._instance_fd=None
-                self._closer=threading.Thread(target=finish,name="collector-close",daemon=True)
+            if self._closer is None:
+                self._closer=threading.Thread(target=self._finish,name="collector-close",daemon=True)
                 self._closer.start()
-            closer=self._closer
-        closer.join(max(0,timeout_s))
-        return not closer.is_alive() and self._close_result
+        self._durable.wait(max(0,timeout_s))
+        return self._close_result
 
-    def _spill(self,code):
-        """The budget refused the final save, or it ran out of time: keep the unsaved
-        readings and the held minute for the next start, which saves them under this run."""
-        with self.lock:
-            payloads=[pending.payload for pending,_ in self.tail]
+    def _finish(self):
         try:
-            self.store.spill(self.run_id,self.clock().wall_ns,payloads)
+            # Waits for a periodic save already running; its readings leave the tail.
+            with self._flush_lock:
+                if self._started:
+                    self._status_events();self._health_reading()
+                with self.lock:
+                    cutoff=self.clock()
+                    for state in self.states.values():
+                        if state.running:
+                            self.ingest(Reading(state.source.name,getattr(state.source,"component","unknown"),state.started,cutoff,
+                                                status="unobserved",reason="stop_read_in_flight"))
+                    self._cutoff=cutoff
+                    payloads=[pending.payload for pending,_ in self.tail]
+                if self._started:
+                    self.store.spill(self.run_id,cutoff.wall_ns,payloads)
+                    self.stop_code="stop_checkpointed"
+            self._close_result=True
         except Exception as exc:
             self.last_save_error=self._save_error(exc);self.stop_code="stop_unsaved_lost"
-            return False
-        self.stop_code=code
-        return True
+        finally:
+            self._durable.set()
+        for thread in self.threads:thread.join()
+        with self.lock:
+            if self._instance_fd is not None:
+                fcntl.flock(self._instance_fd,fcntl.LOCK_UN)
+                os.close(self._instance_fd);self._instance_fd=None

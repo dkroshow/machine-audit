@@ -1,8 +1,12 @@
 """Restart recovery under a shared cap; only disposable synthetic stores."""
+import base64
 from pathlib import Path
 from contextlib import contextmanager
+import json
 import random
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -141,25 +145,32 @@ class BudgetRecoveryTests(unittest.TestCase):
                 self.assertEqual(reasons[-1],'storage_budget')  # then reached covered raw
             finally:store.close()
 
-    def test_a_stop_at_the_cap_spills_within_its_deadline_and_the_next_start_saves_it(self):
-        # Big Mac at the cap: stopping pruned until the final save fit, outlasting the
-        # stop deadline, so launchd restarted it unclean. A stop now saves only what fits
-        # without pruning and keeps the rest in its own spill file for the next start.
+    def reads(self,collector,first,last):
+        for t in range(first,last):
+            clock=Clock(t*10**9,t*10**9,t*10**9)
+            collector.ingest(Reading('synthetic.process','cpu',clock,clock,tuple(
+                Field('process.cpu',float(t*pid),'seconds','counter',entity=f'process:{pid}',label=f'p{pid}',scope='process',additive=True)
+                for pid in (1,2))))
+
+    @staticmethod
+    def saved(store):
+        return (store.db.execute('SELECT run_id,sequence,payload FROM readings ORDER BY run_id,sequence').fetchall(),
+                store.db.execute('SELECT run_id,resolution,bucket_ns,entity,payload FROM summaries ORDER BY 1,2,3,4').fetchall(),
+                store.db.execute('SELECT run_id,last_sequence,stopped_ns FROM runs ORDER BY 1').fetchall())
+
+    def held_minute(self,store,run):
+        return {entity:[(row['sample_count'],row['total']) for row in unpack_summaries(payload)] for entity,payload in store.db.execute(
+            "SELECT entity,payload FROM summaries WHERE run_id=? AND resolution='minute' AND bucket_ns=? AND entity LIKE 'process:%'",(run,60*10**9))}
+
+    def test_a_stop_at_the_cap_checkpoints_without_merging_and_the_next_start_saves_it(self):
+        # Big Mac at the cap: stopping pruned or merged until it outlasted the stop and
+        # was killed. A stop now merges nothing: it checkpoints the unsaved readings and
+        # the held minute, and the next start saves them under their own run.
         scratch=Path(__file__).parent/'.tmp';scratch.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=scratch) as root:
             store=Store(Path(root)/'readings.sqlite',Budget(root,free_margin_bytes=0))
-            def reads(collector,first,last):
-                for t in range(first,last):
-                    clock=Clock(t*10**9,t*10**9,t*10**9)
-                    collector.ingest(Reading('synthetic.process','cpu',clock,clock,tuple(
-                        Field('process.cpu',float(t*pid),'seconds','counter',entity=f'process:{pid}',label=f'p{pid}',scope='process',additive=True)
-                        for pid in (1,2))))
-            def saved():
-                return (store.db.execute('SELECT run_id,sequence,payload FROM readings ORDER BY run_id,sequence').fetchall(),
-                        store.db.execute('SELECT run_id,resolution,bucket_ns,entity,payload FROM summaries ORDER BY 1,2,3,4').fetchall())
             def at_cap():
-                # Room to prune one batch and for a spill file, not for the final save,
-                # which reserves about the database again for its WAL.
+                # Room for a checkpoint, not for saving the readings it holds.
                 store.budget.limit_bytes=store.budget.usage()['bytes']+2*1024**2
             try:
                 # Older raw-heavy history: pruning could make room, slowly and by deleting it.
@@ -171,72 +182,222 @@ class BudgetRecoveryTests(unittest.TestCase):
                 for lo in range(0,300,60):store.append(history[lo:lo+60])
                 store.stop_run('history',-17000*10**9)
                 first=Collector(store,(),run_id='first',boot_id='boot');first.start()
-                reads(first,0,70);self.assertTrue(first.flush())
-                reads(first,70,100)  # unsaved tail; minute 1 is held
-                at_cap();before=saved();began=time.monotonic();merges=[]
-                # A refused stop must not first merge every summary row (15 s on Big Mac).
-                store.db.set_trace_callback(lambda sql:sql.startswith('SELECT sequence_min,payload FROM summaries') and merges.append(1))
+                self.reads(first,0,70);self.assertTrue(first.flush())
+                self.reads(first,70,100)  # unsaved tail; minute 1 is held
+                at_cap();before=self.saved(store);began=time.monotonic();sql=[]
+                store.db.set_trace_callback(sql.append)
                 self.assertTrue(first.close(timeout_s=10))
                 store.db.set_trace_callback(None)
-                self.assertEqual(merges,[])
+                self.assertFalse([q for q in sql if not q.startswith('SELECT last_sequence FROM runs')],'the stop wrote or merged')
                 self.assertLess(time.monotonic()-began,10)
-                self.assertEqual((first.stop_code,saved()),('stop_unsaved_budget',before))  # nothing saved was lost
-                spill1,=Path(root).glob('unsaved-first-*.json')
-                self.assertEqual(spill1.stat().st_mode&0o777,0o600)
-                kept=spill1.read_bytes()
-                # A crash before restoring: the next run's own stop must not replace that file.
+                self.assertEqual((first.stop_code,self.saved(store)),('stop_checkpointed',before))  # nothing saved was lost
+                self.assertFalse(first.flush(),'a save after the cutoff would save the checkpoint twice')
+                checkpoint1,=Path(root).glob('unsaved-first-*.json')
+                self.assertEqual(checkpoint1.stat().st_mode&0o777,0o600)
+                kept=checkpoint1.read_bytes()
+                # A start that cannot save it keeps it, says so even after its own saves
+                # succeed, and its own stop never replaces that file.
                 second=Collector(store,(),run_id='second',boot_id='boot')
                 store.budget.limit_bytes=10**9
-                with patch.object(store,'recover_unsaved',side_effect=BudgetExceeded('managed_storage_limit')):second.start()
-                reads(second,200,230);at_cap()
+                with patch.object(store,'recover_unsaved',return_value=[BudgetExceeded('managed_storage_limit')]):second.start()
+                self.reads(second,200,230);self.assertTrue(second.flush())
+                self.assertEqual((second.status()['save_error'],second.status()['recovery_error']),(None,'managed_storage_limit'))
+                self.reads(second,230,240);at_cap()
                 self.assertTrue(second.close(timeout_s=10))
-                self.assertEqual(spill1.read_bytes(),kept)
+                self.assertEqual(checkpoint1.read_bytes(),kept)
                 self.assertEqual(len(list(Path(root).glob('unsaved-second-*.json'))),1)
                 store.budget.limit_bytes=10**9
                 third=Collector(store,(),run_id='third',boot_id='boot');third.start()
-                self.assertEqual(list(Path(root).glob('unsaved-*')),[])
+                self.assertIsNone(third.recovery_error)
+                self.assertEqual(list(Path(root).glob('unsaved-first-*'))+list(Path(root).glob('unsaved-second-*')),[])
                 runs=dict(store.db.execute("SELECT run_id,last_sequence FROM runs WHERE stopped_ns IS NOT NULL").fetchall())
                 self.assertEqual((runs['first'],runs['second']),(first.sequence,second.sequence))  # every reading, under its own run
-                held={entity:[row['sample_count'] for row in unpack_summaries(payload)] for entity,payload in store.db.execute(
-                    "SELECT entity,payload FROM summaries WHERE run_id='first' AND resolution='minute' AND bucket_ns=? AND entity LIKE 'process:%'",(60*10**9,))}
-                self.assertEqual(held,{'process:1':[39],'process:2':[39]})  # the whole held minute, 61-99 s
+                self.assertEqual({e:[n for n,_ in rows] for e,rows in self.held_minute(store,'first').items()},
+                                 {'process:1':[39],'process:2':[39]})  # the whole held minute, 61-99 s
                 self.assertTrue(third.close())
             finally:store.close()
 
-    def test_a_final_save_slower_than_the_stop_deadline_spills_and_stops_clean(self):
-        # Big Mac merges a final save for about 15 s against a 10 s stop deadline, so
-        # ordinary stops ended unclean. The save now gives up in time and spills.
+    def test_a_checkpoint_is_saved_once_with_its_stop_whatever_point_recovery_reaches(self):
+        # Recovery saves a checkpoint's readings, held minute and stop marker in one
+        # transaction, so a stop marker proves it was saved: a crash before or after that
+        # commit, an empty tail or a second recovery must neither lose nor double it.
         scratch=Path(__file__).parent/'.tmp';scratch.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=scratch) as root:
+        def stopped(root,unsaved):
             store=Store(Path(root)/'readings.sqlite',Budget(root,free_margin_bytes=0))
-            def reads(collector,first,last):
-                for t in range(first,last):
-                    clock=Clock(t*10**9,t*10**9,t*10**9)
-                    collector.ingest(Reading('synthetic.process','cpu',clock,clock,tuple(
-                        Field('process.cpu',float(t*pid),'seconds','counter',entity=f'process:{pid}',label=f'p{pid}',scope='process',additive=True)
-                        for pid in range(1,6))))
-            def saved():
-                return (store.db.execute('SELECT run_id,sequence,payload FROM readings ORDER BY run_id,sequence').fetchall(),
-                        store.db.execute('SELECT run_id,resolution,bucket_ns,entity,payload FROM summaries ORDER BY 1,2,3,4').fetchall())
+            run=Collector(store,(),run_id='run',boot_id='boot');run.start()
+            self.reads(run,0,100-unsaved);self.assertTrue(run.flush());self.reads(run,100-unsaved,100)
+            self.assertTrue(run.close())
+            return store,run
+        def recover(store):
+            after=Collector(store,(),run_id=f'after-{time.monotonic_ns()}',boot_id='boot');after.start()
+            error=after.recovery_error;self.assertTrue(after.close());return error
+        # Pinned from this fixture: 100 process readings and a minute-1 total of
+        # (99-60)*1 and (99-60)*2 CPU seconds over 39 samples.
+        expected={'process:1':[(39,39.0)],'process:2':[(39,78.0)]}
+        for unsaved in (30,0):  # 0: an empty tail with only the held minute
+            with self.subTest(unsaved=unsaved),tempfile.TemporaryDirectory(dir=scratch) as root:
+                store,run=stopped(root,unsaved)
+                try:
+                    checkpoint,=Path(root).glob('unsaved-run-*.json');cutoff=int(checkpoint.stem.rsplit('-',1)[1])
+                    # A crash inside the transaction, after its first writes, before commit.
+                    with patch('machine_audit.store.UPSERT_SUMMARY','INSERT INTO missing_table VALUES(?)'):
+                        self.assertEqual(recover(store),'sqlite_error')
+                    self.assertTrue(checkpoint.exists())
+                    self.assertEqual(store.db.execute("SELECT last_sequence,stopped_ns FROM runs WHERE run_id='run'").fetchone(),
+                                     (run.committed,None))
+                    unlink=Path.unlink
+                    def kept(path,*args,**kwargs):
+                        if path==checkpoint:raise OSError('synthetic crash after commit')
+                        return unlink(path,*args,**kwargs)
+                    with patch.object(Path,'unlink',kept):self.assertEqual(recover(store),'OSError')
+                    saved=self.saved(store)
+                    for attempt in range(2):  # the file left behind, then nothing left
+                        self.assertIsNone(recover(store))
+                        self.assertEqual([r for r in self.saved(store)[1] if r[0]=='run'],[r for r in saved[1] if r[0]=='run'])
+                    self.assertFalse(checkpoint.exists())
+                    count,=store.db.execute("SELECT count(*) FROM readings WHERE run_id='run' AND source='synthetic.process'").fetchone()
+                    self.assertEqual((count,store.db.execute("SELECT stopped_ns FROM runs WHERE run_id='run'").fetchone()[0]),(100,cutoff))
+                    self.assertEqual(self.held_minute(store,'run'),expected)
+                finally:store.close()
+        # An older release could save a checkpoint's readings and die before its stop:
+        # its held minute is then stale. It is kept and named, never saved wrong.
+        with tempfile.TemporaryDirectory(dir=scratch) as root:
+            store,run=stopped(root,30)
             try:
-                # Each step that grows with the process count, made slower than the deadline.
-                for name in ('merge_summaries','unpack_summaries','pack_summaries'):
-                    with self.subTest(name):
-                        slow=Collector(store,(),run_id=f'slow-{name}',boot_id='boot');slow.start()
-                        reads(slow,0,70);self.assertTrue(slow.flush());reads(slow,70,100)
-                        def delayed(*args,real=getattr(machine_audit.store,name)):
-                            time.sleep(0.2);return real(*args)
-                        before=saved();began=time.monotonic()
-                        with patch(f'machine_audit.store.{name}',delayed):
-                            self.assertTrue(slow.close(timeout_s=3))
-                        self.assertLess(time.monotonic()-began,3)
-                        self.assertEqual((slow.stop_code,saved()),('stop_unsaved_deadline',before))
-                        self.assertEqual(len(list(Path(root).glob(f'unsaved-slow-{name}-*.json'))),1)
-                        after=Collector(store,(),run_id=f'after-{name}',boot_id='boot');after.start()
-                        self.assertEqual(list(Path(root).glob('unsaved-*')),[])
-                        self.assertEqual(store.db.execute("SELECT last_sequence FROM runs WHERE run_id=? AND stopped_ns IS NOT NULL",(f'slow-{name}',)).fetchone()[0],slow.sequence)
-                        self.assertTrue(after.close())
+                checkpoint,=Path(root).glob('unsaved-run-*.json')
+                data=json.loads(checkpoint.read_bytes())
+                store.append([Record.unpack(base64.b64decode(p)) for p in data['records']])
+                after=Collector(store,(),run_id='after',boot_id='boot');after.start()
+                self.reads(after,300,310);self.assertTrue(after.flush())
+                self.assertEqual(after.status()['recovery_error'],'unsaved_checkpoint_mismatch')
+                self.assertTrue(checkpoint.exists())
+                self.assertEqual(store.db.execute("SELECT stopped_ns FROM runs WHERE run_id='run'").fetchone()[0],None)
+                self.assertTrue(after.close())
             finally:store.close()
+        # A checkpoint named for one run but holding another run's readings is kept and
+        # named before anything is saved or removed, whether or not its run has stopped.
+        for applied in (False,True):
+            with self.subTest(applied=applied),tempfile.TemporaryDirectory(dir=scratch) as root:
+                store=Store(Path(root)/'readings.sqlite',Budget(root,free_margin_bytes=0))
+                try:
+                    clock=Clock(1,1,1)
+                    def record(run):return Record(Reading('synthetic.process','cpu',clock,clock),'boot',run,1,1,clock)
+                    store.start_run('a','boot',0);store.start_run('b','boot',0)
+                    if applied:store.append([record('a')]);store.stop_run('a',1000)
+                    checkpoint=store.spill('a',1000,[record('b').packed])
+                    before=self.saved(store)
+                    self.assertEqual([str(e) for e in store.recover_unsaved()],['unsaved_checkpoint_mismatch'])
+                    self.assertEqual((checkpoint.exists(),self.saved(store)),(True,before))
+                finally:store.close()
+
+    def test_a_stop_cut_short_by_process_exit_keeps_every_completed_reading(self):
+        # Big Mac's collector stopped 26 s after SIGTERM with no saved stop, no spill and
+        # its last half minute lost. A stop that outlives its deadline returns, the process
+        # exits and kills the unfinished save. Each case crosses a real process exit through
+        # the real startup wrapper; a new process then reopens and recovers.
+        scratch=Path(__file__).parent/'.tmp';scratch.mkdir(exist_ok=True)
+        child=r"""
+import json,os,sys,threading,time
+from pathlib import Path
+from unittest.mock import patch
+repo,root,case=sys.argv[1:4]
+sys.path.insert(0,repo)
+import machine_audit.store
+from machine_audit import startup
+from machine_audit.budget import Budget
+from machine_audit.collector import Collector
+from machine_audit.config import Config
+from machine_audit.model import Clock,Field,Reading,Record
+from machine_audit.store import Store
+entered=threading.Event()
+class Hung:
+    name='synthetic.hung';component='cpu';cadence_s=1
+    def read(self):entered.set();threading.Event().wait()  # A native read that never returns.
+config=Config(data_dir=root,port=0)
+def run(ready):
+    store=Store(Path(root)/'readings.sqlite',Budget(root,free_margin_bytes=0))
+    collector=Collector(store,[Hung()] if case=='hung_read' else [],run_id='stopped',boot_id='boot');collector.start()
+    def reads(first,last):
+        for t in range(first,last):
+            clock=Clock(t*10**9,t*10**9,t*10**9)
+            collector.ingest(Reading('synthetic.process','cpu',clock,clock,tuple(
+                Field('process.cpu',float(t*pid),'seconds','counter',entity=f'process:{pid}',label=f'p{pid}',scope='process',additive=True)
+                for pid in (1,2))))
+    reads(0,70);assert collector.flush();reads(70,100)  # Minute 1 is held, 70-99 s unsaved.
+    if case=='killed_while_checkpointing':
+        # Another run's valid checkpoint, not yet saved, beside the one about to be cut short.
+        store.start_run('earlier','boot',0)
+        store.spill('earlier',5000,[Record(Reading('synthetic.process','cpu',Clock(t,t,t),Clock(t,t,t)),'boot','earlier',t,t,Clock(t,t,t)).packed
+                                    for t in (1,2,3)])
+    ready()
+    if case=='hung_read':assert entered.wait(5)
+    if case=='blocked_reservation':
+        # Another writer's reservation leaves no room until it finishes, which it never does.
+        store.budget.limit_bytes=store.budget.usage()['bytes']+4*1024**2
+        other=Budget(root,limit_bytes=store.budget.limit_bytes,free_margin_bytes=0);held=threading.Event()
+        def hold():
+            with other.reserve(store.budget.limit_bytes-other.usage()['bytes']-2048):held.set();threading.Event().wait()
+        threading.Thread(target=hold,daemon=True).start();assert held.wait(5)
+    def slow(*args,real=machine_audit.store.points):time.sleep(60);return real(*args)
+    def killed(fd):os._exit(3)  # Killed after writing the checkpoint's bytes, before they are synced.
+    with patch('machine_audit.store.points',slow) if case=='slow_derivation' else \
+         patch('machine_audit.store.os.fsync',killed) if case=='killed_while_checkpointing' else patch.object(Store,'close',Store.close):
+        clean=collector.close(timeout_s=1)
+    print(json.dumps({'clean':clean,'code':collector.stop_code}))
+    # As the CLI does: storage stays open while the closer runs, then the process exits.
+    if not collector._closer.is_alive():store.close()
+    return (0 if clean else 2),collector.stop_code
+startup.guarded_run(config,run)
+print(json.dumps(startup.read(config)))
+"""
+        for case,outcome in (('hung_read','checkpointed'),('slow_derivation','checkpointed'),
+                             ('blocked_reservation','failed'),('killed_while_checkpointing','killed')):
+            with self.subTest(case),tempfile.TemporaryDirectory(dir=scratch) as root:
+                stopped=subprocess.run([sys.executable,'-I','-c',child,str(Path(__file__).parents[2]),root,case],
+                                       capture_output=True,text=True,timeout=60)
+                self.assertEqual(stopped.returncode,3 if outcome=='killed' else 0,stopped.stderr)
+                if outcome=='failed':
+                    # Nothing durable: the stop must say so, never claim a stopped run.
+                    result,status=map(json.loads,stopped.stdout.split('\n')[:2])
+                    self.assertEqual((result,status['state'],status['code']),
+                                     ({'clean':False,'code':None},'failed','shutdown_incomplete'))
+                    self.assertEqual(list(Path(root).glob('*unsaved-*')),[])
+                    continue
+                if outcome=='checkpointed':
+                    result,status=map(json.loads,stopped.stdout.split('\n')[:2])
+                    self.assertEqual((result,status['state'],status['code']),
+                                     ({'clean':True,'code':'stop_checkpointed'},'stopped','stop_checkpointed'))
+                    checkpoint,=Path(root).glob('unsaved-stopped-*.json')
+                    cutoff=int(checkpoint.stem.rsplit('-',1)[1])
+                else:
+                    # The partial file never became a checkpoint; recovery skips it and keeps it,
+                    # and still saves the other run's checkpoint beside it.
+                    partial,=Path(root).glob('.unsaved-stopped-*.partial')
+                    self.assertEqual(list(Path(root).glob('unsaved-stopped-*')),[])
+                    self.assertEqual([p.name for p in Path(root).glob('unsaved-earlier-*')],['unsaved-earlier-5000.json'])
+                store=Store(Path(root)/'readings.sqlite',Budget(root,free_margin_bytes=0))
+                try:
+                    after=Collector(store,(),run_id='after',boot_id='boot');after.start()
+                    self.assertIsNone(after.recovery_error)
+                    self.assertTrue(after.close())
+                    self.assertEqual(list(Path(root).glob('unsaved-stopped-*')),[])
+                    runs=dict(store.db.execute('SELECT run_id,stopped_ns FROM runs'))
+                    sequences=[s for s, in store.db.execute("SELECT sequence FROM readings WHERE run_id='stopped' AND source='synthetic.process'")]
+                    held={entity:[row['sample_count'] for row in unpack_summaries(payload)] for entity,payload in store.db.execute(
+                        "SELECT entity,payload FROM summaries WHERE run_id='stopped' AND resolution='minute' AND bucket_ns=? AND entity LIKE 'process:%'",(60*10**9,))}
+                    if outcome=='killed':
+                        earlier=store.db.execute("SELECT count(*) FROM readings WHERE run_id='earlier'").fetchone()[0]
+                        self.assertEqual((runs['earlier'],earlier),(5000,3),'a valid checkpoint was blocked by a partial one')
+                        self.assertEqual(list(Path(root).glob('unsaved-earlier-*')),[])
+                        self.assertEqual((len(sequences),runs['stopped'],held),(70,None,{}))  # an explicit, unstopped loss
+                        self.assertTrue(partial.exists())
+                        continue
+                    self.assertEqual(len(sequences),100,'completed readings were lost')
+                    self.assertEqual(runs['stopped'],cutoff)
+                    self.assertEqual(held,{'process:1':[39],'process:2':[39]},'the held minute was lost')
+                    in_flight=store.db.execute("SELECT count(*) FROM readings WHERE run_id='stopped' AND source='synthetic.hung'").fetchone()[0]
+                    self.assertEqual(in_flight,1 if case=='hung_read' else 0)
+                finally:store.close()
 
     def test_largest_prune_batches_stay_inside_declared_wal_pages(self):
         class ObservedBudget(Budget):
