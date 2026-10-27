@@ -449,6 +449,22 @@ first open. A release before them inserted `dirty` rows positionally and fails
 on a migrated store; rolling back needs a release that names `dirty`'s columns,
 whose rows then read as unknown scope.
 
+Publication copies each differing staged row with one insert-or-update on its
+primary key, counted as one row; it was a REPLACE counted twice. An update reserves
+point and hierarchy rows only for changed identities `_points` writes for: one
+with a point already, or at least 1 GB. Every re-listed folder had reserved three
+such rows. A refused publication keeps its counted terms in that volume's
+`runs.volumes` entry: rows and payload per fixed plan label, changed and point and
+hierarchy candidates, tracked, totals, existing and free pages, and the shortfall.
+Big Mac's first trial refused a main update that declared at least 846,874 dirty
+pages, the whole file, derived from its stored retry level (about 52,926 rows if
+its payload was negligible); its staging was pruned, so the parts are unknown. A disposable regression re-lists 600 unchanged folders on a 15,475-page
+file with 50 MiB to spare: it was refused at 3,014 rows and 48,308 pages, and now
+publishes at 607 rows, writing 8 WAL frames. A mixed regression publishes the same
+map an independent full walk gives. This removes over-counting only: an update
+with many genuine changes can still exceed the headroom and take the recovery full
+walk.
+
 Disposable regressions reproduce Big Mac's three causes with the real Budget:
 a re-listed folder's unchanged files refused at publication
 (`sqlite_checkpoint_headroom`), one refusal stopping every other volume, and a

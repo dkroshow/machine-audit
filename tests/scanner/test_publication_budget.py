@@ -1,16 +1,20 @@
 """Publication must depend on changed rows, not unrelated database size."""
 from contextlib import contextmanager
 from pathlib import Path
+import os
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from machine_audit.budget import Budget, BudgetExceeded
 from machine_audit.scanner.accounting import Blocks
 from machine_audit.scanner.events import next_action
 from machine_audit.scanner.native import Volume
+from machine_audit.scanner.policy import Policy
+from machine_audit.scanner.runner import relist
 from machine_audit.scanner.store import MapStore, MapQuery, SCHEMA
-from machine_audit.scanner.walker import Node
+from machine_audit.scanner.walker import Node, Walker
 
 
 SCRATCH = Path(__file__).parent / '.tmp'
@@ -153,6 +157,127 @@ class PublicationBudgetTests(unittest.TestCase):
             self.assertEqual(store.db.execute(f'SELECT count(*) FROM {table} WHERE generation=?',
                                               (staged[0][0],)).fetchone()[0], 0)
 
+    def walked(self, tree, data, *, padding=0):
+        """A full map of a real tree, then a legacy-scope deferral due on `big` so the
+        next update re-lists it recursively, as Big Mac's deferred folders were."""
+        volume = Volume('v', 'Synthetic', str(tree), 'hfs', tree.stat().st_dev, 10**12, 1, 1, 10**9)
+        policy = Policy(home=str(tree.parent), homes=[])
+        store = MapStore(data/'scanner.sqlite', Budget(data, free_margin_bytes=0))
+        store.prepare(volume);walker = Walker(volume, policy, store, Blocks());walker.walk()
+        store.finish_volume(volume, walker.blocks, walker.gaps, full=True, lean=True, bookmark=1)
+        with store.write(rows=2, payload_bytes=padding):  # Retained history the bound must copy.
+            store.db.execute('CREATE TABLE padding(value BLOB)')
+            store.db.execute('INSERT INTO padding VALUES(zeroblob(?))', (padding,))
+        with store.write(rows=1):
+            store.db.execute("INSERT INTO dirty(volume,id,due_ns) VALUES('v',?,0)", (str((tree/'big').stat().st_ino),))
+        return store, volume, policy
+
+    def counted(self, store):
+        """Publication admissions: declared rows, SQLite changes, declared pages, WAL frames."""
+        seen = []
+        original = store.budget.sqlite_write
+        @contextmanager
+        def checked(db, path, *args, **kwargs):
+            with original(db, path, *args, **kwargs) as admitted:
+                before = db.total_changes
+                yield admitted
+                if store.run_context['stage'] == 'publication':
+                    wal = Path(str(path)+'-wal')
+                    seen.append((kwargs['rows'], db.total_changes-before, admitted['dirty_pages'],
+                                 max(0, (wal.stat().st_size-32)//(admitted['page_size']+24))))
+        store.budget.sqlite_write = checked
+        return seen
+
+    def update(self, store, volume, policy, batch=None):
+        store.prepare(volume, full=False)
+        if batch:
+            # Model Big Mac's staging batches (8,192 operations against 846,874 pages)
+            # at this file size, so staging stays far below the database.
+            queue = store._queue
+            def batched(query, args):
+                queue(query, args)
+                if len(store.buffer) >= batch:store.flush()
+            store._queue = batched
+        walker = Walker(volume, policy, store, Blocks())
+        self.assertTrue(relist(store, walker, policy, volume, 1, []))
+        return walker
+
+    def test_an_unchanged_relisted_folder_publishes_within_its_counted_changes(self):
+        # Big Mac's main update was refused at publication; what it declared is unknown.
+        # This mechanism can cause that refusal: each re-listed folder declared a two-row
+        # REPLACE for its listing and three point and hierarchy slots, so unchanged
+        # folders alone reserved a second copy of the whole file.
+        tree = self.root/'tree';data = self.root/'data';data.mkdir()
+        for d in range(600):(tree/'big'/f'd{d}').mkdir(parents=True);(tree/'big'/f'd{d}'/'f').write_bytes(b'x')
+        store, volume, policy = self.walked(tree, data, padding=60*1024**2)
+        store.close()
+        (data/'synthetic-readings.sqlite').write_bytes(bytes(30*1024**2))  # Another store's share of the cap.
+        budget = Budget(data, free_margin_bytes=0)
+        budget.limit_bytes = budget.usage()['bytes']+50*1024**2  # Room for the real work, not a second copy.
+        store = MapStore(data/'scanner.sqlite', budget);self.addCleanup(store.close)
+        seen = self.counted(store)
+        walker = self.update(store, volume, policy, batch=64)
+        store.finish_volume(volume, walker.blocks, walker.gaps, full=False, lean=True, bookmark=2)
+        (declared, changes, pages, frames), = seen
+        self.assertLess(pages, store.db.execute('PRAGMA page_count').fetchone()[0], 'the bound was the whole file')
+        self.assertGreaterEqual(declared, changes);self.assertLessEqual(frames, pages)
+        listed = store.db.execute('SELECT count(*) FROM listings l JOIN volumes v ON l.generation=v.generation AND l.volume=v.key').fetchone()[0]
+        self.assertEqual((listed, store.db.execute('SELECT count(*) FROM dirty').fetchone()[0]), (602, 0))
+
+    def test_a_mixed_update_publishes_what_a_full_walk_of_the_same_tree_maps(self):
+        # Published rows are copied by one insert-or-update each. Changed, added,
+        # deleted, moved, removed and hard-linked entries, and tracked folders, must
+        # publish exactly what an independent full walk maps, after a failure that
+        # rolls back.
+        tree = self.root/'tree';data = self.root/'data';data.mkdir()
+        big = tree/'big'
+        for d in range(30):(big/f'd{d}').mkdir(parents=True);(big/f'd{d}'/'f').write_bytes(b'x'*(d+1))
+        os.link(big/'d1'/'f', big/'d2'/'linked')
+        store, volume, policy = self.walked(tree, data)
+        self.addCleanup(store.close)
+        with store.write(rows=10):  # Folders tracked earlier at 2 GB; d20 is later removed.
+            for d in (3,4,5,20,21):
+                ino = str((big/f'd{d}').stat().st_ino)
+                store.db.execute("INSERT INTO tracked VALUES('v',?,?)", (ino, str(big.stat().st_ino)))
+                store.db.execute("INSERT INTO points VALUES('v',?,1,?,'uses',2000000000,'observed')", (ino, f'd{d}'))
+        tracked = {d:str((big/f'd{d}').stat().st_ino) for d in (3,4,5,20,21)}
+        for d in (10,11):(big/f'd{d}'/'f').write_bytes(b'y'*20000)            # resized
+        (big/'d12'/'f').unlink()                                               # deleted
+        (big/'d13'/'g').write_bytes(b'z')                                      # added
+        (big/'d20'/'f').unlink();(big/'d20').rmdir()                           # removed, tracked
+        os.rename(big/'d22', big/'d23'/'moved')                                # moved
+        os.link(big/'d1'/'f', big/'d24'/'linked')                              # another shared holder
+        def published():
+            return [store.db.execute(f'SELECT * FROM {t} WHERE generation=(SELECT generation FROM volumes) ORDER BY 3,4').fetchall()
+                    for t in ('nodes','files','holders','charges','listings')]
+        before = published()
+        walker = self.update(store, volume, policy)
+        with patch('machine_audit.scanner.store.save_hierarchy', side_effect=RuntimeError('synthetic publication failure')):
+            with self.assertRaisesRegex(RuntimeError, 'synthetic publication failure'):
+                store.finish_volume(volume, walker.blocks, walker.gaps, full=False, lean=True, bookmark=2)
+        self.assertEqual(published(), before, 'a failed publication changed the published map')
+        seen = self.counted(store)
+        store.finish_volume(volume, walker.blocks, walker.gaps, full=False, lean=True, bookmark=2)
+        (declared, changes, pages, frames), = seen
+        self.assertGreaterEqual(declared, changes);self.assertLessEqual(frames, pages)
+        reference = MapStore(self.root/'reference'/'scanner.sqlite', Budget(self.root/'reference', free_margin_bytes=0))
+        self.addCleanup(reference.close)
+        reference.prepare(volume);walker = Walker(volume, policy, reference, Blocks());walker.walk()
+        reference.finish_volume(volume, walker.blocks, walker.gaps, full=True, lean=True, bookmark=2)
+        def mapped(map_store):
+            # Rows by identity; the generation and listing times differ by design.
+            g, = map_store.db.execute('SELECT generation FROM volumes').fetchone()
+            rows = [sorted(tuple(r)[1:] for r in map_store.db.execute(f'SELECT * FROM {t} WHERE generation=?', (g,)))
+                    for t in ('nodes','files','holders','charges')]
+            return rows+[sorted((r[2],r[4]) for r in map_store.db.execute('SELECT * FROM listings WHERE generation=?', (g,)))]
+        self.assertEqual(mapped(store), mapped(reference))
+        self.assertGreater(len(mapped(store)[2]), 2, 'the fixture lost its shared holders')
+        latest = {}
+        for identity, size, status in store.db.execute('SELECT id,size,status FROM points ORDER BY observed_ns'):
+            latest[identity] = (size, status)
+        self.assertEqual({d:latest[i][1] for d,i in tracked.items()},
+                         {3:'below_threshold',4:'below_threshold',5:'below_threshold',20:'not_observed',21:'below_threshold'})
+
     def test_page_limit_shortened_by_the_cap_is_a_capacity_refusal(self):
         # A transaction that ran out of the page limit the cap had shortened failed
         # as write_failed, outside recovery and its retry gate.
@@ -213,16 +338,16 @@ class PublicationBudgetTests(unittest.TestCase):
 
         @contextmanager
         def record(*args, **kwargs):
-            writes.append(kwargs['rows'])
+            before = store.db.total_changes
             with original(*args, **kwargs):yield
+            writes.append((kwargs['rows'], store.db.total_changes-before))
 
         store.write = record
         store.finish_volume(self.volume, Blocks(), [], full=False, lean=True)
-        # Four changed identities require eight point slots plus four possible
-        # terminal points; only the root remains in the staged nodes table.
-        # Six map and six hierarchy slots are also needed. Stage markers stay
-        # with the unpublished generation for its bounded prune.
-        self.assertGreaterEqual(writes[-1], 8+4+6+6)
+        # The removed tracked identities' terminal points, the removed rows and the
+        # hierarchy must all fit the publication's declared rows.
+        declared, changes = writes[-1]
+        self.assertGreaterEqual(declared, changes)
         self.assertEqual(len(store.changed), 4)
         for identity in ('2', '3', '4'):
             point = store.db.execute('SELECT size,status FROM points WHERE id=? ORDER BY observed_ns DESC LIMIT 1',

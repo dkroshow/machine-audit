@@ -581,9 +581,9 @@ class MapStore:
         counted with its own predicate. Staged rows stay unpublished for the
         bounded prune of building generations."""
         plan=[]
-        def remove(table,where,args):
+        def remove(label,table,where,args):
             count,payload=self._row_size(table,where,args)
-            plan.append((f'DELETE FROM {table} WHERE {where}',args,count,payload))
+            plan.append((f'DELETE FROM {table} WHERE {where}',args,count,payload,label))
         def same(table):
             # The other generation's row with this primary key and equal values.
             columns=list(self.db.execute(f'PRAGMA table_info({table})'))[1:]
@@ -597,29 +597,32 @@ class MapStore:
             return f'{table}.{key} NOT IN (SELECT id FROM {removed} WHERE generation=? AND volume=?)'
         # Only a committed listing fulfills a deferred refresh. Probe its
         # primary key from the small dirty set, never scan the complete map.
-        remove('dirty','''volume=? AND EXISTS(SELECT 1 FROM listings l
+        remove('dirty','dirty','''volume=? AND EXISTS(SELECT 1 FROM listings l
             WHERE l.generation=? AND l.volume=? AND l.id=inode_key(dirty.id))''',
             (self.volume,self.generation,self.vid))
         if self.base_gen is None:return plan
         stage=(self.generation,self.vid)
         # A base row survives a reset when its staged copy is identical.
         for table,key in (('files','parent'),('holders','dir')):
-            remove(table,f'''generation=? AND volume=? AND {key} IN
+            remove(f'base_{table}_reset',table,f'''generation=? AND volume=? AND {key} IN
                 (SELECT id FROM reset_dirs WHERE generation=? AND volume=? UNION SELECT id FROM removed WHERE generation=? AND volume=?)
                 AND NOT ({kept(table)} AND {same(table)})''',
                 (self.base_gen,self.vid,*stage,*stage,*stage,self.generation))
         for table,key in (('nodes','id'),('listings','id'),('charges','stream')):
             removed='removed_charges' if table=='charges' else 'removed'
-            remove(table,f'generation=? AND volume=? AND {key} IN (SELECT id FROM {removed} WHERE generation=? AND volume=?)',
+            remove(f'base_{table}_removed',table,f'generation=? AND volume=? AND {key} IN (SELECT id FROM {removed} WHERE generation=? AND volume=?)',
                 (self.base_gen,self.vid,*stage))
         for table in MAP_TABLES:
-            names=','.join(r[1] for r in list(self.db.execute(f'PRAGMA table_info({table})'))[1:])
+            columns=list(self.db.execute(f'PRAGMA table_info({table})'))
+            names=','.join(c['name'] for c in columns[1:])
+            keys=','.join(c['name'] for c in sorted(columns,key=lambda c:c['pk']) if c['pk'])
+            values=','.join(f"{c['name']}=excluded.{c['name']}" for c in columns if not c['pk'])
             where=f'generation=? AND volume=? AND {kept(table)} AND NOT {same(table)}'
             args=(*stage,*stage,self.base_gen)
             count,payload=self._row_size(table,where,args)
-            # REPLACE can delete a prior row as well as insert its replacement.
-            plan.append((f'INSERT OR REPLACE INTO {table} SELECT ?,{names} FROM {table} WHERE {where}',
-                         (self.base_gen,*args),2*count,2*payload))
+            # One mutation a row: a new row is inserted, a published one updated in place.
+            plan.append((f'INSERT INTO {table} SELECT ?,{names} FROM {table} WHERE {where} ON CONFLICT({keys}) DO UPDATE SET {values}',
+                         (self.base_gen,*args),count,payload,f'copy_{table}'))
         return plan
 
     def finish_volume(self,volume,blocks,gaps,*,full,lean,bookmark=None,event_uuid=None,complete=True,physical=True,event_progress=None):
@@ -649,13 +652,16 @@ class MapStore:
             where+=f' AND ({metric}>=1000000000 OR EXISTS(SELECT 1 FROM tracked WHERE volume=? AND id=source_id(nodes.id)))'
             params+=self.volume,
         candidates,payload=self._row_size('nodes',where,params)
-        point_candidates=candidates if full else len(self.changed)
+        # An update writes points only for the changed rows _points writes for, and
+        # only tracked rows join the hierarchy, so the new ones are among them.
+        point_candidates=candidates if full else sum(
+            1 for key in self.changed if (node:=self._node(key)) is not None and self._last_point(node,metric)[1])
+        hierarchy_candidates=candidates if full else point_candidates
         tracked,tracked_payload=self._row_size('tracked','volume=?',(self.volume,))
         # Points also visit removed identities absent from the staged nodes.
         # Reserve two writes per candidate and a terminal point per old identity.
-        # Hierarchy: at most old+new identities, plus one epoch. Count both
-        # sides of every REPLACE in the map switch.
-        rows=sum(p[2] for p in plan)+2*point_candidates+candidates+2*tracked+5
+        # Hierarchy: at most old+new identities, plus one epoch.
+        rows=sum(p[2] for p in plan)+2*point_candidates+hierarchy_candidates+2*tracked+5
         payload=3*payload+3*tracked_payload+sum(p[3] for p in plan)
         payload+=(candidates+tracked)*(len(self.volume.encode())+64)  # volume and hierarchy version
         payload+=self.db.execute('''SELECT coalesce(sum(length(CAST(p.label AS BLOB))),0)
@@ -665,21 +671,31 @@ class MapStore:
         gap_text=json.dumps(sorted(set(gaps)))
         payload+=len((volume.label+volume.mount+gap_text+(event_uuid or '')).encode())
         no_progress=0 if full or event_progress is True else old['no_progress']+1 if event_progress is False else old['no_progress']
+        # Counts only, with fixed labels: what a refused publication declared, so a
+        # run record can say which part was too large.
+        receipt=dict(plan={label:[count,size] for _,_,count,size,label in plan},changed=len(self.changed),
+                     point_candidates=point_candidates,hierarchy_candidates=hierarchy_candidates,
+                     tracked=tracked,rows=rows,payload_bytes=payload)
         self.phase('publication')
-        with self.write(rows=rows,payload_bytes=payload):
-            for sql,args,_,_ in plan:self.db.execute(sql,args)
-            published=self.base_gen if self.base_gen is not None else self.generation
-            now=time.time_ns()
-            self._points(published,now,result['valid'],full)
-            save_hierarchy(self.db,published,self.volume,now,volume_key=self.vid)
-            self.db.execute('''UPDATE volumes SET label=?,mount=?,generation=?,observed_ns=?,full_ns=?,volume_used=?,capacity=?,free=?,available=?,
-                valid=?,status=?,lean=?,bookmark=?,no_progress=?,event_uuid=?,gaps=?,mounted=1,budget_retry_bytes=NULL WHERE id=?''',
-                (volume.label,volume.mount,published,now,now if full else old['full_ns'],volume.used,volume.capacity,volume.free,volume.available,
-                 int(result['valid']),result['status'],int(lean),bookmark,no_progress,
-                 event_uuid,gap_text,self.volume))
-            if full and old['generation'] is not None:
-                self.db.execute("UPDATE generations SET status='retired' WHERE id=?",(old['generation'],))
-            self.db.execute("UPDATE generations SET status='published' WHERE id=?",(published,))
+        receipt.update(existing_pages=self.db.execute('PRAGMA page_count').fetchone()[0],
+                       freelist_pages=self.db.execute('PRAGMA freelist_count').fetchone()[0])
+        try:
+            with self.write(rows=rows,payload_bytes=payload):
+                for sql,args,_,_,_ in plan:self.db.execute(sql,args)
+                published=self.base_gen if self.base_gen is not None else self.generation
+                now=time.time_ns()
+                self._points(published,now,result['valid'],full)
+                save_hierarchy(self.db,published,self.volume,now,volume_key=self.vid)
+                self.db.execute('''UPDATE volumes SET label=?,mount=?,generation=?,observed_ns=?,full_ns=?,volume_used=?,capacity=?,free=?,available=?,
+                    valid=?,status=?,lean=?,bookmark=?,no_progress=?,event_uuid=?,gaps=?,mounted=1,budget_retry_bytes=NULL WHERE id=?''',
+                    (volume.label,volume.mount,published,now,now if full else old['full_ns'],volume.used,volume.capacity,volume.free,volume.available,
+                     int(result['valid']),result['status'],int(lean),bookmark,no_progress,
+                     event_uuid,gap_text,self.volume))
+                if full and old['generation'] is not None:
+                    self.db.execute("UPDATE generations SET status='retired' WHERE id=?",(old['generation'],))
+                self.db.execute("UPDATE generations SET status='published' WHERE id=?",(published,))
+        except BudgetExceeded as exc:
+            exc.publication=dict(receipt,shortfall_bytes=exc.shortfall_bytes);raise
         self.generation=published;self.base_gen=None
         return result
 
@@ -693,8 +709,8 @@ class MapStore:
         for row in rows:
             if row is None:continue
             identity=source_id(row['id'])
-            last=self.db.execute('SELECT * FROM points WHERE volume=? AND id=? ORDER BY observed_ns DESC LIMIT 1',(self.volume,identity)).fetchone()
-            if last is None and row[metric]<1_000_000_000:continue
+            last,writes=self._last_point(row,metric)
+            if not writes:continue
             # Baseline readout context only; historical placement has its own
             # immutable observations and must not be inferred from this cache.
             self.db.execute('INSERT INTO tracked VALUES(?,?,?) ON CONFLICT(volume,id) DO UPDATE SET parent=excluded.parent',
@@ -708,6 +724,13 @@ class MapStore:
                 last=self.db.execute('SELECT * FROM points WHERE volume=? AND id=? ORDER BY observed_ns DESC LIMIT 1',(self.volume,tracked['id'])).fetchone()
                 if last and (last['size'] is not None or last['status']!='not_observed'):
                     self.db.execute('INSERT INTO points VALUES(?,?,?,?,?,?,?)',(self.volume,tracked['id'],now,last['label'],metric,None,'not_observed'))
+
+    def _last_point(self,row,metric):
+        """A map row's latest point, and whether _points writes for it: a row with
+        a point keeps its history, any other only from 1 GB."""
+        last=self.db.execute('SELECT * FROM points WHERE volume=? AND id=? ORDER BY observed_ns DESC LIMIT 1',
+                             (self.volume,source_id(row['id']))).fetchone()
+        return last,last is not None or row[metric]>=1_000_000_000
 
     def mark_failed(self,status,*,end_run=True,retry_bytes=None):
         self.buffer.clear();self.buffer_bytes=0;self.pending_resets.clear()

@@ -296,7 +296,8 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     processed+=entries
                     store.mark_failed(blocked,end_run=False,retry_bytes=exc.retry_bytes)
                     results.append({'volume_id':volume.id,'status':blocked,'action':action,'trigger':trigger,
-                                    'stage':store.run_context['stage'],'entries':entries})
+                                    'stage':store.run_context['stage'],'entries':entries,
+                                    **({'publication':exc.publication} if hasattr(exc,'publication') else {})})
                     continue
                 published+=1
                 processed+=walker.entries

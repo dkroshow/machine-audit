@@ -303,6 +303,51 @@ class RootPublicationTests(unittest.TestCase):
             result, status = self.scan([second], events=events, full=False)
         self.assertEqual((result['volumes'][0]['trigger'], status), ('budget_retry_gate', blocked[0]))
 
+    def test_refused_publication_keeps_a_numeric_receipt_of_what_it_declared(self):
+        # Big Mac's main update was refused at publication and its staging was pruned
+        # by the next volume, so nothing could say which counted part was too large.
+        other = self.base/'other';other.mkdir()
+        second = replace(self.volume, id='w', mount=str(other), device=2)
+        self.scan([self.volume, second])
+        events = SimpleNamespace(uuid=lambda device:'events', current_id=lambda:30,
+                                 replay=lambda device,since:Replay(paths={'/child':False} if device==1 else {}, up_to=30))
+        with sqlite3.connect(self.data/'scanner.sqlite') as db:
+            start = db.execute('SELECT max(observed_ns) FROM volumes').fetchone()[0]
+        phase, finish = MapStore.phase, MapStore.finish_volume
+        labels = {'dirty','base_files_reset','base_holders_reset','base_nodes_removed','base_listings_removed',
+                  'base_charges_removed','copy_nodes','copy_files','copy_holders','copy_charges','copy_listings'}
+        for hours, refused in ((1, 'publication'), (2, 'progress')):
+            def refusing(store, stage, **kwargs):
+                full = lambda:setattr(store.budget,'limit_bytes',store.budget.usage()['bytes'])  # nothing more fits
+                if stage=='publication' and store.volume=='v' and refused=='progress':full()
+                phase(store, stage, **kwargs)
+                if stage=='publication' and store.volume=='v' and refused=='publication':full()
+            def roomy(store, *args, **kwargs):
+                try:return finish(store, *args, **kwargs)
+                finally:store.budget.limit_bytes=10**10  # Room again for the failure record and the next volume.
+            with self.subTest(refused), patch.object(MapStore,'phase',refusing), patch.object(MapStore,'finish_volume',roomy), \
+                 patch('machine_audit.scanner.runner.time.time_ns', return_value=start+hours*3600*10**9):
+                result, status = self.scan([self.volume, second], events=events, full=False)
+            outcome = {r['volume_id']:r for r in result['volumes']}
+            self.assertEqual((status, outcome['w']['status']), ('partial', 'observed'))
+            self.assertTrue(outcome['v']['status'].startswith('budget_blocked_'))
+            with sqlite3.connect(self.data/'scanner.sqlite') as db:
+                stored = {r['volume_id']:r for r in json.loads(db.execute('SELECT volumes FROM runs ORDER BY started_ns DESC LIMIT 1').fetchone()[0])}
+                staging = db.execute("SELECT count(*) FROM generations g JOIN volumes v ON v.key=g.volume WHERE v.id='v' AND g.status='building'").fetchone()[0]
+            self.assertEqual(staging, 0, "the next volume's preparation prunes the refused staging; the receipt must not depend on it")
+            if refused=='progress':
+                self.assertNotIn('publication', stored['v'], 'a refused progress write was reported as the publication')
+                continue
+            receipt = stored['v']['publication']
+            self.assertEqual(set(receipt), {'plan','changed','point_candidates','hierarchy_candidates','tracked','rows',
+                                            'payload_bytes','existing_pages','freelist_pages','shortfall_bytes'})
+            self.assertEqual(set(receipt['plan']), labels)
+            numbers = [v for k,v in receipt.items() if k!='plan']+[n for pair in receipt['plan'].values() for n in pair]
+            self.assertTrue(all(type(n) is int and n>=0 for n in numbers), 'the receipt holds counts and bytes only')
+            self.assertGreater(receipt['changed'], 0)
+            self.assertEqual(receipt['rows'], sum(n for n,_ in receipt['plan'].values())+2*receipt['point_candidates']
+                             +receipt['hierarchy_candidates']+2*receipt['tracked']+5)
+
     def test_full_walk_refused_by_an_unknown_page_shortfall_waits_for_an_operator(self):
         # Running out of an admitted page limit was write_failed, then a one-byte
         # retry level: every small collector prune repeated the same failing walk.
