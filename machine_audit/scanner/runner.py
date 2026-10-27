@@ -21,6 +21,10 @@ from .accounting import Blocks
 from .store import MapStore
 from .walker import Walker, shown_path
 
+# Refusals that more managed storage would admit; reader contention and the
+# filesystem free-space margin are retried as before.
+CAPACITY_REFUSALS=('managed_storage_limit','sqlite_checkpoint_headroom')
+
 
 @contextmanager
 def scan_lock(root):
@@ -64,11 +68,11 @@ def relist(store,walker,policy,volume,now,changes):
     """Re-list changed folders, given as (absolute path, recursive), plus deferred ones now due."""
     roots_to_update={}
     recursive_roots=set()
-    for due in store.db.execute('SELECT id FROM dirty WHERE volume=? AND due_ns<=?',(volume.id,now)):
-        saved=store.known_directory(due[0])
+    for due,recursive in store.db.execute('SELECT id,recursive FROM dirty WHERE volume=? AND due_ns<=?',(volume.id,now)):
+        saved=store.known_directory(due)
         if saved and saved['path']:
             roots_to_update[saved['path']]=saved
-            recursive_roots.add(saved['path'])
+            if recursive is None or recursive:recursive_roots.add(saved['path'])
     for path,recursive in changes:
         if os.path.commonpath([path,volume.mount])!=volume.mount:
             continue
@@ -87,7 +91,7 @@ def relist(store,walker,policy,volume,now,changes):
             # A >20k-entry directory is visited at most daily.
             listing=store.listing(found['id'])
             if listing and listing['count']>20_000 and now-listing['listed_ns']<86400*10**9:
-                store.defer(found['id'],listing['listed_ns']+86400*10**9)
+                store.defer(found['id'],listing['listed_ns']+86400*10**9,recursive)
                 walker.gaps.add('large_directory_deferred')
                 continue
             roots_to_update[path]=found
@@ -110,7 +114,7 @@ def relist(store,walker,policy,volume,now,changes):
             if present:
                 # Still there but not listable (the walker named why): its last map
                 # stands and it is retried next hour.
-                store.defer(previous['id'],now+3600*10**9);continue
+                store.defer(previous['id'],now+3600*10**9,recursive);continue
         else:present=True
         if not present:
             # Gone, or no longer a directory: drop its subtree; its parent's listing
@@ -154,6 +158,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
         processed=0
         root_failed=False
         published=0
+        blocked=None
         results=[]
         try:
             store.written_bytes=lambda:native.process(os.getpid()).diskio_byteswritten
@@ -203,9 +208,18 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     if force or old['full_attempt_ns'] is None or now-old['full_attempt_ns']>=86400*10**9:
                         action,trigger='full','failed_volume_retry'
                     else:action,trigger='wait','failed_full_retry_cooldown'
+                # The cap refused this volume's last attempt. An update gets one
+                # full walk: it prunes retired rows first and publishes by a small
+                # pointer switch. A refused full waits until managed storage falls
+                # to its retry level; only an operator's forced scan skips that.
+                if old and old['status'].removeprefix('budget_blocked_') in CAPACITY_REFUSALS and action!='wait':
+                    retry=old['budget_retry_bytes']
+                    if failed_full and not force and retry is not None and not budget.retry_level_reached(retry):
+                        action,trigger='wait','budget_retry_gate'
+                    else:action,trigger='full','budget_recovery'
                 if action=='wait':
                     store.phase('complete',action=action,trigger=trigger)
-                    status=old['status'] if trigger=='failed_full_retry_cooldown' else 'current'
+                    status=old['status'] if trigger in ('failed_full_retry_cooldown','budget_retry_gate') else 'current'
                     results.append({'volume_id':volume.id,'status':status,'action':action,'trigger':trigger})
                     continue
                 store.phase('events',action=action,trigger=trigger)
@@ -226,41 +240,55 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                                           (volume.id,now)).fetchone():trigger='deferred_folder_due'
                     if action=='update' and store.db.execute('''SELECT 1 FROM nodes n INDEXED BY node_parent
                         JOIN dirty d ON d.volume=? AND d.id=source_id(n.id)
-                        WHERE n.generation=? AND n.volume=? AND n.parent IS NULL AND d.due_ns<=? LIMIT 1''',
+                        WHERE n.generation=? AND n.volume=? AND n.parent IS NULL AND d.due_ns<=?
+                        AND coalesce(d.recursive,1) LIMIT 1''',
                         (volume.id,old['generation'],old['key'],now)).fetchone():
                         action,trigger='full','deferred_root_due'
                 bookmark=events.current_id() if action=='full' else replay.up_to or replay.last_good or old['bookmark']
-                store.phase('prepare',action=action,trigger=trigger)
-                store.prepare(volume,full=action=='full',lean=not full_disk_access)
-                blocks=Blocks()
-                walker=Walker(volume,policy,store,blocks,fs,grain)
-                store.phase('walk')
-                if action=='full':
-                    walker.walk()
-                    # A full walk starts with one root; descendants are queued
-                    # only after its listing completes. Empty is still listed.
-                    if not walker.listed:
-                        root_failed=True
-                        processed+=walker.entries
-                        reason='root_unreadable'+''.join('_'+gap for gap in sorted(walker.gaps-{'root_unreadable'}))
-                        store.mark_failed(reason,end_run=False)
-                        results.append({'volume_id':volume.id,'status':'root_unreadable','action':action,'trigger':trigger,
-                                        'reason':reason,'entries':walker.entries,'gaps':sorted(walker.gaps)})
-                        continue
-                else:
-                    complete=relist(store,walker,policy,volume,now,
-                           ((os.path.normpath(os.path.join(volume.mount,relative.lstrip('/'))),recursive)
-                            for relative,recursive in replay.paths.items()))
-                    if not complete:
-                        root_failed=True
-                        processed+=walker.entries
-                        store.mark_failed('update_unreadable',end_run=False)
-                        results.append({'volume_id':volume.id,'status':'update_unreadable','action':action,
-                                        'trigger':trigger,'entries':walker.entries,'gaps':sorted(walker.gaps)})
-                        continue
-                store.finish_volume(volume,blocks,walker.gaps,full=action=='full',lean=not full_disk_access,
-                    bookmark=bookmark,event_uuid=event_uuid,complete=walker.sharing_complete and (action=='full' or not replay.interrupted),
-                    event_progress=None if not replay or not replay.paths else bookmark!=old['bookmark'])
+                walker=None
+                try:
+                    store.phase('prepare',action=action,trigger=trigger)
+                    store.prepare(volume,full=action=='full',lean=not full_disk_access)
+                    blocks=Blocks()
+                    walker=Walker(volume,policy,store,blocks,fs,grain)
+                    store.phase('walk')
+                    if action=='full':
+                        walker.walk()
+                        # A full walk starts with one root; descendants are queued
+                        # only after its listing completes. Empty is still listed.
+                        if not walker.listed:
+                            root_failed=True
+                            processed+=walker.entries
+                            reason='root_unreadable'+''.join('_'+gap for gap in sorted(walker.gaps-{'root_unreadable'}))
+                            store.mark_failed(reason,end_run=False)
+                            results.append({'volume_id':volume.id,'status':'root_unreadable','action':action,'trigger':trigger,
+                                            'reason':reason,'entries':walker.entries,'gaps':sorted(walker.gaps)})
+                            continue
+                    else:
+                        complete=relist(store,walker,policy,volume,now,
+                               ((os.path.normpath(os.path.join(volume.mount,relative.lstrip('/'))),recursive)
+                                for relative,recursive in replay.paths.items()))
+                        if not complete:
+                            root_failed=True
+                            processed+=walker.entries
+                            store.mark_failed('update_unreadable',end_run=False)
+                            results.append({'volume_id':volume.id,'status':'update_unreadable','action':action,
+                                            'trigger':trigger,'entries':walker.entries,'gaps':sorted(walker.gaps)})
+                            continue
+                    store.finish_volume(volume,blocks,walker.gaps,full=action=='full',lean=not full_disk_access,
+                        bookmark=bookmark,event_uuid=event_uuid,complete=walker.sharing_complete and (action=='full' or not replay.interrupted),
+                        event_progress=None if not replay or not replay.paths else bookmark!=old['bookmark'])
+                except BudgetExceeded as exc:
+                    # Only this attempt is dropped: its pending writes now, its
+                    # staged generation at the next preparation. Other volumes go on.
+                    blocked=f'budget_blocked_{exc.code}'
+                    root_failed=True
+                    entries=walker.entries if walker else 0
+                    processed+=entries
+                    store.mark_failed(blocked,end_run=False,retry_bytes=exc.retry_bytes)
+                    results.append({'volume_id':volume.id,'status':blocked,'action':action,'trigger':trigger,
+                                    'stage':store.run_context['stage'],'entries':entries})
+                    continue
                 published+=1
                 processed+=walker.entries
                 store.progress(processed)
@@ -271,7 +299,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
             if missing:
                 with store.write(rows=len(missing)):
                     store.db.executemany('UPDATE volumes SET mounted=0 WHERE id=?',((identity,) for identity in missing))
-            run_status=('partial' if published else 'root_unreadable') if root_failed else 'complete'
+            run_status=('partial' if published else blocked or 'root_unreadable') if root_failed else 'complete'
             store.phase('complete')
             store.record_volumes(results)
             store.progress(processed,run_status)
@@ -290,7 +318,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
             recorded=False
             try:
                 store.record_volumes(results)
-                store.mark_failed(reason)
+                store.mark_failed(reason,retry_bytes=getattr(exc,'retry_bytes',None))
             except Exception:
                 pass
             try:

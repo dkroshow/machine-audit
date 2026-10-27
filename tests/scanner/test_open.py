@@ -106,6 +106,7 @@ class RootPublicationTests(unittest.TestCase):
             # Attempt status can change without changing the published map.
             volume.pop('status')
             volume.pop('full_attempt_ns')
+            volume.pop('budget_retry_bytes')
             generation = db.execute("SELECT generation FROM volumes WHERE id='v'").fetchone()[0]
             nodes = db.execute('SELECT * FROM nodes WHERE generation=? ORDER BY id', (generation,)).fetchall()
             points = db.execute("SELECT * FROM points WHERE volume='v' ORDER BY id,observed_ns").fetchall()
@@ -116,7 +117,7 @@ class RootPublicationTests(unittest.TestCase):
         children.pop('status')  # Last attempt status is checked separately.
         return volume, nodes, points, epochs, hierarchy, state, children
 
-    def scan(self, volumes, policy=None, events=None, force=False):
+    def scan(self, volumes, policy=None, events=None, force=False, full=True, limit=10**10):
         native = SimpleNamespace(process=lambda pid: SimpleNamespace(proc_start_abstime=1, diskio_byteswritten=0))
         filesystem = SimpleNamespace(volumes=lambda: volumes, sharing=lambda *args: None)
         events = events or SimpleNamespace(uuid=lambda device: 'events', current_id=lambda: 20)
@@ -125,8 +126,9 @@ class RootPublicationTests(unittest.TestCase):
              patch('machine_audit.scanner.runner.IOKit'), \
              patch('machine_audit.scanner.runner.FSEvents', return_value=events), \
              patch('machine_audit.scanner.runner.os.nice'), \
+             patch('machine_audit.scanner.runner.Budget', lambda root: Budget(root, limit_bytes=limit)), \
              patch('machine_audit.scanner.runner.Policy', return_value=policy or Policy(home=str(self.base), homes=[])):
-            result = run_scan(self.data, full=True, force=force)
+            result = run_scan(self.data, full=full, force=force)
         with sqlite3.connect(self.data / 'scanner.sqlite') as db:
             status, ended = db.execute('SELECT status,ended_ns FROM runs ORDER BY started_ns DESC LIMIT 1').fetchone()
         self.assertIsNotNone(ended)
@@ -177,7 +179,6 @@ class RootPublicationTests(unittest.TestCase):
                 (ValueError('synthetic private path'), 'scan_failed', 'invalid_scan_state_ValueError'),
                 (OSError(5, 'synthetic private path'), 'scan_failed', 'os_error_OSError'),
                 (TypeError('synthetic private path'), 'scan_failed', 'unexpected_error_TypeError'),
-                (BudgetExceeded('synthetic_rule'), 'budget_blocked', 'budget_blocked_synthetic_rule'),
                 (sqlite3.OperationalError('synthetic private path'), 'write_failed', 'write_failed_OperationalError')):
             with self.subTest(reason=reason), patch.object(MapStore, 'finish_volume', side_effect=error):
                 result, status = self.scan([self.volume],force=True)
@@ -190,6 +191,76 @@ class RootPublicationTests(unittest.TestCase):
                 after = self.published()
                 self.assertEqual(after[1:6], before[1:6])
                 self.assertEqual(after[6]['rows'], before[6]['rows'])
+        # A budget refusal ends only that volume's attempt and is recorded with it.
+        with patch.object(MapStore, 'finish_volume', side_effect=BudgetExceeded('synthetic_rule')):
+            result, status = self.scan([self.volume],force=True)
+        self.assertEqual((result['status'], status, result['volumes'][0]['status']), ('budget_blocked_synthetic_rule',)*3)
+        self.assertEqual(self.published()[1:6], before[1:6])
+
+    def test_capacity_refusal_recovers_once_by_full_walk_then_waits_for_freed_space(self):
+        # Big Mac retried one refused update hourly for five days, re-walking a
+        # million entries each time, and the refusal stopped every other volume.
+        other = self.base/'other';other.mkdir();(other/'file').write_bytes(b'other')
+        second = replace(self.volume, id='w', mount=str(other), device=2)
+        volumes = [self.volume, second]
+        self.scan(volumes)  # Publish real maps for both volumes.
+        store = MapStore(self.data/'scanner.sqlite', Budget(self.data, free_margin_bytes=0))
+        with store.write(rows=2, payload_bytes=8*1024**2):  # Retained history: whole-file WAL bounds exceed the cap.
+            store.db.execute('CREATE TABLE padding(value BLOB)')
+            store.db.execute('INSERT INTO padding VALUES(zeroblob(?))', (8*1024**2,))
+        store.close()
+        collector = self.data/'synthetic-collector.sqlite'
+        collector.write_bytes(bytes(16*1024**2))
+        limit = Budget(self.data).usage()['bytes']+4*1024**2
+        for i in range(3000):(self.tree/'child'/str(i)).write_bytes(b'x')
+        events = SimpleNamespace(uuid=lambda device:'events', current_id=lambda:30,
+            replay=lambda device,since:Replay(paths={'/child':False} if device==1 else {}, up_to=30))
+        before = self.published()
+        with sqlite3.connect(self.data/'scanner.sqlite') as db:
+            start, hour = db.execute('SELECT max(observed_ns) FROM volumes').fetchone()[0], 3600*10**9
+        def run(after, **kwargs):
+            with patch('machine_audit.scanner.runner.time.time_ns', return_value=start+after):
+                result, status = self.scan(volumes, events=events, limit=limit, **{'full':False, **kwargs})
+            return status, {r['volume_id']:r for r in result['volumes']}
+        def volume(column):
+            with sqlite3.connect(self.data/'scanner.sqlite') as db:
+                return db.execute(f"SELECT {column} FROM volumes WHERE id='v'").fetchone()[0]
+
+        status, results = run(hour)
+        self.assertEqual(status, 'partial')
+        self.assertIn(results['v']['status'], ('budget_blocked_sqlite_checkpoint_headroom','budget_blocked_managed_storage_limit'))
+        self.assertGreaterEqual(results['v']['entries'], 3000, 'failed work must still be counted')
+        self.assertEqual(results['w']['status'], 'observed')
+        self.assertEqual(self.published()[:6], before[:6])
+        with sqlite3.connect(self.data/'scanner.sqlite') as db:
+            generation = db.execute("SELECT generation FROM volumes WHERE id='w'").fetchone()[0]
+            self.assertEqual(db.execute('SELECT count(*) FROM files WHERE generation=?', (generation,)).fetchone()[0], 1,
+                             'the refused volume\'s pending rows were published as another volume\'s work')
+        status, results = run(2*hour)
+        self.assertEqual((results['v']['action'], results['v']['trigger']), ('full', 'budget_recovery'))
+        self.assertTrue(results['v']['status'].startswith('budget_blocked_'))
+        level = volume('budget_retry_bytes')
+        self.assertIsNotNone(level)
+        for after, full in ((3*hour, False), (3*hour+86400*10**9, True)):  # Hourly and persistent full settings.
+            status, results = run(after, full=full)
+            self.assertEqual((results['v']['action'], results['v']['trigger']), ('wait', 'budget_retry_gate'))
+            self.assertEqual(results['w']['status'], 'observed')
+        status, results = run(4*hour, force=True)  # The operator's explicit retry.
+        self.assertEqual(results['v']['action'], 'full')
+        self.assertTrue(results['v']['status'].startswith('budget_blocked_'))
+        level = volume('budget_retry_bytes')
+        usage = Budget(self.data).usage()
+        with open(collector, 'r+b') as file:
+            file.truncate(16*1024**2-(usage['bytes']+usage['checkpoint_reservation_bytes']-level)+65536)
+        status, results = run(5*hour)
+        self.assertEqual(results['v']['trigger'], 'budget_retry_gate')
+        collector.unlink()  # Synthetic file created by this test.
+        status, results = run(6*hour)
+        self.assertEqual((status, results['v']['action'], results['v']['status']), ('complete', 'full', 'observed'))
+        self.assertIsNone(volume('budget_retry_bytes'))
+        status, results = run(7*hour)
+        self.assertEqual((results['v']['action'], results['v']['trigger'], results['v']['status']),
+                         ('update', 'hourly_update', 'observed'))
 
     def test_specific_invariant_and_chosen_action_survive_a_failed_run(self):
         def fail_aggregate(store, affected):
@@ -278,14 +349,21 @@ class RootPublicationTests(unittest.TestCase):
         with sqlite3.connect(self.data/'scanner.sqlite') as db:
             self.assertEqual(db.execute('SELECT full_ns FROM volumes').fetchone()[0],100*10**9)
 
-    def test_deferred_volume_root_uses_full_writer(self):
+    def test_deferred_volume_root_uses_full_writer_unless_known_shallow(self):
         with sqlite3.connect(self.data/'scanner.sqlite') as db:
-            db.execute('INSERT INTO dirty VALUES(?,?,?)',('v','1',0))
+            db.execute('INSERT INTO dirty(volume,id,due_ns) VALUES(?,?,?)',('v','1',0))  # Recorded before the scope flag.
         events = SimpleNamespace(uuid=lambda device:'events', current_id=lambda:30,
                                  replay=lambda device,since:Replay(up_to=30))
         with patch('machine_audit.scanner.runner.time.time_ns', return_value=3700*10**9):
             result, status = self.scan([self.volume],events=events)
         self.assertEqual((result['action'],result['trigger']),('full','deferred_root_due'))
+        self.assertEqual(status,'complete')
+        with sqlite3.connect(self.data/'scanner.sqlite') as db:
+            now = db.execute('SELECT observed_ns FROM volumes').fetchone()[0]+3600*10**9
+            db.execute('INSERT INTO dirty VALUES(?,?,?,0)',('v',str(self.tree.stat().st_ino),0))
+        with patch('machine_audit.scanner.runner.time.time_ns', return_value=now):
+            result, status = self.scan([self.volume],events=events)
+        self.assertEqual((result['action'],result['trigger'],result['entries']),('update','deferred_folder_due',1))
         self.assertEqual(status,'complete')
 
     def test_directory_replaced_before_the_scan_relists_its_parent(self):

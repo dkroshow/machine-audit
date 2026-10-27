@@ -24,11 +24,13 @@ class BudgetExceeded(RuntimeError):
     """Refused admission. The message is a reason code, never free text,
     so run records and status files can keep it."""
 
-    def __init__(self, code: str):
+    def __init__(self, code: str, shortfall_bytes: int | None = None):
         if not _CODE.fullmatch(code):
             raise ValueError('invalid budget reason code')
         super().__init__(code)
         self.code = code
+        self.shortfall_bytes = shortfall_bytes
+        self.retry_bytes = None  # Set by admission; see Budget.retry_level_reached.
 
 
 class _ReservationBusy(Exception):
@@ -85,6 +87,15 @@ class Budget:
                 "warning": total >= self.warning_bytes, "parts": parts,
                 "checkpoint_reservation_bytes":sum(size for name,size in parts.items() if name.endswith("-wal")),
                 "checkpoint_error":self.last_checkpoint_error}
+
+    def retry_level_reached(self, retry_bytes: int) -> bool:
+        """Whether managed bytes plus uncheckpointed WAL have fallen to a refusal's
+        retry level. The level comes from the refusal's own admission snapshot:
+        at it the same peak would have fit. That holds only while the writer's
+        own database, its peak and other writers' reservations stay unchanged.
+        A level of 0 means the peak cannot fit under the limit at all."""
+        usage = self.usage()
+        return usage['bytes'] + usage['checkpoint_reservation_bytes'] <= retry_bytes
 
     @contextmanager
     def _guard(self):
@@ -173,14 +184,17 @@ class Budget:
             own=self._sqlite_bytes(usage,resource) if resource is not None else 0
             # Reservation records have fixed bounded size and count in the cap.
             other=usage['bytes']+512-path.stat().st_size+extra-own
-            try:maximum=peak(other,own) if callable(peak) else peak
-            except BudgetExceeded:
+            try:
+                maximum=peak(other,own) if callable(peak) else peak
+                total=other+maximum
+                if total>self.limit_bytes:
+                    raise BudgetExceeded('managed_storage_limit',total-self.limit_bytes)
+            except BudgetExceeded as refused:
                 if wait_path:raise _ReservationBusy(wait_path) from None
+                if refused.shortfall_bytes is not None:
+                    # Same snapshot as the refusal, without this claim's record.
+                    refused.retry_bytes=max(0,usage['bytes']-path.stat().st_size+extra-refused.shortfall_bytes)
                 raise
-            total=other+maximum
-            if total>self.limit_bytes:
-                if wait_path:raise _ReservationBusy(wait_path)
-                raise BudgetExceeded('managed_storage_limit')
             if check_free and shutil.disk_usage(self.root).free < max(0,total-usage['bytes'])+self.free_margin_bytes:
                 raise BudgetExceeded('free_space_margin')
             data=json.dumps([resource,maximum],separators=(',',':')).encode()
@@ -255,7 +269,7 @@ class Budget:
                 if max_growth_bytes is not None:
                     cap=min(cap,existing+(max_growth_bytes+page-1)//page)
                 if cap < existing or other+bound(existing)>self.limit_bytes:
-                    raise BudgetExceeded("sqlite_checkpoint_headroom")
+                    raise BudgetExceeded("sqlite_checkpoint_headroom",other+bound(existing)-self.limit_bytes)
                 low=existing
                 while low<cap:
                     middle=(low+cap+1)//2

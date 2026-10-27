@@ -178,7 +178,9 @@ writes, a replacement map being built, and write-ahead-log and checkpoint
 growth all reserve space through the
 [shared-budget mechanism](architecture.md#failure-behavior). When an update
 cannot fit, the last complete map is kept, the map is marked stale and
-budget-blocked, and the collector keeps recording under the cap. Change
+budget-blocked, and the collector keeps recording under the cap. Other volumes
+still update; the blocked volume recovers by one full walk, which waits for
+freed space if it is refused too ([recovery](source-validation.md#scanner-budget-recovery)). Change
 points are retained under the agreed pruning order; no thinning of them is
 defined yet, and none is applied silently.
 

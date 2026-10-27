@@ -132,5 +132,33 @@ class CheckpointBudgetTests(unittest.TestCase):
                 with self.budget.sqlite_write(self.writer,self.path):pass
         self.assertEqual(self.budget.usage()['checkpoint_reservation_bytes'],0)
 
+    def test_refusal_retry_level_matches_admission_after_the_counted_wal_is_gone(self):
+        # The scanner's retry gate trusts this level. It must come from the refused
+        # snapshot, stay closed while a counted WAL remains, and then open exactly
+        # where the same peak is admitted again.
+        old=self.pinned_commit()
+        (self.root/'other.bin').write_bytes(bytes(1_500_000))
+        usage=self.budget.usage();wal=usage['checkpoint_reservation_bytes']
+        peak=self.budget.limit_bytes-usage['bytes']-512+200_000
+        with self.assertRaisesRegex(BudgetExceeded,'managed_storage_limit') as refused:
+            with self.budget.reserve(peak):pass
+        level=refused.exception.retry_bytes
+        self.assertEqual(refused.exception.shortfall_bytes,wal+200_000)
+        self.assertFalse(self.budget.retry_level_reached(level))
+        old.close()
+        with self.budget.sqlite_write(self.writer,self.path):pass  # The WAL is copied into its database.
+        usage=self.budget.usage();self.assertEqual(usage['checkpoint_reservation_bytes'],0)
+        with open(self.root/'other.bin','r+b') as other:
+            other.truncate(1_500_000-(usage['bytes']-level)+1)
+        self.assertFalse(self.budget.retry_level_reached(level))
+        with self.assertRaisesRegex(BudgetExceeded,'managed_storage_limit'):
+            with self.budget.reserve(peak):pass
+        with open(self.root/'other.bin','r+b') as other:other.truncate(1_500_000-(usage['bytes']-level))
+        self.assertTrue(self.budget.retry_level_reached(level))
+        with self.budget.reserve(peak):pass
+        with self.assertRaises(BudgetExceeded) as impossible:
+            with self.budget.reserve(self.budget.limit_bytes):pass
+        self.assertEqual(impossible.exception.retry_bytes,0)
+
 
 if __name__=='__main__':unittest.main()

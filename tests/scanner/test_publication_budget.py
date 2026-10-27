@@ -5,7 +5,7 @@ import sqlite3
 import tempfile
 import unittest
 
-from machine_audit.budget import Budget
+from machine_audit.budget import Budget, BudgetExceeded
 from machine_audit.scanner.accounting import Blocks
 from machine_audit.scanner.events import next_action
 from machine_audit.scanner.native import Volume
@@ -30,6 +30,18 @@ class PublicationBudgetTests(unittest.TestCase):
     def node(self, store, size):
         store.directory(Node('1', None, 'Root', 'directory', size, size, 'observed', None, 0))
 
+    @staticmethod
+    def published(store):
+        """Everything a reader can see: pointer, published map rows and history."""
+        generation = store.db.execute("SELECT generation FROM volumes WHERE id='v'").fetchone()[0]
+        evidence = [tuple(store.db.execute("SELECT * FROM volumes WHERE id='v'").fetchone())]
+        for table in ('nodes', 'files', 'holders', 'charges', 'listings'):
+            evidence.append([tuple(r) for r in store.db.execute(
+                f'SELECT * FROM {table} WHERE generation=? ORDER BY 2,3,4', (generation,))])
+        for table in ('points', 'tracked', 'hierarchy_epochs', 'hierarchy_nodes', 'dirty'):
+            evidence.append([tuple(r) for r in store.db.execute(f'SELECT * FROM {table} ORDER BY 1,2,3')])
+        return evidence
+
     def test_run_diagnostics_migrate_without_changing_prior_run_evidence(self):
         legacy = SCHEMA.replace(',\n volume_id TEXT,action TEXT,trigger TEXT,stage TEXT,volumes TEXT', '').replace(',full_attempt_ns INTEGER','')
         original = ('old',1,2,2,123,'start','complete',10,20,30,40,'scheduled')
@@ -49,7 +61,10 @@ class PublicationBudgetTests(unittest.TestCase):
         self.assertEqual(tuple(store.db.execute('SELECT volume_id,action,trigger,stage FROM runs WHERE id=?',
                                               (store.run,)).fetchone()),('v','full','event_kernel_drop','walk'))
 
-    def test_existing_large_store_opens_and_publishes_small_update_with_counted_wal(self):
+    def test_existing_large_store_publishes_a_restaged_folder_by_its_changes_with_counted_wal(self):
+        # Big Mac refused every hourly update at publication: each unchanged file
+        # of a re-listed folder counted as a copy, the WAL bound grew to the whole
+        # database, and the cap refused it. Only changed rows may count.
         store = MapStore(self.path, Budget(self.root, free_margin_bytes=0))
         store.prepare(self.volume)
         self.node(store, 0)
@@ -57,6 +72,8 @@ class PublicationBudgetTests(unittest.TestCase):
         store.directory(Node('3', '1', 'Removed', 'directory', GB, GB, 'observed', None, 0))
         for identity in range(5):
             store.file(str(identity), '2', 'File '+str(identity), 100, 0)
+        kept = [(str(i), '2', 'Kept '+str(i), 4096, i) for i in range(10, 3010)]
+        for row in kept:store.file(*row)
         store.holder('0', '2', 10, 100, None, False)
         store.finish_volume(self.volume, Blocks(), [], full=True, lean=True, bookmark=10)
         # The inert payload models retained history. It must not reserve a
@@ -87,22 +104,51 @@ class PublicationBudgetTests(unittest.TestCase):
         self.addCleanup(store.close)
         store.start('scheduled')
         store.prepare(self.volume, full=False)
+        old = self.published(store)
         store.begin_directory('2')
         store.directory(Node('2', '1', 'Child', 'directory', 3*GB, 3*GB, 'observed', None, 0))
+        # Staging batches stay far below the database, as Big Mac's 8,192-row
+        # batches do against its 826,826 pages.
+        for first in range(0, len(kept), 25):
+            for row in kept[first:first+25]:store.file(*row)
+            store.flush()
         store.file('6', '2', 'Replacement', 3*GB, 0)
         store.clear_subtree('3')
+        limit, budget.limit_bytes = budget.limit_bytes, budget.usage()['bytes']+1_000_000
+        with self.assertRaisesRegex(BudgetExceeded, 'sqlite_checkpoint_headroom'):
+            store.finish_volume(self.volume, Blocks(), [], full=False, lean=True, bookmark=11)
+        self.assertEqual(store.run_context['stage'], 'publication')
+        self.assertEqual(self.published(store), old, 'a refused publication changed published evidence')
+        budget.limit_bytes = limit
         result = store.finish_volume(self.volume, Blocks(), [], full=False, lean=True, bookmark=11)
         store.progress(status='complete')
         self.assertEqual(result['uses'], 3*GB)
         self.assertEqual(MapQuery(self.path).query()['rows'][0]['uses'], 3*GB)
-        self.assertEqual(store.db.execute('SELECT count(*) FROM files').fetchone()[0], 1)
-        self.assertEqual(store.db.execute('SELECT count(*) FROM holders').fetchone()[0], 0)
+        published = store.generation
+        self.assertEqual(store.db.execute('SELECT count(*) FROM files WHERE generation=?', (published,)).fetchone()[0], 3001)
+        self.assertEqual(store.db.execute("SELECT count(*) FROM files WHERE generation=? AND label LIKE 'Kept%'",
+                                          (published,)).fetchone()[0], 3000)
+        self.assertEqual(store.db.execute('SELECT count(*) FROM holders WHERE generation=?', (published,)).fetchone()[0], 0)
         self.assertEqual(store.db.execute('SELECT status FROM points WHERE id=? ORDER BY observed_ns DESC LIMIT 1',
                                          ('3',)).fetchone()[0], 'not_observed')
         self.assertEqual(store.db.execute('SELECT length(value) FROM padding').fetchone()[0], 8*1024**2)
         self.assertLessEqual(budget.usage()['bytes'], budget.limit_bytes)
         self.assertTrue(admissions)
         self.assertLess(max(rows for rows, _ in admissions), 1000)
+        # Stopping before cleanup leaves only unpublished rows behind; the next
+        # preparation removes them and never touches the published generation.
+        new = self.published(store)
+        staged = store.db.execute("SELECT id FROM generations WHERE status='building'").fetchall()
+        self.assertEqual(len(staged), 1)
+        store.close()
+        # Prune batches declare 4,096 rows: small against Big Mac's file, not this one.
+        store = MapStore(self.path, Budget(self.root, free_margin_bytes=0))
+        self.addCleanup(store.close)
+        store.prepare(self.volume, full=False)
+        self.assertEqual(self.published(store), new)
+        for table in ('files', 'nodes', 'reset_dirs', 'removed'):
+            self.assertEqual(store.db.execute(f'SELECT count(*) FROM {table} WHERE generation=?',
+                                              (staged[0][0],)).fetchone()[0], 0)
 
     def test_quiet_updates_leave_counter_unchanged_and_never_force_full(self):
         store = MapStore(self.path, Budget(self.root, free_margin_bytes=0))
@@ -154,8 +200,9 @@ class PublicationBudgetTests(unittest.TestCase):
         store.finish_volume(self.volume, Blocks(), [], full=False, lean=True)
         # Four changed identities require eight point slots plus four possible
         # terminal points; only the root remains in the staged nodes table.
-        # Six map, six hierarchy and six metadata/marker slots are also needed.
-        self.assertGreaterEqual(writes[-1], 8+4+6+6+6)
+        # Six map and six hierarchy slots are also needed. Stage markers stay
+        # with the unpublished generation for its bounded prune.
+        self.assertGreaterEqual(writes[-1], 8+4+6+6)
         self.assertEqual(len(store.changed), 4)
         for identity in ('2', '3', '4'):
             point = store.db.execute('SELECT size,status FROM points WHERE id=? ORDER BY observed_ns DESC LIMIT 1',

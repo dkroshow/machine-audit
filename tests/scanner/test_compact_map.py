@@ -266,7 +266,7 @@ class CompactMapTests(unittest.TestCase):
         self.store.flush();before=self.store.db.total_changes
         self.store.finish_volume(self.volume,Blocks(),[],full=False,lean=True)
         self.assertLess(self.store.db.total_changes-before,150)
-        self.assertEqual(self.store.db.execute('SELECT count(*) FROM files').fetchone()[0],951)
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM files WHERE generation=?',(published,)).fetchone()[0],951)
         self.assertEqual(self.store.generation,published)
         with self.assertRaisesRegex(ValueError,'stale_or_incompatible'):
             query.query('children',limit=2,cursor=cursor)

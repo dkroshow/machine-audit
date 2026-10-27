@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS volumes(
  key INTEGER PRIMARY KEY,id TEXT NOT NULL UNIQUE,label TEXT NOT NULL,mount TEXT NOT NULL,generation INTEGER,
  observed_ns INTEGER,full_ns INTEGER,volume_used INTEGER,capacity INTEGER,free INTEGER,available INTEGER,
  valid INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL,lean INTEGER NOT NULL,bookmark INTEGER,
- no_progress INTEGER NOT NULL DEFAULT 0,event_uuid TEXT,gaps TEXT NOT NULL DEFAULT '[]',mounted INTEGER NOT NULL DEFAULT 1,full_attempt_ns INTEGER);
+ no_progress INTEGER NOT NULL DEFAULT 0,event_uuid TEXT,gaps TEXT NOT NULL DEFAULT '[]',mounted INTEGER NOT NULL DEFAULT 1,full_attempt_ns INTEGER,budget_retry_bytes INTEGER);
 CREATE TABLE IF NOT EXISTS nodes(
  generation INTEGER NOT NULL,volume INTEGER NOT NULL,id INTEGER NOT NULL,parent INTEGER,label TEXT,kind TEXT NOT NULL,
  own_listed INTEGER NOT NULL,own_uses INTEGER NOT NULL,listed INTEGER,uses INTEGER,status TEXT NOT NULL,mtime INTEGER,
@@ -69,7 +69,8 @@ CREATE TABLE IF NOT EXISTS hierarchy_epochs(
 CREATE TABLE IF NOT EXISTS hierarchy_nodes(
  volume TEXT NOT NULL,version TEXT NOT NULL,id TEXT NOT NULL,parent TEXT,label TEXT,present INTEGER NOT NULL,
  rank INTEGER NOT NULL,first_rank INTEGER NOT NULL,PRIMARY KEY(volume,version,rank),UNIQUE(volume,version,id)) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS dirty(volume TEXT,id TEXT,due_ns INTEGER,PRIMARY KEY(volume,id)) WITHOUT ROWID;
+-- recursive NULL is a deferral recorded before the flag existed: treated as recursive.
+CREATE TABLE IF NOT EXISTS dirty(volume TEXT,id TEXT,due_ns INTEGER,recursive INTEGER,PRIMARY KEY(volume,id)) WITHOUT ROWID;
 -- The last time a volume's root was refused, kept apart from its published map's times.
 CREATE TABLE IF NOT EXISTS denied(volume TEXT PRIMARY KEY,observed_ns INTEGER NOT NULL) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS runs(
@@ -131,9 +132,10 @@ class MapStore:
                 with self.write(rows=len(missing_columns)):
                     for column in sorted(missing_columns):
                         self.db.execute(f'ALTER TABLE runs ADD COLUMN {column} TEXT')
-            if 'full_attempt_ns' not in {r['name'] for r in self.db.execute('PRAGMA table_info(volumes)')}:
-                with self.write(rows=1):
-                    self.db.execute('ALTER TABLE volumes ADD COLUMN full_attempt_ns INTEGER')
+            for table,column in (('volumes','full_attempt_ns'),('volumes','budget_retry_bytes'),('dirty','recursive')):
+                if column not in {r['name'] for r in self.db.execute(f'PRAGMA table_info({table})')}:
+                    with self.write(rows=1):
+                        self.db.execute(f'ALTER TABLE {table} ADD COLUMN {column} INTEGER')
         except BaseException:
             if self.db is not None:self.db.close()
             raise
@@ -225,12 +227,16 @@ class MapStore:
                 key=','.join(r['name'] for r in columns if r['pk'])
                 # Cache spilling stays disabled. Bound deletions per commit,
                 # retaining the generation record so interrupted cleanup resumes.
+                # Each batch declares its actual rows: a small leftover must not
+                # reserve a full batch.
                 while True:
-                    with self.write(rows=4096):
-                        removed=self.db.execute(f'''DELETE FROM {table} WHERE ({key}) IN
-                            (SELECT {key} FROM {table} WHERE generation=? ORDER BY {key} LIMIT 4096)''',
-                            (generation,)).rowcount
-                    if removed<4096:break
+                    batch=self.db.execute(f'SELECT count(*) FROM (SELECT 1 FROM {table} WHERE generation=? LIMIT 4096)',
+                                          (generation,)).fetchone()[0]
+                    if not batch:break
+                    with self.write(rows=batch):
+                        self.db.execute(f'''DELETE FROM {table} WHERE ({key}) IN
+                            (SELECT {key} FROM {table} WHERE generation=? ORDER BY {key} LIMIT 4096)''',(generation,))
+                    if batch<4096:break
             with self.write(rows=1):
                 self.db.execute('DELETE FROM generations WHERE id=?',(generation,))
 
@@ -263,8 +269,12 @@ class MapStore:
         self._queue('INSERT OR REPLACE INTO listings VALUES(?,?,?,?,?)',
                     (self.generation,self.vid,inode_key(identity),time.time_ns(),count))
 
-    def defer(self,identity,due_ns):
-        with self.write(rows=1):self.db.execute('INSERT OR REPLACE INTO dirty VALUES(?,?,?)',(self.volume,identity,due_ns))
+    def defer(self,identity,due_ns,recursive):
+        # A pending refresh keeps its earliest due time and is never narrowed
+        # by a later shallow event.
+        with self.write(rows=1):self.db.execute('''INSERT INTO dirty VALUES(?,?,?,?) ON CONFLICT(volume,id) DO UPDATE SET
+            due_ns=min(due_ns,excluded.due_ns),recursive=max(coalesce(recursive,1),excluded.recursive)''',
+            (self.volume,identity,due_ns,int(recursive)))
 
     def directory(self,node):
         identity=inode_key(node.id)
@@ -553,37 +563,51 @@ class MapStore:
             self.flush()
 
     def _publication_changes(self):
-        """SQL and counted work for the one atomic switch of changed rows."""
+        """SQL and counted work for the one atomic switch of changed rows.
+
+        Only rows that differ reach the published generation. Each statement is
+        counted with its own predicate. Staged rows stay unpublished for the
+        bounded prune of building generations."""
         plan=[]
         def remove(table,where,args):
             count,payload=self._row_size(table,where,args)
             plan.append((f'DELETE FROM {table} WHERE {where}',args,count,payload))
+        def same(table):
+            # The other generation's row with this primary key and equal values.
+            columns=list(self.db.execute(f'PRAGMA table_info({table})'))[1:]
+            match=' AND '.join(f'o.{c["name"]}{"=" if c["pk"] else " IS "}{table}.{c["name"]}' for c in columns)
+            return f'EXISTS(SELECT 1 FROM {table} o WHERE o.generation=? AND {match})'
+        def kept(table):
+            # Staged rows under a removed identity are never published. The
+            # identity is part of each primary key, so both generations agree.
+            key={'nodes':'id','files':'parent','holders':'dir','listings':'id','charges':'stream'}[table]
+            removed='removed_charges' if table=='charges' else 'removed'
+            return f'{table}.{key} NOT IN (SELECT id FROM {removed} WHERE generation=? AND volume=?)'
         # Only a committed listing fulfills a deferred refresh. Probe its
         # primary key from the small dirty set, never scan the complete map.
         remove('dirty','''volume=? AND EXISTS(SELECT 1 FROM listings l
             WHERE l.generation=? AND l.volume=? AND l.id=inode_key(dirty.id))''',
             (self.volume,self.generation,self.vid))
         if self.base_gen is None:return plan
+        stage=(self.generation,self.vid)
+        # A base row survives a reset when its staged copy is identical.
         for table,key in (('files','parent'),('holders','dir')):
             remove(table,f'''generation=? AND volume=? AND {key} IN
-                (SELECT id FROM reset_dirs WHERE generation=? AND volume=? UNION SELECT id FROM removed WHERE generation=? AND volume=?)''',
-                (self.base_gen,self.vid,self.generation,self.vid,self.generation,self.vid))
+                (SELECT id FROM reset_dirs WHERE generation=? AND volume=? UNION SELECT id FROM removed WHERE generation=? AND volume=?)
+                AND NOT ({kept(table)} AND {same(table)})''',
+                (self.base_gen,self.vid,*stage,*stage,*stage,self.generation))
         for table,key in (('nodes','id'),('listings','id'),('charges','stream')):
             removed='removed_charges' if table=='charges' else 'removed'
             remove(table,f'generation=? AND volume=? AND {key} IN (SELECT id FROM {removed} WHERE generation=? AND volume=?)',
-                (self.base_gen,self.vid,self.generation,self.vid))
+                (self.base_gen,self.vid,*stage))
         for table in MAP_TABLES:
-            key={'nodes':'id','files':'parent','holders':'dir','listings':'id','charges':'stream'}[table]
-            removed='removed_charges' if table=='charges' else 'removed'
-            remove(table,f'generation=? AND volume=? AND {key} IN (SELECT id FROM {removed} WHERE generation=? AND volume=?)',
-                            (self.generation,self.vid,self.generation,self.vid))
-            columns=[r[1] for r in self.db.execute(f'PRAGMA table_info({table})')]
-            names=','.join(columns[1:])
-            count,payload=self._row_size(table,'generation=? AND volume=?',(self.generation,self.vid))
+            names=','.join(r[1] for r in list(self.db.execute(f'PRAGMA table_info({table})'))[1:])
+            where=f'generation=? AND volume=? AND {kept(table)} AND NOT {same(table)}'
+            args=(*stage,*stage,self.base_gen)
+            count,payload=self._row_size(table,where,args)
             # REPLACE can delete a prior row as well as insert its replacement.
-            plan.append((f'INSERT OR REPLACE INTO {table} SELECT ?,{names} FROM {table} WHERE generation=? AND volume=?',
-                         (self.base_gen,self.generation,self.vid),2*count,2*payload))
-            remove(table,'generation=? AND volume=?',(self.generation,self.vid))
+            plan.append((f'INSERT OR REPLACE INTO {table} SELECT ?,{names} FROM {table} WHERE {where}',
+                         (self.base_gen,*args),2*count,2*payload))
         return plan
 
     def finish_volume(self,volume,blocks,gaps,*,full,lean,bookmark=None,event_uuid=None,complete=True,physical=True,event_progress=None):
@@ -628,8 +652,6 @@ class MapStore:
             WHERE t.volume=?''',(self.volume,)).fetchone()[0]*2
         gap_text=json.dumps(sorted(set(gaps)))
         payload+=len((volume.label+volume.mount+gap_text+(event_uuid or '')).encode())
-        if self.base_gen is not None:
-            rows+=sum(self._row_size(table,'generation=?',(self.generation,))[0] for table in STAGE_TABLES)
         no_progress=0 if full or event_progress is True else old['no_progress']+1 if event_progress is False else old['no_progress']
         self.phase('publication')
         with self.write(rows=rows,payload_bytes=payload):
@@ -639,16 +661,13 @@ class MapStore:
             self._points(published,now,result['valid'],full)
             save_hierarchy(self.db,published,self.volume,now,volume_key=self.vid)
             self.db.execute('''UPDATE volumes SET label=?,mount=?,generation=?,observed_ns=?,full_ns=?,volume_used=?,capacity=?,free=?,available=?,
-                valid=?,status=?,lean=?,bookmark=?,no_progress=?,event_uuid=?,gaps=?,mounted=1 WHERE id=?''',
+                valid=?,status=?,lean=?,bookmark=?,no_progress=?,event_uuid=?,gaps=?,mounted=1,budget_retry_bytes=NULL WHERE id=?''',
                 (volume.label,volume.mount,published,now,now if full else old['full_ns'],volume.used,volume.capacity,volume.free,volume.available,
                  int(result['valid']),result['status'],int(lean),bookmark,no_progress,
                  event_uuid,gap_text,self.volume))
             if full and old['generation'] is not None:
                 self.db.execute("UPDATE generations SET status='retired' WHERE id=?",(old['generation'],))
             self.db.execute("UPDATE generations SET status='published' WHERE id=?",(published,))
-            if self.base_gen is not None:
-                for table in STAGE_TABLES:self.db.execute(f'DELETE FROM {table} WHERE generation=?',(self.generation,))
-                self.db.execute('DELETE FROM generations WHERE id=?',(self.generation,))
         self.generation=published;self.base_gen=None
         return result
 
@@ -678,13 +697,13 @@ class MapStore:
                 if last and (last['size'] is not None or last['status']!='not_observed'):
                     self.db.execute('INSERT INTO points VALUES(?,?,?,?,?,?,?)',(self.volume,tracked['id'],now,last['label'],metric,None,'not_observed'))
 
-    def mark_failed(self,status,*,end_run=True):
+    def mark_failed(self,status,*,end_run=True,retry_bytes=None):
         self.buffer.clear();self.buffer_bytes=0;self.pending_resets.clear()
         # End the run before attempting a separate volume-status write. A
         # failure of that second admission must not leave the run "running".
         if end_run:self.progress(status=status)
         with self.write(rows=1,payload_bytes=len(status.encode())):
-            self.db.execute('UPDATE volumes SET status=? WHERE id=?',(status,self.volume))
+            self.db.execute('UPDATE volumes SET status=?,budget_retry_bytes=? WHERE id=?',(status,retry_bytes,self.volume))
 
     def close(self):self.db.close()
 

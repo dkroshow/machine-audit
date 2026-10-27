@@ -164,8 +164,8 @@ class RelistTests(unittest.TestCase):
         (self.tree/'kept').write_bytes(b'kept')
         self.baseline()
         identity=str(self.tree.stat().st_ino)
-        self.store.defer(identity,0)
-        self.store.defer('not-observed',0)
+        self.store.defer(identity,0,True)
+        self.store.defer('not-observed',0,True)
         walker=self.update(self.tree)
         def pending():
             return self.store.db.execute('SELECT id FROM dirty WHERE volume=? AND id=?',(self.volume.id,identity)).fetchall()
@@ -177,6 +177,42 @@ class RelistTests(unittest.TestCase):
         self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=False,lean=True)
         self.assertEqual(pending(),[])
         self.assertEqual(self.store.db.execute('SELECT id FROM dirty').fetchone()[0],'not-observed')
+
+    def test_deferred_large_folder_keeps_its_event_scope(self):
+        # Big Mac re-walked ~1M entries per attempt: a deferred large folder was
+        # always re-listed recursively when due, though its events were shallow.
+        big=self.tree/'big';(big/'sub').mkdir(parents=True)
+        for i in range(30):(big/'sub'/str(i)).write_bytes(b'x')
+        self.baseline()
+        identity=str(big.stat().st_ino)
+        with self.store.write(rows=1):
+            self.store.db.execute('UPDATE listings SET count=30000 WHERE id=inode_key(?)',(identity,))
+        self.assertEqual(self.update(big).entries,0)
+        def pending():
+            return tuple(self.store.db.execute('SELECT due_ns,recursive FROM dirty WHERE id=?',(identity,)).fetchone())
+        due,recursive=pending()
+        self.assertEqual(recursive,0)
+        # Merged deferrals keep the earliest due time and never narrow the scope.
+        self.store.defer(identity,due-5,False);self.assertEqual(pending(),(due-5,0))
+        self.store.defer(identity,due+5,True);self.assertEqual(pending(),(due-5,1))
+        self.store.defer(identity,due,False);self.assertEqual(pending(),(due-5,1))
+        with self.store.write(rows=1):self.store.db.execute('UPDATE dirty SET recursive=NULL')
+        self.store.defer(identity,due,False);self.assertEqual(pending(),(due-5,1))
+        (big/'new').mkdir();(big/'new'/'a').write_bytes(b'new');(big/'new'/'b').write_bytes(b'new')
+        for recursive,entries in ((0,4),(None,34)):
+            with self.subTest(recursive=recursive):
+                self.store.prepare(self.volume,full=False)
+                with self.store.write(rows=1):self.store.db.execute('UPDATE dirty SET recursive=?',(recursive,))
+                walker=Walker(self.volume,self.policy,self.store,Blocks())
+                self.assertTrue(relist(self.store,walker,self.policy,self.volume,due,[]))
+                # Shallow: the folder's two entries and the new folder's two files.
+                self.assertEqual(walker.entries,entries)
+                self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=False,lean=True)
+                self.assertEqual(self.store.db.execute('SELECT count(*) FROM files WHERE generation=?',
+                                                       (self.store.generation,)).fetchone()[0],32)
+                self.assertEqual(self.store.db.execute('SELECT count(*) FROM dirty').fetchone()[0],0)
+                with self.store.write(rows=1):
+                    self.store.db.execute('INSERT INTO dirty VALUES(?,?,?,0)',(self.volume.id,identity,due))
 
     def test_shallow_parent_keeps_private_child_without_copying_its_subtree(self):
         private=self.tree/'browser';(private/'inner').mkdir(parents=True)

@@ -239,7 +239,8 @@ complete map and its history available.
 
 Hourly updates stage changed directory listings, files and shared-block rows.
 Only changed folders and affected ancestors are recalculated, then applied in
-one publication transaction. Unchanged files are neither copied nor rewritten.
+one publication transaction. Unchanged files are neither copied nor rewritten,
+including those a re-listed folder staged again.
 Moves update both old and new ancestor chains. Retired full generations are
 reclaimed before the next full build, not by scanning the active map each hour.
 Sharing and ancestor totals commit only to the unpublished staging generation
@@ -373,6 +374,11 @@ Deferred folder refreshes leave `dirty` only when the matching staged listing
 publishes. Admission failure or transaction rollback keeps the refresh pending;
 unobserved folders are not cleared. Cleanup joins each dirty identity to the
 listing primary key and counts the deletions in the publication reservation.
+A deferral keeps its event's scope (`dirty.recursive`). Merged deferrals keep
+the earliest due time and are never narrowed by a later shallow event. A row
+recorded before the flag existed (null) counts as recursive. A due shallow
+folder is re-listed shallowly; new subfolders are still walked whole. Only a
+recursive or unknown root deferral forces a full walk (`deferred_root_due`).
 
 Failed-volume recovery: CLI `scan --full` retries a failed attempt even inside
 the daily cooldown. Persistent `scanner_full` retries at most daily from the
@@ -409,3 +415,32 @@ a self-parent. Each iteration now starts without an inode; failed metadata reads
 record the denied gap without inventing identity. Separate synthetic cloud,
 other-account and own-store exclusions publish without breaking ancestry. This
 does not prove which exception caused the historical Big Mac failure.
+
+### Scanner budget recovery
+
+A budget refusal ends only that volume's attempt. Its pending writes are
+dropped, the run continues with the other volumes, and the run row and
+`runs.volumes` record the code, stage and entries walked. The volume keeps its
+published map, points, hierarchy and bookmark. When the managed-storage cap
+refused the attempt (`managed_storage_limit` or `sqlite_checkpoint_headroom`),
+the next attempt for that volume is one full walk, trigger `budget_recovery`.
+That walk prunes retired generations first and publishes by a small counted
+pointer switch. If the cap refuses that full walk too, the volume waits
+(trigger `budget_retry_gate`). It waits until managed bytes plus uncheckpointed
+WAL fall to `volumes.budget_retry_bytes`. That level comes from the refusal's
+own admission snapshot: there the same peak would have fit. A level of 0
+means it cannot fit under the cap at all. The hourly schedule, the weekly full
+walk, the persistent `scanner_full` setting and a restart all wait. Only the
+operator's CLI `scan --full` retries regardless. A successful publication clears
+the level. Reader contention and the free-space margin keep their hourly retry.
+To resume a gated volume, free managed storage or run `scan --full`.
+
+Disposable regressions reproduce Big Mac's three causes with the real Budget:
+a re-listed folder's unchanged files refused at publication
+(`sqlite_checkpoint_headroom`), one refusal stopping every other volume, and a
+shallow deferral re-walked recursively. They also cover the retry level's
+arithmetic as a counted WAL disappears. At 1M synthetic files with 8% re-listed
+and one change per folder, publication declared 6,810 rows instead of 328,413.
+It wrote 10.2 MB of WAL instead of 33.6 MB, and process peak memory fell from 90 to
+49 MB. The 0.52 CPU seconds of staged-row deletion moved to the next
+preparation. These are synthetic measurements, not Big Mac's.

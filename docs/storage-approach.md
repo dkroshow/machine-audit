@@ -53,13 +53,20 @@ inserts are bounded at 8,192 operations or 2 MiB of arguments, charge writes at
 4,096 rows. Regressions measure their WAL frames against the declared allowance.
 This factor is a product transaction contract, not a general SQLite guarantee.
 Scanner sharing and ancestor totals are staged in counted batches. Before
-publication, the scanner counts the base rows to remove, staged rows to copy
-or delete, and upper bounds for point, hierarchy and metadata writes. Each
-replacement counts both deletion and insertion; variable payload is counted
-too. One reservation covers that counted transaction so map rows, original
-points, hierarchy and the volume pointer remain atomic. Its cost follows the
-changed rows, not unrelated retained history. A large update can still exceed
-available headroom; refusal preserves the prior published map.
+publication, the scanner counts the base rows to remove, the staged rows that
+differ from their published copies, and upper bounds for point, hierarchy and
+metadata writes. A staged row equal to its published row (null-safe, every
+column but the generation) is neither copied nor counted; the count and the
+statement share one predicate. Each replacement counts both deletion and
+insertion; variable payload is counted too. One reservation covers that
+counted transaction so map rows, original points, hierarchy and the volume
+pointer remain atomic. Staged rows are not deleted inside it: the generation
+stays unpublished and the next preparation prunes it in batches that declare
+their actual rows. Its cost follows the changed rows, not unrelated retained
+history or a re-listed folder's unchanged files. A large update can still
+exceed available headroom; refusal preserves the prior published map, and the
+scanner recovers by one full walk (see
+[source validation](source-validation.md#scanner-budget-recovery)).
 An existing complete scanner schema needs no startup write. Schema creation
 counts its fixed metadata and any rows used to build missing indexes. The
 generic budget API retains the whole-database fallback for uncounted callers;
