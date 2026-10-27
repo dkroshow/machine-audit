@@ -154,10 +154,12 @@ class MapStore:
             except BaseException as exc:
                 if self.db.in_transaction:self.db.execute('ROLLBACK')
                 # The transaction ran out of the page limit the cap had shortened:
-                # storage pressure, not a failed write. Other errors stay as raised.
+                # storage pressure, not a failed write. How much it lacked is
+                # unknown, so the refusal carries no retry level. Other errors
+                # stay as raised.
                 if (getattr(exc,'sqlite_errorcode',None)==sqlite3.SQLITE_FULL and admitted['budget_limited']
                         and self.db.execute('PRAGMA max_page_count').fetchone()[0]==admitted['max_pages']):
-                    raise self.budget.page_limit_refusal() from None
+                    raise BudgetExceeded('sqlite_page_limit') from None
                 raise
 
     def _row_size(self,table,where='1',args=()):

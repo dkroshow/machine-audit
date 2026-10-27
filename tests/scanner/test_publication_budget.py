@@ -159,15 +159,12 @@ class PublicationBudgetTests(unittest.TestCase):
         store = MapStore(self.path, Budget(self.root, free_margin_bytes=0))
         self.addCleanup(store.close)
         with store.write(rows=1):store.db.execute('CREATE TABLE fill(value BLOB)')
-        filler = self.root/'synthetic-collector.sqlite';filler.write_bytes(bytes(4096))
         store.budget.limit_bytes = store.budget.usage()['bytes']+2*1024**2
         with self.assertRaisesRegex(BudgetExceeded, 'sqlite_page_limit') as refused:
             with store.write(rows=100_000):store.db.execute('INSERT INTO fill VALUES(zeroblob(?))', (4*1024**2,))
         self.assertEqual(store.db.execute('SELECT count(*) FROM fill').fetchone()[0], 0)
-        self.assertIsNone(refused.exception.shortfall_bytes, 'the missing amount is unknown')
-        self.assertFalse(store.budget.retry_level_reached(refused.exception.retry_bytes))
-        filler.unlink()
-        self.assertTrue(store.budget.retry_level_reached(refused.exception.retry_bytes))
+        # How much it lacked is unknown: no invented shortfall or retry level.
+        self.assertEqual((refused.exception.shortfall_bytes, refused.exception.retry_bytes), (None, None))
         # Running past pages the writer declared itself is a contract error, not pressure.
         store.budget.limit_bytes = 10**10
         with self.assertRaisesRegex(sqlite3.OperationalError, 'full'):

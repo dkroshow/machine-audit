@@ -434,14 +434,16 @@ pointer switch. If the cap refuses that full walk too, the volume waits
 (trigger `budget_retry_gate`). It waits until managed bytes plus uncheckpointed
 WAL fall to `volumes.budget_retry_bytes`. That level comes from the refusal's
 own admission snapshot: there the same peak would have fit. A level of 0
-means it cannot fit under the cap at all. For `sqlite_page_limit` the missing
-amount is unknown, so its level asks only that storage fall below where it
-was. A held volume makes the run `partial`, or its blocked status when nothing
-else published; it never reports success. The hourly schedule, the weekly full
+means it cannot fit under the cap at all. A `sqlite_page_limit` refusal cannot
+say how much storage it lacked, so it stores no level, and a full walk it
+refused waits until the operator forces a scan. A held volume makes the run
+`partial`, or its blocked status when nothing else published, whichever wait
+held it; it never reports success. The hourly schedule, the weekly full
 walk, the persistent `scanner_full` setting and a restart all wait. Only the
 operator's CLI `scan --full` retries regardless. A successful publication clears
 the level. Reader contention and the free-space margin keep their hourly retry.
-To resume a gated volume, free managed storage or run `scan --full`.
+To resume a gated volume, free managed storage down to its level, or run
+`scan --full`, the only resume when no level is stored.
 The store gains nullable `volumes.budget_retry_bytes` and `dirty.recursive` on
 first open. A release before them inserted `dirty` rows positionally and fails
 on a migrated store; rolling back needs a release that names `dirty`'s columns,

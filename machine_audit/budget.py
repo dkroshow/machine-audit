@@ -97,17 +97,6 @@ class Budget:
         usage = self.usage()
         return usage['bytes'] + usage['checkpoint_reservation_bytes'] <= retry_bytes
 
-    def page_limit_refusal(self) -> BudgetExceeded:
-        """The refusal for a transaction that ran out of a page limit the cap had
-        shortened. The missing amount is unknown, so its retry level asks only
-        that managed bytes plus uncheckpointed WAL fall below their level now,
-        without the reservation records that vanish when writers finish."""
-        refused = BudgetExceeded('sqlite_page_limit')
-        usage = self.usage()
-        records = sum(size for name, size in usage['parts'].items() if name.startswith('.budget-') and name.endswith('.claim'))
-        refused.retry_bytes = max(0, usage['bytes'] - records + usage['checkpoint_reservation_bytes'] - 1)
-        return refused
-
     @contextmanager
     def _guard(self):
         # Only admission metadata is protected here. Never execute SQLite or

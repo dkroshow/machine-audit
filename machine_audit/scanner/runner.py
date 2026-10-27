@@ -216,16 +216,18 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                 # The cap refused this volume's last attempt. An update gets one
                 # full walk: it prunes retired rows first and publishes by a small
                 # pointer switch. A refused full waits until managed storage falls
-                # to its retry level; only an operator's forced scan skips that.
-                if old and old['status'].removeprefix('budget_blocked_') in CAPACITY_REFUSALS and action!='wait':
+                # to its retry level, or, when the refusal could not say how much
+                # it lacked, for good; only an operator's forced scan skips that.
+                capacity=old and old['status'].removeprefix('budget_blocked_') in CAPACITY_REFUSALS
+                if capacity and action!='wait':
                     retry=old['budget_retry_bytes']
-                    if failed_full and not force and retry is not None and not budget.retry_level_reached(retry):
+                    if failed_full and not force and (retry is None or not budget.retry_level_reached(retry)):
                         action,trigger='wait','budget_retry_gate'
                     else:action,trigger='full','budget_recovery'
                 if action=='wait':
                     store.phase('complete',action=action,trigger=trigger)
                     status=old['status'] if trigger in ('failed_full_retry_cooldown','budget_retry_gate') else 'current'
-                    if trigger=='budget_retry_gate':  # Blocked, not up to date.
+                    if capacity:  # Blocked, not up to date, whichever wait held it.
                         root_failed=True;blocked=status
                     results.append({'volume_id':volume.id,'status':status,'action':action,'trigger':trigger})
                     continue

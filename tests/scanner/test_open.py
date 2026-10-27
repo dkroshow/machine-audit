@@ -303,29 +303,44 @@ class RootPublicationTests(unittest.TestCase):
             result, status = self.scan([second], events=events, full=False)
         self.assertEqual((result['volumes'][0]['trigger'], status), ('budget_retry_gate', blocked[0]))
 
-    def test_cap_shortened_page_limit_gates_a_full_walk_until_storage_falls(self):
-        # Running out of an admitted page limit was write_failed: ungated, so each
-        # scheduled run could repeat the full walk.
+    def test_full_walk_refused_by_an_unknown_page_shortfall_waits_for_an_operator(self):
+        # Running out of an admitted page limit was write_failed, then a one-byte
+        # retry level: every small collector prune repeated the same failing walk.
         filler = self.data/'synthetic-collector.sqlite'
         filler.write_bytes(bytes(1024**2))
         limit = Budget(self.data).usage()['bytes']+3*1024**2
+        walks = []
         def overflow(store, affected):
+            walks.append(1)
             with store.write(rows=100_000):
                 store.db.execute('CREATE TABLE fill(value BLOB)')
                 store.db.execute('INSERT INTO fill VALUES(zeroblob(?))', (8*1024**2,))
         before = self.published()
-        with patch.object(MapStore, '_aggregate_full', overflow), \
-             patch('machine_audit.scanner.runner.time.time_ns', return_value=8*86400*10**9):
-            result, status = self.scan([self.volume], full=False, limit=limit)
-        self.assertEqual((result['action'], status), ('full', 'budget_blocked_sqlite_page_limit'))
-        self.assertEqual(self.published()[1:6], before[1:6])
-        with patch('machine_audit.scanner.runner.time.time_ns', return_value=9*86400*10**9):
-            result, status = self.scan([self.volume], full=False, limit=limit)
-        self.assertEqual((result['volumes'][0]['trigger'], status), ('budget_retry_gate', 'budget_blocked_sqlite_page_limit'))
-        filler.unlink()  # Synthetic file created by this test.
-        with patch('machine_audit.scanner.runner.time.time_ns', return_value=9*86400*10**9+1):
-            result, status = self.scan([self.volume], full=False, limit=limit)
-        self.assertEqual((result['volumes'][0]['trigger'], status), ('budget_recovery', 'complete'))
+        day, hour = 86400*10**9, 3600*10**9
+        def scan(now, **kwargs):
+            with patch('machine_audit.scanner.runner.time.time_ns', return_value=now):
+                result, status = self.scan([self.volume], limit=limit, **{'full':False, **kwargs})
+            return result['volumes'][0]['trigger'], status, result['status']
+        blocked = 'budget_blocked_sqlite_page_limit'
+        with patch.object(MapStore, '_aggregate_full', overflow):
+            self.assertEqual(scan(8*day), ('weekly_full', blocked, blocked))
+            self.assertEqual(self.published()[1:6], before[1:6])
+            # Each run is a fresh process. Hourly, persistent full inside and
+            # after its daily cooldown, and small freed space all keep waiting
+            # and never report success.
+            for now, full, trigger in ((8*day+hour, False, 'budget_retry_gate'),
+                                       (8*day+2*hour, True, 'failed_full_retry_cooldown'),
+                                       (9*day+3*hour, True, 'budget_retry_gate'),
+                                       (9*day+4*hour, False, 'budget_retry_gate')):
+                with open(filler, 'r+b') as file:file.truncate(filler.stat().st_size-64*1024)
+                self.assertEqual(scan(now, full=full), (trigger, blocked, blocked))
+            self.assertEqual(len(walks), 1)
+            self.assertEqual(scan(9*day+5*hour, force=True), ('budget_recovery', blocked, blocked))
+            self.assertEqual(len(walks), 2)
+        self.assertEqual(scan(9*day+6*hour, force=True)[1:], ('complete', 'observed'))
+        events = SimpleNamespace(uuid=lambda device:'events', current_id=lambda:30,
+                                 replay=lambda device,since:Replay(up_to=30))
+        self.assertEqual(scan(10*day+7*hour, events=events), ('hourly_update', 'complete', 'observed'))
 
     def test_specific_invariant_and_chosen_action_survive_a_failed_run(self):
         def fail_aggregate(store, affected):
