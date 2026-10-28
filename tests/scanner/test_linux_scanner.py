@@ -10,11 +10,11 @@ import time
 import unittest
 from unittest.mock import patch
 
-from machine_audit.budget import Budget
+from machine_audit.budget import Budget, BudgetExceeded
 from machine_audit.scanner.accounting import Blocks
 from machine_audit.scanner.linux import run_scan
 from machine_audit.scanner.native import Volume
-from machine_audit.scanner.store import MapQuery, MapStore, hot_set
+from machine_audit.scanner.store import MapQuery, MapStore, MergePending, hot_set
 from machine_audit.scanner.walker import Node
 from machine_audit.sources.linux.watcher import (DIRTY, IN_CREATE, IN_DELETE_SELF, IN_IGNORED, IN_Q_OVERFLOW,
                                                  changes, record_dirty)
@@ -145,6 +145,15 @@ class LinuxScannerTests(unittest.TestCase):
         self.assertEqual(dirty.stat().st_mode & 0o777, 0o600)
         self.assertIsNone(re.search(r'[A-Za-z/]', dirty.read_text().replace('version', '').replace('volumes', '')
                                     .replace(volume, '')))  # numbers only: no names reach the file
+        # A volume still merging a published delta is not scanned, and its watched
+        # change stays queued instead of being consumed unseen.
+        held = {volume: MergePending(BudgetExceeded('managed_storage_limit'))}
+        with patch.object(MapStore, 'finish_merges', return_value=held):
+            run = self.scan()
+        result = run['volumes'][0]
+        self.assertEqual((run['status'], result['action'], result['trigger'], result['merge']),
+                         ('partial', 'wait', 'merge_pending', 'blocked_managed_storage_limit'))
+        self.assertTrue(list(self.data.glob(DIRTY + '*')))
         result = self.scan()['volumes'][0]
         self.assertEqual((result['action'], result['entries']), ('update', 2))  # a/file and a/new only
         query = MapQuery(self.data / 'scanner.sqlite')

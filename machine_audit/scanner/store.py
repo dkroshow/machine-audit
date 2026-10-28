@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS volumes(
  key INTEGER PRIMARY KEY,id TEXT NOT NULL UNIQUE,label TEXT NOT NULL,mount TEXT NOT NULL,generation INTEGER,
  observed_ns INTEGER,full_ns INTEGER,volume_used INTEGER,capacity INTEGER,free INTEGER,available INTEGER,
  valid INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL,lean INTEGER NOT NULL,bookmark INTEGER,
- no_progress INTEGER NOT NULL DEFAULT 0,event_uuid TEXT,gaps TEXT NOT NULL DEFAULT '[]',mounted INTEGER NOT NULL DEFAULT 1,full_attempt_ns INTEGER,budget_retry_bytes INTEGER);
+ no_progress INTEGER NOT NULL DEFAULT 0,event_uuid TEXT,gaps TEXT NOT NULL DEFAULT '[]',mounted INTEGER NOT NULL DEFAULT 1,full_attempt_ns INTEGER,budget_retry_bytes INTEGER,delta_generation INTEGER);
 CREATE TABLE IF NOT EXISTS nodes(
  generation INTEGER NOT NULL,volume INTEGER NOT NULL,id INTEGER NOT NULL,parent INTEGER,label TEXT,kind TEXT NOT NULL,
  own_listed INTEGER NOT NULL,own_uses INTEGER NOT NULL,listed INTEGER,uses INTEGER,status TEXT NOT NULL,mtime INTEGER,
@@ -82,6 +82,37 @@ CREATE TABLE IF NOT EXISTS runs(
 MAP_TABLES=('nodes','files','holders','charges','listings')
 STAGE_TABLES=('removed','reset_dirs','removed_charges')
 MAX_ANCESTRY=1024
+KEYS={'nodes':'id','files':'parent','holders':'dir','listings':'id','charges':'stream'}
+PRIMARY={'nodes':('id',),'files':('parent','id'),'holders':('dir','file_id'),'listings':('id',),'charges':('stream',)}
+MERGE_ROWS=4096
+# Format 3 adds a published delta. A reader of format 2 only would read a base
+# generation a merge has partly updated, so it refuses format 3.
+FORMATS=(2,3)
+
+
+def published(table,alias,base,volume,delta):
+    """SQL condition: row `alias` of `table` is in its volume's published map, base
+    generation `base` overlaid by published delta generation `delta` (NULL for none).
+    These are exactly the rows a merge leaves in the base: delta rows not removed, and
+    base rows that no delta row replaces, not removed and, for files and holders, not
+    under a re-listed directory. The arguments are SQL expressions."""
+    key=KEYS[table]
+    def marked(marker):
+        return f'EXISTS(SELECT 1 FROM {marker} m WHERE m.generation={delta} AND m.volume={volume} AND m.id={alias}.{key})'
+    removed=marked('removed_charges' if table=='charges' else 'removed')
+    hidden=removed+(' OR '+marked('reset_dirs') if table in ('files','holders') else '')
+    same=' AND '.join(f'o.{c}={alias}.{c}' for c in PRIMARY[table])
+    return (f'(({alias}.generation={delta} AND NOT {removed}) OR ({alias}.generation={base} AND NOT ({hidden})'
+            f' AND NOT EXISTS(SELECT 1 FROM {table} o WHERE o.generation={delta} AND o.volume={volume} AND {same})))')
+
+
+class MergePending(RuntimeError):
+    """The update is published, but merging its delta into the base did not finish.
+    The delta stays published; the next run merges it before any scan."""
+    def __init__(self,cause):
+        code=(f'blocked_{cause.code}' if isinstance(cause,BudgetExceeded) else
+              getattr(cause,'sqlite_errorname','sqlite_error').lower() if isinstance(cause,sqlite3.Error) else type(cause).__name__)
+        super().__init__(code);self.code=code
 
 
 class MapStore:
@@ -99,7 +130,7 @@ class MapStore:
                 self.db=sqlite3.connect(self.path,isolation_level=None,timeout=5)
                 self.db.row_factory=sqlite3.Row
                 existing=self.db.execute("SELECT 1 FROM sqlite_master WHERE name='volumes'").fetchone()
-                if existing and self.db.execute('PRAGMA user_version').fetchone()[0]!=2:
+                if existing and self.db.execute('PRAGMA user_version').fetchone()[0] not in FORMATS:
                     raise ValueError('scanner_format_requires_fresh_store')
                 os.chmod(self.path,0o600)
                 self.db.execute('PRAGMA journal_mode=WAL')
@@ -123,7 +154,7 @@ class MapStore:
                 with self.write(rows=rows,payload_bytes=payload):
                     for statement in SCHEMA.split(';'):
                         if statement.strip():self.db.execute(statement)
-                    self.db.execute('PRAGMA user_version=2')
+                    if not existing:self.db.execute('PRAGMA user_version=3')
             # Nullable diagnostic columns extend format 2 without rewriting map
             # rows or changing old observations. Each ALTER is metadata only.
             columns={r['name'] for r in self.db.execute('PRAGMA table_info(runs)')}
@@ -136,6 +167,11 @@ class MapStore:
                 if column not in {r['name'] for r in self.db.execute(f'PRAGMA table_info({table})')}:
                     with self.write(rows=1):
                         self.db.execute(f'ALTER TABLE {table} ADD COLUMN {column} INTEGER')
+            # Format 3 is the delta column: both commit together, or neither does.
+            if 'delta_generation' not in {r['name'] for r in self.db.execute('PRAGMA table_info(volumes)')}:
+                with self.write(rows=2):
+                    self.db.execute('ALTER TABLE volumes ADD COLUMN delta_generation INTEGER')
+                    self.db.execute('PRAGMA user_version=3')
         except BaseException:
             if self.db is not None:self.db.close()
             raise
@@ -211,6 +247,8 @@ class MapStore:
 
     def prepare(self,volume,full=True,lean=True):
         self.flush()
+        pending=self.db.execute('SELECT delta_generation FROM volumes WHERE id=?',(volume.id,)).fetchone()
+        if pending and pending[0] is not None:raise ValueError('merge_pending')
         # This attempt owns any failure from here on, including a refused prune,
         # and a full attempt is recorded before the cleanup that can refuse it.
         self.volume,self.generation,self.base_gen=volume.id,None,None
@@ -575,55 +613,15 @@ class MapStore:
             self.flush()
 
     def _publication_changes(self):
-        """SQL and counted work for the one atomic switch of changed rows.
-
-        Only rows that differ reach the published generation. Each statement is
-        counted with its own predicate. Staged rows stay unpublished for the
-        bounded prune of building generations."""
-        plan=[]
-        def remove(label,table,where,args):
-            count,payload=self._row_size(table,where,args)
-            plan.append((f'DELETE FROM {table} WHERE {where}',args,count,payload,label))
-        def same(table):
-            # The other generation's row with this primary key and equal values.
-            columns=list(self.db.execute(f'PRAGMA table_info({table})'))[1:]
-            match=' AND '.join(f'o.{c["name"]}{"=" if c["pk"] else " IS "}{table}.{c["name"]}' for c in columns)
-            return f'EXISTS(SELECT 1 FROM {table} o WHERE o.generation=? AND {match})'
-        def kept(table):
-            # Staged rows under a removed identity are never published. The
-            # identity is part of each primary key, so both generations agree.
-            key={'nodes':'id','files':'parent','holders':'dir','listings':'id','charges':'stream'}[table]
-            removed='removed_charges' if table=='charges' else 'removed'
-            return f'{table}.{key} NOT IN (SELECT id FROM {removed} WHERE generation=? AND volume=?)'
+        """The publication's own map statement: the deferred refreshes its listings
+        fulfil, counted. Map rows reach the base through the bounded merge."""
         # Only a committed listing fulfills a deferred refresh. Probe its
         # primary key from the small dirty set, never scan the complete map.
-        remove('dirty','dirty','''volume=? AND EXISTS(SELECT 1 FROM listings l
-            WHERE l.generation=? AND l.volume=? AND l.id=inode_key(dirty.id))''',
-            (self.volume,self.generation,self.vid))
-        if self.base_gen is None:return plan
-        stage=(self.generation,self.vid)
-        # A base row survives a reset when its staged copy is identical.
-        for table,key in (('files','parent'),('holders','dir')):
-            remove(f'base_{table}_reset',table,f'''generation=? AND volume=? AND {key} IN
-                (SELECT id FROM reset_dirs WHERE generation=? AND volume=? UNION SELECT id FROM removed WHERE generation=? AND volume=?)
-                AND NOT ({kept(table)} AND {same(table)})''',
-                (self.base_gen,self.vid,*stage,*stage,*stage,self.generation))
-        for table,key in (('nodes','id'),('listings','id'),('charges','stream')):
-            removed='removed_charges' if table=='charges' else 'removed'
-            remove(f'base_{table}_removed',table,f'generation=? AND volume=? AND {key} IN (SELECT id FROM {removed} WHERE generation=? AND volume=?)',
-                (self.base_gen,self.vid,*stage))
-        for table in MAP_TABLES:
-            columns=list(self.db.execute(f'PRAGMA table_info({table})'))
-            names=','.join(c['name'] for c in columns[1:])
-            keys=','.join(c['name'] for c in sorted(columns,key=lambda c:c['pk']) if c['pk'])
-            values=','.join(f"{c['name']}=excluded.{c['name']}" for c in columns if not c['pk'])
-            where=f'generation=? AND volume=? AND {kept(table)} AND NOT {same(table)}'
-            args=(*stage,*stage,self.base_gen)
-            count,payload=self._row_size(table,where,args)
-            # One mutation a row: a new row is inserted, a published one updated in place.
-            plan.append((f'INSERT INTO {table} SELECT ?,{names} FROM {table} WHERE {where} ON CONFLICT({keys}) DO UPDATE SET {values}',
-                         (self.base_gen,*args),count,payload,f'copy_{table}'))
-        return plan
+        where='''volume=? AND EXISTS(SELECT 1 FROM listings l
+            WHERE l.generation=? AND l.volume=? AND l.id=inode_key(dirty.id))'''
+        args=(self.volume,self.generation,self.vid)
+        count,payload=self._row_size('dirty',where,args)
+        return [(f'DELETE FROM dirty WHERE {where}',args,count,payload,'dirty')]
 
     def finish_volume(self,volume,blocks,gaps,*,full,lean,bookmark=None,event_uuid=None,complete=True,physical=True,event_progress=None):
         self.flush();old=self.db.execute('SELECT * FROM volumes WHERE id=?',(self.volume,)).fetchone()
@@ -654,14 +652,15 @@ class MapStore:
         candidates,payload=self._row_size('nodes',where,params)
         # An update writes points only for the changed rows _points writes for, and
         # only tracked rows join the hierarchy, so the new ones are among them.
-        point_candidates=candidates if full else sum(
-            1 for key in self.changed if (node:=self._node(key)) is not None and self._last_point(node,metric)[1])
+        point_candidates=candidates if full else sum(1 for key in self.changed if (
+            node:=self._published_node(key,self.base_gen,self.generation)) is not None and self._last_point(node,metric)[1])
         hierarchy_candidates=candidates if full else point_candidates
         tracked,tracked_payload=self._row_size('tracked','volume=?',(self.volume,))
         # Points also visit removed identities absent from the staged nodes.
         # Reserve two writes per candidate and a terminal point per old identity.
-        # Hierarchy: at most old+new identities, plus one epoch.
-        rows=sum(p[2] for p in plan)+2*point_candidates+hierarchy_candidates+2*tracked+5
+        # Hierarchy: at most old+new identities, plus one epoch. An update also marks
+        # its staged generation as the published delta.
+        rows=sum(p[2] for p in plan)+2*point_candidates+hierarchy_candidates+2*tracked+5+(self.base_gen is not None)
         payload=3*payload+3*tracked_payload+sum(p[3] for p in plan)
         payload+=(candidates+tracked)*(len(self.volume.encode())+64)  # volume and hierarchy version
         payload+=self.db.execute('''SELECT coalesce(sum(length(CAST(p.label AS BLOB))),0)
@@ -682,30 +681,137 @@ class MapStore:
         try:
             with self.write(rows=rows,payload_bytes=payload):
                 for sql,args,_,_,_ in plan:self.db.execute(sql,args)
-                published=self.base_gen if self.base_gen is not None else self.generation
+                # An update publishes its staged generation as a delta over the base.
+                published,delta=(self.generation,None) if self.base_gen is None else (self.base_gen,self.generation)
                 now=time.time_ns()
-                self._points(published,now,result['valid'],full)
-                save_hierarchy(self.db,published,self.volume,now,volume_key=self.vid)
+                self._points(published,now,result['valid'],full,delta)
+                save_hierarchy(self.db,published,self.volume,now,volume_key=self.vid,delta=delta)
                 self.db.execute('''UPDATE volumes SET label=?,mount=?,generation=?,observed_ns=?,full_ns=?,volume_used=?,capacity=?,free=?,available=?,
-                    valid=?,status=?,lean=?,bookmark=?,no_progress=?,event_uuid=?,gaps=?,mounted=1,budget_retry_bytes=NULL WHERE id=?''',
+                    valid=?,status=?,lean=?,bookmark=?,no_progress=?,event_uuid=?,gaps=?,mounted=1,budget_retry_bytes=NULL,delta_generation=? WHERE id=?''',
                     (volume.label,volume.mount,published,now,now if full else old['full_ns'],volume.used,volume.capacity,volume.free,volume.available,
                      int(result['valid']),result['status'],int(lean),bookmark,no_progress,
-                     event_uuid,gap_text,self.volume))
+                     event_uuid,gap_text,delta,self.volume))
                 if full and old['generation'] is not None:
                     self.db.execute("UPDATE generations SET status='retired' WHERE id=?",(old['generation'],))
                 self.db.execute("UPDATE generations SET status='published' WHERE id=?",(published,))
+                if delta is not None:self.db.execute("UPDATE generations SET status='delta' WHERE id=?",(delta,))
         except BudgetExceeded as exc:
             exc.publication=dict(receipt,shortfall_bytes=exc.shortfall_bytes);raise
         self.generation=published;self.base_gen=None
+        if delta is not None:
+            try:self.merge_delta(self.volume)
+            except Exception as exc:raise MergePending(exc) from exc
         return result
 
-    def _points(self,generation,now,valid,full):
+    def _published_node(self,key,base,delta):
+        """A directory's row in this volume's published map: the base overlaid by `delta`."""
+        return self.db.execute(f'''SELECT * FROM nodes n WHERE n.generation IN (:g,:d) AND n.volume=:v AND n.id=:id
+            AND {published('nodes','n',':g',':v',':d')}''',dict(g=base,d=delta,v=self.vid,id=key)).fetchone()
+
+    def finish_merges(self):
+        """Merge every published delta, before any scan this run. Returns, by volume id,
+        a MergePending for each delta still pending."""
+        pending={}
+        for volume_id, in self.db.execute('SELECT id FROM volumes WHERE delta_generation IS NOT NULL').fetchall():
+            try:self.merge_delta(volume_id)
+            except Exception as exc:pending[volume_id]=MergePending(exc)
+        return pending
+
+    def merge_delta(self,volume_id):
+        """Apply a volume's published delta to its base in bounded batches, then clear it.
+
+        The delta still overlays every row a batch writes, so each committed batch leaves
+        the published map as it was. The work is the base rows the delta replaces or hides,
+        plus the delta itself. A refusal or crash keeps the delta; merging again resumes."""
+        row=self.db.execute('SELECT key,generation,delta_generation FROM volumes WHERE id=?',(volume_id,)).fetchone()
+        if row is None or row['delta_generation'] is None:return
+        self.phase('merge')
+        names=dict(g=row['generation'],v=row['key'],d=row['delta_generation'])
+        for table in MAP_TABLES:
+            self._merge_removals(table,names)
+            self._merge_rows(table,names)
+        with self.write(rows=2):
+            self.db.execute('UPDATE volumes SET delta_generation=NULL WHERE key=?',(names['v'],))
+            # The merged delta is only staging now, pruned like any other.
+            self.db.execute("UPDATE generations SET status='building' WHERE id=?",(names['d'],))
+
+    def _payload(self,table,alias):
+        columns=[r['name'] for r in self.db.execute(f'PRAGMA table_info({table})')]
+        return '+'.join(f"CASE WHEN typeof({alias}.{c}) IN ('text','blob') THEN length(CAST({alias}.{c} AS BLOB)) ELSE 0 END" for c in columns)
+
+    @staticmethod
+    def _chunks(rows):
+        batch=[]
+        for row in rows:
+            batch.append(row)
+            if len(batch)==MERGE_ROWS:yield batch;batch=[]
+        if batch:yield batch
+
+    def _merge_removals(self,table,names):
+        """Delete base rows the delta removes, or re-lists without a replacement. It walks
+        the delta's markers and, within each, the base rows by key, so a marker that hides
+        more than one batch keeps its place."""
+        key,primary=KEYS[table],PRIMARY[table]
+        markers=['removed_charges' if table=='charges' else 'removed']+(['reset_dirs'] if table in ('files','holders') else [])
+        # Each marker table's next id by its key; the smaller is the next marker.
+        first,following=(f"SELECT min(id) FROM ({' UNION ALL '.join(f'SELECT * FROM (SELECT id FROM {m} WHERE generation=:d AND volume=:v{bound} ORDER BY id LIMIT 1)' for m in markers)})"
+                         for bound in ('',' AND id>:after'))
+        within=primary[1:]
+        keys=','.join('b.'+c for c in primary)
+        replaced=' AND '.join(f'r.{c}=b.{c}' for c in primary)
+        def doomed():
+            marker=None
+            while (marker:=self.db.execute(following if marker is not None else first,dict(names,after=marker)).fetchone()[0]) is not None:
+                last=None
+                while True:
+                    seek=f" AND ({','.join('b.'+c for c in within)})>({','.join(':s'+str(i) for i in range(len(within)))})" if last else ''
+                    # A delta row with this key replaces the base row instead.
+                    rows=self.db.execute(f'''SELECT {keys},{self._payload(table,'b')} FROM {table} b
+                        WHERE b.generation=:g AND b.volume=:v AND b.{key}=:marker{seek}
+                        AND NOT EXISTS(SELECT 1 FROM {table} r WHERE r.generation=:d AND r.volume=:v AND {replaced}
+                            AND {published(table,'r',':g',':v',':d')})
+                        ORDER BY {keys} LIMIT :n''',dict(names,marker=marker,n=MERGE_ROWS,
+                        **{f's{i}':v for i,v in enumerate(last or ())})).fetchall()
+                    yield from rows
+                    if len(rows)<MERGE_ROWS or not within:break
+                    last=tuple(rows[-1])[1:len(primary)]
+        for batch in self._chunks(doomed()):
+            with self.write(rows=len(batch),payload_bytes=sum(r[-1] for r in batch)):
+                self.db.executemany(f'DELETE FROM {table} WHERE generation=? AND volume=? AND {" AND ".join(c+"=?" for c in primary)}',
+                                    ((names['g'],names['v'],*tuple(r)[:-1]) for r in batch))
+
+    def _merge_rows(self,table,names):
+        """Write the delta rows that differ into the base, one insert-or-update each,
+        walking the delta by primary key."""
+        columns=[r['name'] for r in self.db.execute(f'PRAGMA table_info({table})')]
+        primary=PRIMARY[table]
+        pk=('generation','volume',*primary)
+        keys=','.join('d.'+c for c in primary)
+        values=','.join(f'{c}=excluded.{c}' for c in columns if c not in pk)
+        same=' AND '.join(f'o.{c}{"=" if c in pk else " IS "}d.{c}' for c in columns[1:])
+        last=None
+        while True:
+            seek=f" AND ({keys})>({','.join(':s'+str(i) for i in range(len(primary)))})" if last else ''
+            found=self.db.execute(f'''SELECT {keys},{self._payload(table,'d')} FROM {table} d
+                WHERE d.generation=:d AND d.volume=:v AND {published(table,'d',':g',':v',':d')}{seek}
+                AND NOT EXISTS(SELECT 1 FROM {table} o WHERE o.generation=:g AND {same})
+                ORDER BY {keys} LIMIT :n''',dict(names,n=MERGE_ROWS,**{f's{i}':v for i,v in enumerate(last or ())})).fetchall()
+            if not found:return
+            with self.write(rows=len(found),payload_bytes=sum(r[-1] for r in found)):
+                self.db.executemany(f'''INSERT INTO {table} SELECT ?,{",".join(columns[1:])} FROM {table}
+                    WHERE generation=? AND volume=? AND {" AND ".join(c+"=?" for c in primary)}
+                    ON CONFLICT({",".join(pk)}) DO UPDATE SET {values}''',
+                    ((names['g'],names['d'],names['v'],*tuple(r)[:-1]) for r in found))
+            if len(found)<MERGE_ROWS:return
+            last=tuple(found[-1])[:-1]
+
+    def _points(self,generation,now,valid,full,delta=None):
         metric='uses' if valid else 'listed'
         if full:
             rows=self.db.execute(f'''SELECT * FROM nodes WHERE generation=? AND volume=? AND ({metric}>=1000000000 OR
                  EXISTS(SELECT 1 FROM tracked WHERE volume=? AND id=source_id(nodes.id)))''',(generation,self.vid,self.volume))
         else:
-            rows=(self.db.execute('SELECT * FROM nodes WHERE generation=? AND volume=? AND id=?',(generation,self.vid,k)).fetchone() for k in self.changed)
+            rows=(self._published_node(k,generation,delta) for k in self.changed)
         for row in rows:
             if row is None:continue
             identity=source_id(row['id'])
@@ -720,7 +826,7 @@ class MapStore:
             if not last or (last['size'],last['metric'],last['status'])!=(size,metric,status):
                 self.db.execute('INSERT INTO points VALUES(?,?,?,?,?,?,?)',(self.volume,identity,now,row['label'],metric,size,status))
         for tracked in self.db.execute('SELECT id FROM tracked WHERE volume=?',(self.volume,)):
-            if not self.db.execute('SELECT 1 FROM nodes WHERE generation=? AND volume=? AND id=?',(generation,self.vid,inode_key(tracked['id']))).fetchone():
+            if not self._published_node(inode_key(tracked['id']),generation,delta):
                 last=self.db.execute('SELECT * FROM points WHERE volume=? AND id=? ORDER BY observed_ns DESC LIMIT 1',(self.volume,tracked['id'])).fetchone()
                 if last and (last['size'] is not None or last['status']!='not_observed'):
                     self.db.execute('INSERT INTO points VALUES(?,?,?,?,?,?,?)',(self.volume,tracked['id'],now,last['label'],metric,None,'not_observed'))
@@ -737,6 +843,10 @@ class MapStore:
         # End the run before attempting a separate volume-status write. A
         # failure of that second admission must not leave the run "running".
         if end_run:self.progress(status=status)
+        # A published attempt stands, even if its write failed after commit: a later
+        # failure is the run's, not the map's.
+        if self.db.execute('SELECT 1 FROM volumes WHERE id=? AND ? IN (generation,delta_generation)',
+                           (self.volume,self.generation)).fetchone():return
         with self.write(rows=1,payload_bytes=len(status.encode())):
             self.db.execute('UPDATE volumes SET status=?,budget_retry_bytes=? WHERE id=?',(status,retry_bytes,self.volume))
 
@@ -764,25 +874,31 @@ def _encode_cursor(value):
     return base64.urlsafe_b64encode(json.dumps(value,separators=(',',':')).encode()).decode()
 
 
-HOT_SET=f'''
-WITH hot(volume_id,vkey,generation,mount,id,size) AS (
-  SELECT v.id,v.key,v.generation,v.mount,n.id,n.listed FROM volumes v
-  JOIN nodes n ON n.generation=v.generation AND n.volume=v.key
-  WHERE v.mounted=1 AND n.kind='directory' AND n.listed>=1000000000
+def hot_set_query(delta):
+    """The hot set over each volume's published map; `delta` is the volumes row's delta
+    column, or NULL for a format-2 store that has none."""
+    def visible(table,alias,source):
+        return published(table,alias,f'{source}.generation',f'{source}.vkey' if source!='v' else 'v.key',f'{source}.delta')
+    return f'''
+WITH volume AS (SELECT id,key,generation,{delta} AS delta,mount,mounted FROM volumes),
+hot(volume_id,vkey,generation,delta,mount,id,size) AS (
+  SELECT v.id,v.key,v.generation,v.delta,v.mount,n.id,n.listed FROM volume v
+  JOIN nodes n ON n.generation IN (v.generation,v.delta) AND n.volume=v.key
+  WHERE v.mounted=1 AND n.kind='directory' AND n.listed>=1000000000 AND {visible('nodes','n','v')}
   UNION ALL
-  SELECT v.id,v.key,v.generation,v.mount,f.parent,f.allocated FROM volumes v
-  JOIN files f ON f.generation=v.generation AND f.volume=v.key
-  WHERE v.mounted=1 AND f.allocated>=100000000),
-top AS (SELECT volume_id,vkey,generation,mount,id,max(size) AS size FROM hot
+  SELECT v.id,v.key,v.generation,v.delta,v.mount,f.parent,f.allocated FROM volume v
+  JOIN files f ON f.generation IN (v.generation,v.delta) AND f.volume=v.key
+  WHERE v.mounted=1 AND f.allocated>=100000000 AND {visible('files','f','v')}),
+top AS (SELECT volume_id,vkey,generation,delta,mount,id,max(size) AS size FROM hot
   GROUP BY vkey,id ORDER BY size DESC LIMIT ?),
-chain(volume_id,generation,vkey,mount,size,start,start_parent,node,rel,depth) AS (
-  SELECT t.volume_id,t.generation,t.vkey,t.mount,t.size,t.id,n.parent,n.parent,
+chain(volume_id,generation,delta,vkey,mount,size,start,start_parent,node,rel,depth) AS (
+  SELECT t.volume_id,t.generation,t.delta,t.vkey,t.mount,t.size,t.id,n.parent,n.parent,
          CASE WHEN n.parent IS NULL THEN '' ELSE '/'||n.label END,0
-  FROM top t JOIN nodes n ON n.generation=t.generation AND n.volume=t.vkey AND n.id=t.id
+  FROM top t JOIN nodes n ON n.generation IN (t.generation,t.delta) AND n.volume=t.vkey AND n.id=t.id AND {visible('nodes','n','t')}
   UNION ALL
-  SELECT c.volume_id,c.generation,c.vkey,c.mount,c.size,c.start,c.start_parent,n.parent,
+  SELECT c.volume_id,c.generation,c.delta,c.vkey,c.mount,c.size,c.start,c.start_parent,n.parent,
          CASE WHEN n.parent IS NULL THEN c.rel ELSE '/'||n.label||c.rel END,c.depth+1
-  FROM chain c JOIN nodes n ON n.generation=c.generation AND n.volume=c.vkey AND n.id=c.node
+  FROM chain c JOIN nodes n ON n.generation IN (c.generation,c.delta) AND n.volume=c.vkey AND n.id=c.node AND {visible('nodes','n','c')}
   WHERE c.rel IS NOT NULL AND c.depth<{MAX_ANCESTRY})
 SELECT volume_id,start,start_parent,mount,rel FROM chain WHERE node IS NULL AND rel IS NOT NULL ORDER BY size DESC
 '''
@@ -795,9 +911,11 @@ def hot_set(path,limit):
     the read holds its WAL snapshot only while it runs."""
     db=sqlite3.connect(Path(path).as_uri()+'?mode=ro',uri=True,timeout=2)
     try:
-        if db.execute('PRAGMA user_version').fetchone()[0]!=2:
+        db.execute('BEGIN')  # The format and the map it selects are one snapshot.
+        version=db.execute('PRAGMA user_version').fetchone()[0]
+        if version not in FORMATS:
             raise ValueError('scanner_format_requires_fresh_store')
-        rows=db.execute(HOT_SET,(limit,)).fetchall()
+        rows=db.execute(hot_set_query('delta_generation' if version==3 else 'NULL'),(limit,)).fetchall()
     finally:
         db.close()
     return [(volume,source_id(folder),source_id(parent),os.path.normpath(mount+rel)) for volume,folder,parent,mount,rel in rows]
@@ -818,19 +936,26 @@ class MapQuery:
         db = sqlite3.connect(self.path.as_uri()+'?mode=ro',uri=True,timeout=2)
         db.row_factory = sqlite3.Row
         try:
-            if db.execute('PRAGMA user_version').fetchone()[0]!=2:
-                raise ValueError('scanner_format_requires_fresh_store')
             db.execute('BEGIN')
+            if db.execute('PRAGMA user_version').fetchone()[0] not in FORMATS:
+                raise ValueError('scanner_format_requires_fresh_store')
             volumes = list(db.execute('SELECT * FROM volumes ORDER BY label LIMIT 2001'))
+            def map_rows(table,v,where,tail='',**params):
+                # Each generation of the published map keeps its own index, seek and
+                # limit; callers merge the two bounded results.
+                delta=v['delta_generation'] if 'delta_generation' in v.keys() else None
+                names=dict(params,g=v['generation'],d=delta,v=v['key'])
+                return [row for generation in dict.fromkeys((v['generation'],delta)) if generation is not None
+                        for row in db.execute(f'''SELECT * FROM {table} x WHERE x.generation=:gen AND x.volume=:v
+                            AND {published(table,'x',':g',':v',':d')} AND {where} {tail}''',dict(names,gen=generation))]
             chosen = params.get('volume_id') or (volumes[0]['id'] if volumes else None)
             volume = next((v for v in volumes if v['id']==chosen),None)
             rows=[];truncated=False;next_cursor=None;hierarchy=None
             if action == 'volumes':
                 if cursor:raise ValueError('incompatible_storage_cursor')
                 for v in volumes[:limit+1]:
-                    root = db.execute('SELECT listed,uses FROM nodes WHERE generation=? AND volume=? AND parent IS NULL LIMIT 1',
-                                      (v['generation'],v['key'])).fetchone()
-                    listed,uses=(root[0],root[1]) if root else (None,None)
+                    root = next(iter(map_rows('nodes',v,'x.parent IS NULL','LIMIT 1')),None)
+                    listed,uses=(root['listed'],root['uses']) if root else (None,None)
                     valid = bool(v['valid'])
                     rows.append(dict(id=v['id'],label=v['label'],observed_ns=v['observed_ns'],full_scan_ns=v['full_ns'],
                                      listed=listed,uses=uses if valid else None,volume_used=v['volume_used'],
@@ -841,23 +966,23 @@ class MapQuery:
             elif volume and action == 'children':
                 parent = params.get('parent_id')
                 if parent is None:
-                    root = db.execute('SELECT id FROM nodes WHERE generation=? AND volume=? AND parent IS NULL LIMIT 1',
-                                      (volume['generation'],volume['key'])).fetchone()
-                    parent = source_id(root[0]) if root else None
+                    root = next(iter(map_rows('nodes',volume,'x.parent IS NULL','LIMIT 1')),None)
+                    parent = source_id(root['id']) if root else None
                 metric='uses' if volume['valid'] else 'listed'
                 scope=_scope([action,volume['generation'],volume['observed_ns'],chosen,parent,metric,'size-desc-id-desc-v2'])
                 if cursor and cursor['scope']!=scope:raise ValueError('stale_or_incompatible_storage_cursor')
-                seek='';values=[]
+                seek='';values={}
                 if cursor:
                     if set(cursor)!={'size','id','scope'}:raise ValueError('invalid_children_cursor')
-                    seek=f' AND ({metric},id)<(?,?)';values=[cursor['size'],inode_key(cursor['id'])]
-                for n in db.execute(f'SELECT * FROM nodes WHERE generation=? AND volume=? AND parent IS ?{seek} ORDER BY {metric} DESC,id DESC LIMIT ?',
-                                    (volume['generation'],volume['key'],inode_key(parent),*values,limit+1)):
+                    values=dict(size=cursor['size'],id=inode_key(cursor['id']))
+                seek=f' AND (x.{metric},x.id)<(:size,:id)' if cursor else ''
+                for n in map_rows('nodes',volume,f'x.parent IS :parent{seek}',f'ORDER BY x.{metric} DESC,x.id DESC LIMIT :n',
+                                  parent=inode_key(parent),n=limit+1,**values):
                     rows.append(dict(id=source_id(n['id']),parent_id=source_id(n['parent']),label=n['label'],kind=n['kind'],listed=n['listed'],
                                      uses=n['uses'] if volume['valid'] else None,status=n['status'],observed_ns=volume['observed_ns'],_size=n[metric] or 0))
-                seek=' AND (allocated,id)<(?,?)' if cursor else ''
-                for f in db.execute(f'SELECT * FROM files WHERE generation=? AND volume=? AND parent IS ?{seek} ORDER BY allocated DESC,id DESC LIMIT ?',
-                                    (volume['generation'],volume['key'],inode_key(parent),*values,limit+1)):
+                seek=' AND (x.allocated,x.id)<(:size,:id)' if cursor else ''
+                for f in map_rows('files',volume,f'x.parent IS :parent{seek}','ORDER BY x.allocated DESC,x.id DESC LIMIT :n',
+                                  parent=inode_key(parent),n=limit+1,**values):
                     rows.append(dict(id=source_id(f['id']),parent_id=source_id(f['parent']),label=f['label'],kind='file',listed=f['allocated'],
                                      uses=None,status='observed',observed_ns=volume['observed_ns'],_size=f['allocated']))
                 def order(row):
@@ -907,8 +1032,8 @@ class MapQuery:
                         change=b['size']-a['size'] if comparable else None,status='observed' if comparable else 'unobserved'))
                 rows.sort(key=lambda r:abs(r['change'] or 0),reverse=True)
             # Configured exclusions are reported by count only; their paths stay in config.
-            excluded=db.execute("SELECT COUNT(*) FROM nodes WHERE generation=? AND volume=? AND status='excluded'",
-                                (volume['generation'],volume['key'])).fetchone()[0] if volume else 0
+            # Excluded roots are few: configured exclusions, each a single row.
+            excluded=len(map_rows('nodes',volume,"x.status='excluded'")) if volume else 0
             gaps=json.loads(volume['gaps']) if volume else []
             if excluded:gaps=sorted(set(gaps)|{'excluded'})
             coverage={'observed_ns':volume['observed_ns'] if volume else None,

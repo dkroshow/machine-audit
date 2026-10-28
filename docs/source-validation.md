@@ -214,15 +214,18 @@ remain explicit self-cost gaps. Measuring cost does not establish benefit.
 
 ## Compact map publication
 
-Private format 2 uses SQLite `WITHOUT ROWID` map tables, integer generation and
+Private format 3 uses SQLite `WITHOUT ROWID` map tables, integer generation and
 volume keys, and lossless unsigned-inode encoding into signed 64-bit keys.
 Nonnumeric fixture IDs occupy a separate TEXT namespace. Shared-block range
 records reference an ordinal, preserving the distinction between unsigned
 clone IDs and negative partial-copy IDs. File names stay in their rows;
 directory paths are reconstructed from parent/name, with a 1,024-ancestor
 bound and explicit missing/cycle errors. The public query shapes and IDs stay
-the same. Legacy-format stores are refused intact; this build uses fresh stores
-and does not attempt a live migration.
+the same. Stores older than format 2 are refused intact. A format-2 store migrates
+on first open: one write adds nullable `volumes.delta_generation` and sets format 3,
+so a store has both or neither. Earlier builds then
+refuse it intact (`scanner_format_requires_fresh_store`), so a format-2 release is
+not a usable rollback; there is no automatic downgrade.
 
 Opening SQLite and configuring its journal reserve 256 KiB before the first
 connection can allocate files. That reservation ends before schema creation
@@ -238,16 +241,21 @@ size points and observed hierarchy together. A failure leaves the previous
 complete map and its history available.
 
 Hourly updates stage changed directory listings, files and shared-block rows.
-Only changed folders and affected ancestors are recalculated, then applied in
-one publication transaction. Unchanged files are neither copied nor rewritten,
-including those a re-listed folder staged again.
+Only changed folders and affected ancestors are recalculated. One small
+transaction publishes the update: it records the staged generation as the
+volume's delta, with its points, hierarchy and dirty-record removal. Readers see
+the base map overlaid by that delta: delta rows not removed, and base rows that no
+delta row replaces, not removed and, for files and holders, not under a re-listed
+folder. Bounded batches then merge the delta into the base, and a last write clears
+it; every committed batch leaves the same visible map. Unchanged files are neither
+copied nor rewritten, including those a re-listed folder staged again.
 Moves update both old and new ancestor chains. Retired full generations are
 reclaimed before the next full build, not by scanning the active map each hour.
 Sharing and ancestor totals commit only to the unpublished staging generation
-in bounded batches. Final publication counts the changed rows and variable
-payload for its shared DB/WAL/SHM reservation; it does not reserve a second copy
-of unrelated map/history pages. Its atomic transaction retains the previous
-map and history if admission or publication fails.
+in bounded batches. Publication and each merge batch count their own rows and
+variable payload for the shared DB/WAL/SHM reservation; neither reserves a second
+copy of unrelated map/history pages. A refusal before publication retains the
+previous map and history. A full walk still publishes in one atomic transaction.
 
 ## Compact map measurement
 
@@ -449,8 +457,8 @@ first open. A release before them inserted `dirty` rows positionally and fails
 on a migrated store; rolling back needs a release that names `dirty`'s columns,
 whose rows then read as unknown scope.
 
-Publication copies each differing staged row with one insert-or-update on its
-primary key, counted as one row; it was a REPLACE counted twice. An update reserves
+The merge copies each differing staged row with one insert-or-update on its
+primary key, counted as one row. An update reserves
 point and hierarchy rows only for changed identities `_points` writes for: one
 with a point already, or at least 1 GB. Every re-listed folder had reserved three
 such rows. A refused publication keeps its counted terms in that volume's
@@ -459,8 +467,8 @@ hierarchy candidates, tracked, totals, existing and free pages, and the shortfal
 Big Mac's first trial refused a main update that declared at least 846,874 dirty
 pages, the whole file, derived from its stored retry level (about 52,926 rows if
 its payload was negligible); its staging was pruned, so the parts are unknown. A disposable regression re-lists 600 unchanged folders on a 15,475-page
-file with 50 MiB to spare: it was refused at 3,014 rows and 48,308 pages, and now
-publishes at 607 rows, writing 8 WAL frames. A mixed regression publishes the same
+file with 50 MiB to spare: it was refused at 3,014 rows and 48,308 pages, and the
+over-counting fix published it at 607 rows, writing 8 WAL frames. A mixed regression publishes the same
 map an independent full walk gives. This removes over-counting only: an update
 with many genuine changes can still exceed the headroom and take the recovery full
 walk.
@@ -474,3 +482,19 @@ and one change per folder, publication declared 6,810 rows instead of 328,413.
 It wrote 10.2 MB of WAL instead of 33.6 MB, and process peak memory fell from 90 to
 49 MB. The 0.52 CPU seconds of staged-row deletion moved to the next
 preparation. These are synthetic measurements, not Big Mac's.
+
+Big Mac's second refusal was a genuine update, not over-counting: 48,486 counted
+rows needed 3.20 GB of WAL beside 1.73 GB of room. Estimated from that receipt,
+its publication would now carry about 1,719 rows, and each 4,096-row merge batch
+declares about 270 MB. A merge refused or interrupted after publication keeps the
+update published: the result reports the volume's stored status with a `merge`
+code, and the next run merges the delta before any scan. On Linux, watched
+changes taken while a merge is pending stay queued. Preparation refuses a volume
+whose delta is pending; its published map stands, so such a run is `partial`. Later failures in that run never mark the volume failed or
+rewrite its publication. A process
+that dies leaves the run row incomplete; the volume's `delta_generation` is the
+recovery fact, and `runs.volumes` is diagnostic only. A disposable regression
+publishes a 600-folder update, refused before at publication, in 7 counted rows,
+then merges it in 28 batches of at most 1,089 declared pages. Publication still
+grows with an update's changed metadata, so a large enough update can still be
+refused before it publishes and take the recovery full walk.

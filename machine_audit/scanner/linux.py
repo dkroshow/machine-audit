@@ -19,7 +19,7 @@ from .accounting import Blocks
 from .native import Volume
 from .policy import Policy
 from .runner import relist, scan_lock
-from .store import MapStore
+from .store import MapStore, MergePending
 from .walker import Walker
 
 # System areas a walk never enters. Most are separate filesystems the walk skips anyway.
@@ -65,7 +65,16 @@ def run_scan(data_dir, *, full=False, grain='files', roots=None, exclusions=(), 
         store.start('requested_full' if full else 'scheduled')
         processed, published, root_failed, results = 0, 0, False, []
         try:
+            # A published delta is merged before any scan, so nothing stages over it.
+            pending = store.finish_merges()
             for volume, entry in found:
+                if volume.id in pending:
+                    # Not scanned, so its watched changes stay queued below. Its map stands.
+                    root_failed, published = True, published + 1
+                    status = store.db.execute('SELECT status FROM volumes WHERE id=?', (volume.id,)).fetchone()[0]
+                    results.append({'volume_id': volume.id, 'status': status, 'action': 'wait', 'trigger': 'merge_pending',
+                                    'merge': pending[volume.id].code})
+                    continue
                 old = store.db.execute('SELECT * FROM volumes WHERE id=?', (volume.id,)).fetchone()
                 has_root = old and store.db.execute('SELECT 1 FROM nodes WHERE generation=? AND volume=? AND parent IS NULL LIMIT 1',
                                                     (old['generation'], old['key'])).fetchone()
@@ -130,8 +139,16 @@ def run_scan(data_dir, *, full=False, grain='files', roots=None, exclusions=(), 
                         results.append({'volume_id':volume.id,'status':'update_unreadable','action':action,
                                         'entries':walker.entries,'gaps':sorted(walker.gaps)})
                         continue
-                store.finish_volume(volume, blocks, walker.gaps, full=action == 'full', lean=False,
-                                    complete=walker.sharing_complete, physical=False)
+                try:
+                    store.finish_volume(volume, blocks, walker.gaps, full=action == 'full', lean=False,
+                                        complete=walker.sharing_complete, physical=False)
+                except MergePending as exc:
+                    # Published; the next run merges the delta before scanning anything.
+                    root_failed, published, processed = True, published + 1, processed + walker.entries
+                    status = store.db.execute('SELECT status FROM volumes WHERE id=?', (volume.id,)).fetchone()[0]
+                    results.append({'volume_id': volume.id, 'status': status, 'action': action,
+                                    'entries': walker.entries, 'gaps': sorted(walker.gaps), 'merge': exc.code})
+                    continue
                 published += 1
                 processed += walker.entries
                 store.progress(processed)
@@ -142,8 +159,9 @@ def run_scan(data_dir, *, full=False, grain='files', roots=None, exclusions=(), 
             if missing:
                 with store.write(rows=len(missing)):
                     store.db.executemany('UPDATE volumes SET mounted=0 WHERE id=?', ((identity,) for identity in missing))
-            for path in taken:
-                path.unlink()
+            if not pending:  # A skipped volume's queued changes wait for its merge.
+                for path in taken:
+                    path.unlink()
             run_status = ('partial' if published else 'root_unreadable') if root_failed else 'complete'
             store.progress(processed, run_status)
             # The process's own peak, as the run record keeps it. A unit's cgroup peak is larger:

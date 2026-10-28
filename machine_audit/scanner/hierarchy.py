@@ -9,12 +9,16 @@ import json
 from .errors import ScanError
 
 
-def save_hierarchy(db, generation, volume, observed_ns, *, volume_key):
-    tracked = {r['id']: r for r in db.execute('''
+def save_hierarchy(db, generation, volume, observed_ns, *, volume_key, delta=None):
+    """`generation` overlaid by a published `delta` is the published map read here."""
+    from .store import published
+    visible = published('nodes', 'n', ':g', ':v', ':d')
+    names = dict(g=generation, v=volume_key, d=delta)
+    tracked = {r['id']: r for r in db.execute(f'''
         SELECT t.id,source_id(n.parent) AS parent,n.label,n.id IS NOT NULL AS present
         FROM tracked t LEFT JOIN nodes n
-          ON n.generation=? AND n.volume=? AND n.id=inode_key(t.id)
-        WHERE t.volume=? ORDER BY t.id''', (generation,volume_key,volume))}
+          ON n.generation IN (:g,:d) AND n.volume=:v AND n.id=inode_key(t.id) AND {visible}
+        WHERE t.volume=:volume ORDER BY t.id''', dict(names, volume=volume))}
     parent_cache = {}
     parents = {}
     for identity, row in tracked.items():
@@ -25,8 +29,9 @@ def save_hierarchy(db, generation, volume, observed_ns, *, volume_key):
                 raise ScanError('hierarchy_cycle')
             visited.add(parent)
             if parent not in parent_cache:
-                found = db.execute('SELECT source_id(parent) AS parent FROM nodes WHERE generation=? AND volume=? AND id=inode_key(?)',
-                                   (generation,volume_key,parent)).fetchone()
+                found = db.execute(f'''SELECT source_id(n.parent) AS parent FROM nodes n
+                    WHERE n.generation IN (:g,:d) AND n.volume=:v AND n.id=inode_key(:id) AND {visible}''',
+                    dict(names, id=parent)).fetchone()
                 parent_cache[parent] = found['parent'] if found else None
             parent = parent_cache[parent]
         parents[identity] = parent

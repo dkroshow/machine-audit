@@ -411,7 +411,7 @@ is no PID-based liveness inference.
 
 The scanner computes full-scan sharing outside a transaction and commits charges
 in batches of at most 4,096 rows with a 16 MiB additional page ceiling. These rows
-belong to the unpublished generation; final publication remains atomic. Both
+belong to the unpublished generation; a full walk's publication remains atomic. Both
 collector and scanner must use this reservation protocol together. Do not run
 an older writer concurrently: it cannot account for active reservation records.
 

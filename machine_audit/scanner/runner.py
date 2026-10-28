@@ -18,7 +18,7 @@ from .events import FSEvents, next_decision
 from .errors import ScanError
 from .policy import Policy
 from .accounting import Blocks
-from .store import MapStore
+from .store import MapStore, MergePending
 from .walker import Walker, shown_path
 
 # Refusals that more managed storage would admit; reader contention and the
@@ -169,6 +169,8 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
             store.written_bytes=lambda:native.process(os.getpid()).diskio_byteswritten
             store.process_start=str(native.process(os.getpid()).proc_start_abstime)
             store.start('requested_full' if full else 'scheduled')
+            # A published delta is merged before any scan, so nothing stages over it.
+            pending=store.finish_merges()
             store.phase('discover')
             volumes=list(fs.volumes())
             if roots:
@@ -177,6 +179,14 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     raise ValueError('only_discovered_volume_roots_are_allowed')
                 volumes=selected
             for volume in volumes:
+                if volume.id in pending:
+                    # Its update is published; it is not scanned until its delta merges.
+                    root_failed=True;published+=1  # its map stands, the run is partial
+                    store.phase('complete',volume_id=volume.id,action='wait',trigger='merge_pending')
+                    status=store.db.execute('SELECT status FROM volumes WHERE id=?',(volume.id,)).fetchone()[0]
+                    results.append({'volume_id':volume.id,'status':status,'action':'wait','trigger':'merge_pending',
+                                    'merge':pending[volume.id].code})
+                    continue
                 store.phase('decide',volume_id=volume.id,action='pending',trigger='pending')
                 old=store.db.execute('SELECT * FROM volumes WHERE id=?',(volume.id,)).fetchone()
                 if old and old['generation'] and not old['lean'] and not full_disk_access:
@@ -298,6 +308,13 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     results.append({'volume_id':volume.id,'status':blocked,'action':action,'trigger':trigger,
                                     'stage':store.run_context['stage'],'entries':entries,
                                     **({'publication':exc.publication} if hasattr(exc,'publication') else {})})
+                    continue
+                except MergePending as exc:
+                    # Published; the next run merges the delta before scanning anything.
+                    root_failed=True;published+=1;processed+=walker.entries
+                    status=store.db.execute('SELECT status FROM volumes WHERE id=?',(volume.id,)).fetchone()[0]
+                    results.append({'volume_id':volume.id,'status':status,'action':action,'trigger':trigger,
+                                    'entries':walker.entries,'gaps':sorted(walker.gaps),'merge':exc.code})
                     continue
                 published+=1
                 processed+=walker.entries

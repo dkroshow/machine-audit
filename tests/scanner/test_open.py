@@ -314,8 +314,7 @@ class RootPublicationTests(unittest.TestCase):
         with sqlite3.connect(self.data/'scanner.sqlite') as db:
             start = db.execute('SELECT max(observed_ns) FROM volumes').fetchone()[0]
         phase, finish = MapStore.phase, MapStore.finish_volume
-        labels = {'dirty','base_files_reset','base_holders_reset','base_nodes_removed','base_listings_removed',
-                  'base_charges_removed','copy_nodes','copy_files','copy_holders','copy_charges','copy_listings'}
+        labels = {'dirty'}  # Map rows reach the base through the bounded merge, after publication.
         for hours, refused in ((1, 'publication'), (2, 'progress')):
             def refusing(store, stage, **kwargs):
                 full = lambda:setattr(store.budget,'limit_bytes',store.budget.usage()['bytes'])  # nothing more fits
@@ -346,7 +345,57 @@ class RootPublicationTests(unittest.TestCase):
             self.assertTrue(all(type(n) is int and n>=0 for n in numbers), 'the receipt holds counts and bytes only')
             self.assertGreater(receipt['changed'], 0)
             self.assertEqual(receipt['rows'], sum(n for n,_ in receipt['plan'].values())+2*receipt['point_candidates']
-                             +receipt['hierarchy_candidates']+2*receipt['tracked']+5)
+                             +receipt['hierarchy_candidates']+2*receipt['tracked']+5+1)  # +1: the delta's own status
+
+    def test_a_refused_merge_keeps_its_publication_and_merges_before_any_scan(self):
+        # After publication, a merge refusal must not mark the volume failed, set a retry
+        # level or start a recovery walk. Each run merges first, and a volume whose merge
+        # is still refused is not scanned while the others go on.
+        other = self.base/'other';other.mkdir()
+        second = replace(self.volume, id='w', mount=str(other), device=2)
+        self.scan([self.volume, second])
+        events = SimpleNamespace(uuid=lambda device:'events', current_id=lambda:30,
+                                 replay=lambda device,since:Replay(paths={'/child':False} if device==1 else {}, up_to=30))
+        (self.tree/'child'/'added').write_bytes(b'x')
+        with sqlite3.connect(self.data/'scanner.sqlite') as db:
+            start = db.execute('SELECT max(observed_ns) FROM volumes').fetchone()[0]
+        phase, finish, merges = MapStore.phase, MapStore.finish_volume, MapStore.finish_merges
+        refuse = {'v'}
+        def refusing(store, stage, **kwargs):
+            phase(store, stage, **kwargs)
+            if stage=='merge' and (store.volume in refuse or None in refuse):
+                store.budget.limit_bytes=store.budget.usage()['bytes']  # nothing more fits
+        def roomy(method):
+            def call(store, *args, **kwargs):
+                try:return method(store, *args, **kwargs)
+                finally:store.budget.limit_bytes=10**10
+            return call
+        def run(hours, volumes=(self.volume, second)):
+            with patch.object(MapStore,'phase',refusing), patch.object(MapStore,'finish_volume',roomy(finish)), \
+                 patch.object(MapStore,'finish_merges',roomy(merges)), \
+                 patch('machine_audit.scanner.runner.time.time_ns', return_value=start+hours*3600*10**9):
+                result, status = self.scan(list(volumes), events=events, full=False)
+            with sqlite3.connect(self.data/'scanner.sqlite') as db:
+                row = db.execute("SELECT status,delta_generation,observed_ns,bookmark,budget_retry_bytes FROM volumes WHERE id='v'").fetchone()
+                history = [db.execute(f"SELECT count(*) FROM {t} WHERE volume='v'").fetchone()[0] for t in ('points','hierarchy_epochs')]
+            return status, {r['volume_id']:r for r in result['volumes']}, row, history
+        status, results, row, history = run(1)
+        self.assertEqual((status, results['v']['status'], results['w']['status']), ('partial', 'observed', 'observed'))
+        self.assertTrue(results['v']['merge'].startswith('blocked_'))
+        published = row
+        self.assertEqual((row[0], row[4]), ('observed', None))
+        self.assertIsNotNone(row[1])
+        refuse = {None}  # still refused at the next run's first step
+        status, results, row, again = run(2)
+        self.assertEqual((results['v']['action'], results['v']['trigger'], results['v']['status']), ('wait', 'merge_pending', 'observed'))
+        self.assertEqual((status, results['w']['status'], row, again), ('partial', 'observed', published, history))
+        # With only that volume to scan, nothing was read, yet its map stands: partial.
+        status, results, row, again = run(2, [self.volume])
+        self.assertEqual((status, results['v']['trigger'], row, again), ('partial', 'merge_pending', published, history))
+        refuse = set()
+        status, results, row, again = run(3)
+        # The merge finishes first; this run's own hourly update then publishes normally.
+        self.assertEqual((status, results['v']['status'], row[1]), ('complete', 'observed', None))
 
     def test_full_walk_refused_by_an_unknown_page_shortfall_waits_for_an_operator(self):
         # Running out of an admitted page limit was write_failed, then a one-byte
