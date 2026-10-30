@@ -257,6 +257,13 @@ rows existed answers from its minute rows. An instance answers for the buckets
 it topped, so a gauge's mean over a long span is the mean of those buckets.
 Coverage and export are unchanged.
 
+**Encoding.** A bundle is JSON compressed by zlib at level 6 with a fixed preset
+dictionary of names from the code ([privacy](privacy.md#what-a-reading-may-contain)),
+because each bundle is too short to teach zlib its own keys. Over Big Mac's recorded
+rows it saves 39–47% against the earlier level 1 without a dictionary. A bundle names
+the dictionary by checksum, so those bytes can never change. Bundles saved earlier
+decode as before; a release older than the dictionary cannot read the newer ones.
+
 **Rows saved before the rule.** `machine-audit thin-process-rows [--batches N]`
 applies the rule to 15-minute and hour rows an earlier release saved: for each
 run and bucket it ranks the saved process rows with the same function and deletes

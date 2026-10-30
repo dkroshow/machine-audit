@@ -21,6 +21,12 @@ A summary row adds one derived number, `who_rank`: the largest value `who`
 ranks that bundle by, computed from the bundle's own measures (`who_rank` in
 `model.py`). It holds nothing new in kind and is not exported.
 
+The zlib dictionary that compresses summary bundles (`summary_dictionary.py`)
+ships in the code, so it holds only names from the code: keys, signal, unit and
+source names and method names. It never holds a label, entity id, reading or
+anything else taken from a machine; `test_summary_encoding.py` checks every word
+against the code.
+
 Never, in any slot, export, log, error, test fixture or feedback: file or
 folder names, paths, command lines, arguments, environment values, host names,
 IP or hardware addresses, network names, user names, service, unit, container

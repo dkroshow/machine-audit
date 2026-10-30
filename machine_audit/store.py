@@ -15,6 +15,7 @@ import zlib
 from .budget import Budget, BudgetExceeded
 from .derive import points, rollups, merge_summaries
 from .model import PROCESS_ENTITIES, Record, field_component, is_series, who_rank
+from .summary_dictionary import SUMMARY_DICTIONARY
 
 MINUTE = 60_000_000_000
 QUARTER = 15 * MINUTE
@@ -73,7 +74,8 @@ def pack_summaries(rows):
     for row in rows:
         keys=tuple(sorted(row))
         groups.setdefault(keys,[]).append([row[k] for k in keys])
-    return zlib.compress(encode([2, [[keys,values] for keys,values in groups.items()]]).encode(), 1)
+    compressor = zlib.compressobj(6, zdict=SUMMARY_DICTIONARY)
+    return compressor.compress(encode([2, [[keys,values] for keys,values in groups.items()]]).encode()) + compressor.flush()
 
 
 UPSERT_SUMMARY = ("INSERT INTO summaries(run_id,sequence_min,sequence_max,resolution,bucket_ns,source,component,entity,who_rank,payload) VALUES(?,?,?,?,?,?,?,?,?,?) "
@@ -147,7 +149,12 @@ def extended(held,bucket,rows,run_id,own,lower,upper):
 def unpack_summaries(payload, keep=None):
     """Rows of one stored bundle. `keep(signal, kind, component)` drops rows before
     their dictionaries are built."""
-    version, groups = json.loads(zlib.decompress(payload))
+    # A stream written before the dictionary simply does not ask for it.
+    stream = zlib.decompressobj(zdict=SUMMARY_DICTIONARY)
+    data = stream.decompress(payload)
+    if not stream.eof:
+        raise ValueError("truncated_summary")
+    version, groups = json.loads(data)
     if version != 2:
         raise ValueError("unsupported_summary_encoding")
     if keep is None:
