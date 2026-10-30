@@ -217,6 +217,55 @@ class BudgetRecoveryTests(unittest.TestCase):
                 self.assertTrue(third.close())
             finally:store.close()
 
+    def coarse_process_rows(self,store,run):
+        return {(resolution,entity):[(row['sample_count'],row['total']) for row in unpack_summaries(payload)] for resolution,entity,payload in store.db.execute(
+            "SELECT resolution,entity,payload FROM summaries WHERE run_id=? AND resolution IN ('15-minute','hour') AND entity LIKE 'process:%'",(run,))}
+
+    def test_the_held_quarter_and_hour_survive_a_stop_checkpoint(self):
+        # A process row of an open quarter or hour exists only in memory: a stop must carry
+        # it across the restart, or every stop would lose up to an hour of process history.
+        scratch=Path(__file__).parent/'.tmp';scratch.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as root:
+            store=Store(Path(root)/'readings.sqlite',Budget(root,free_margin_bytes=0))
+            try:
+                run=Collector(store,(),run_id='run',boot_id='boot');run.start()
+                self.reads(run,0,70);self.assertTrue(run.flush());self.reads(run,70,100)
+                self.assertTrue(run.close())
+                self.assertEqual(self.coarse_process_rows(store,'run'),{})
+                checkpoint,=Path(root).glob('unsaved-run-*.json')
+                self.assertEqual(set(json.loads(checkpoint.read_bytes())['held']),{'minute','15-minute','hour'})
+                after=Collector(store,(),run_id='after',boot_id='boot');after.start()
+                self.assertIsNone(after.recovery_error);self.assertTrue(after.close())
+                # 100 readings, 99 s of (1 and 2 CPU s)/s, split by the save at 70.
+                self.assertEqual(self.coarse_process_rows(store,'run'),{(resolution,entity):[(100,total)] for resolution in ('15-minute','hour')
+                                                                        for entity,total in (('process:1',99.0),('process:2',198.0))})
+            finally:store.close()
+
+    def test_a_checkpoint_from_the_previous_release_recovers_and_extends_its_saved_rows(self):
+        # An upgrade restarts from the previous release's stop. Its file holds a minute only,
+        # and it had saved every process's quarter and hour rows at each save. Recovery must
+        # read that file and add the unsaved tail to those rows, not replace them with it.
+        scratch=Path(__file__).parent/'.tmp';scratch.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as root:
+            store=Store(Path(root)/'readings.sqlite',Budget(root,free_margin_bytes=0))
+            try:
+                with patch('machine_audit.store.RANKED',{'minute':('process:','program:'),'15-minute':(),'hour':()}):
+                    run=Collector(store,(),run_id='run',boot_id='boot');run.start()
+                    self.reads(run,0,70);self.assertTrue(run.flush());self.reads(run,70,100)
+                    self.assertTrue(run.close())
+                checkpoint,=Path(root).glob('unsaved-run-*.json')
+                data=json.loads(checkpoint.read_bytes())
+                data.update(format='machine-audit-unsaved-v1',held=data['held']['minute'])
+                checkpoint.write_text(json.dumps(data))
+                self.assertEqual(self.coarse_process_rows(store,'run')[('hour','process:1')],[(70,69.0)])
+                after=Collector(store,(),run_id='after',boot_id='boot');after.start()
+                self.assertIsNone(after.recovery_error);self.assertTrue(after.close())
+                self.assertEqual(list(Path(root).glob('unsaved-run-*')),[])
+                self.assertEqual(self.coarse_process_rows(store,'run'),{(resolution,entity):[(100,total)] for resolution in ('15-minute','hour')
+                                                                        for entity,total in (('process:1',99.0),('process:2',198.0))})
+                self.assertEqual({e:[n for n,_ in rows] for e,rows in self.held_minute(store,'run').items()},{'process:1':[39],'process:2':[39]})
+            finally:store.close()
+
     def test_a_checkpoint_is_saved_once_with_its_stop_whatever_point_recovery_reaches(self):
         # Recovery saves a checkpoint's readings, held minute and stop marker in one
         # transaction, so a stop marker proves it was saved: a crash before or after that

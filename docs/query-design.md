@@ -118,8 +118,8 @@ includes all measured Machine-audit components, not only the collector process.
   windows, as the [time and coverage rules](cpu-view.md#time-windows-and-coverage-working)
   say; the method is visible in the answer.
 - **Resolution follows the span and a row cap.** Raw readings for a few
-  minutes, minute rollups for hours, hourly rollups for days; a process
-  outside a minute's top consumers answers from 15-minute rollups. The answer
+  minutes, minute rollups for hours, hourly rollups for days; an entity
+  outside a minute's top consumers answers from its 15-minute rollup. The answer
   names its resolution and the cadence behind it. Nothing is interpolated.
 - **Peaks keep their meaning.** A maximum is the maximum of the samples the
   rollup saw, with its time. A process peak is a 10-second pass rate; a host
@@ -181,11 +181,11 @@ admitted label, with the grouping and coverage method recorded on the row),
 and rolls that series up per minute and per hour with the same spike fields
 as an instance. Members' actual read times differ within a pass, so the row
 records how they were aligned rather than treating the pass as one instant.
-Instance rollups and instance identity are kept unchanged beside it; the
-program rollup is a bounded additional derived summary, rebuildable from
-retained passes, and its grouping can be revised while they exist. Without
-it, program peaks, hours hot and histograms over pruned history are
-unavailable, not approximate, and the answer must say so.
+Each bucket's top instance rollups and instance identity are kept beside it;
+the program rollup is a bounded derived summary, rebuildable from retained
+passes, and its grouping can be revised while they exist. Without it, program
+peaks, hours hot and histograms over pruned history are unavailable, not
+approximate, and the answer must say so.
 
 ## Kept ready, or computed on request
 
@@ -194,12 +194,12 @@ unavailable, not approximate, and the answer must say so.
 
 - Minute and hourly rollups per host signal, carrying the summary family their
   kind requires, with max and its time.
-- Minute and hourly rollups per process instance and per signal, with the
-  spike fields listed in the storage approach, and the proposed per-program
-  rollups above. These are the additions the query design makes to the
-  architecture's rollups. Their size and query cost are not measured; they
-  follow the storage approach's rule of measuring growth before choosing
-  reductions.
+- Minute, 15-minute and hourly rollups per signal for each bucket's top
+  process instances, and per-program rollups for every program at 15-minute
+  and hourly grain, with the spike fields listed in the storage approach.
+  These are the additions the query design makes to the architecture's
+  rollups. Their measured growth set the
+  [top-consumer rule](storage-approach.md#summary-resolutions).
 - Coverage per source per minute: reads due, done, late, skipped, failed.
 - The recent-read cache for *now*, owned by the collector.
 
@@ -220,13 +220,12 @@ oldest readings first, then oldest minute rollups, hourly and incident records
 longest. Answers over a span that crosses a cutoff say where detail ends:
 
 - *series* names its resolution per span and marks the pruned range.
-- *who* keeps every instance's rollup; there is no top-N floor and nothing
-  is dropped below a size. Additive totals over complete covered windows stay
-  exact, and a new grouping's additive totals can still be formed from
-  retained instance totals. What is lost is within-window order, the detailed
-  readings and burst shape around the retained peak time, and a new
-  grouping's peaks, time above and histograms; the answer names which fields
-  are exact and which are unavailable for the span.
+- *who* keeps every program's rollup and each bucket's top instances. Additive
+  totals over complete covered windows stay exact per program. What is lost is
+  within-window order, the detailed readings and burst shape around the
+  retained peak time, instance rollups outside each bucket's top consumers, and
+  any new grouping of additive totals, peaks, time above and histograms; the
+  answer names which fields are exact and which are unavailable for the span.
 - *around* a pruned time returns rollup rows and events, and says the pass
   behind a peak is gone.
 - A maximum survives pruning with its time; the shape of the burst around it

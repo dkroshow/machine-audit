@@ -292,7 +292,8 @@ opening an older store adds the column and rewrites nothing. Among equal values
 
 `who` accepts intervals up to 31 days. It combines complete interior hours with
 15-minute and minute rows at the sides, merges one entity at a time, and ranks
-only the output. Minute rows hold only each minute's top processes and programs;
+only the output. Minute rows hold only each minute's top processes and programs,
+and 15-minute and hour rows only each bucket's top processes and every program;
 an entity without a minute row for every minute of a side's quarter hour answers
 that quarter hour from its 15-minute row, marked `partial_boundary`. `total_rows` counts all matching entities; `totals_complete` is not made
 false merely because the requested output page is shorter. CPU accounting uses
@@ -301,7 +302,8 @@ footprints remain separate instance scopes.
 
 Stored summary resolutions are `minute` (every entity except processes and
 programs, which keep only each minute's top consumers), `15-minute` and `hour`
-(every entity); see [summary resolutions](storage-approach.md#summary-resolutions).
+(every entity except processes, which keep only each bucket's top consumers); see
+[summary resolutions](storage-approach.md#summary-resolutions).
 `series` reports `resolution` as `raw`, `minute`, `15-minute` or `hour`. Summary
 rows carry `summary_resolution`; in `who` it names the coarsest resolution that
 set the row's edges.

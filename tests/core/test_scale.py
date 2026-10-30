@@ -87,6 +87,7 @@ class ScaleTests(unittest.TestCase):
         self.assertEqual([r.to_dict() for r in saved],[r.to_dict() for r in records])
         self.assertEqual(len(saved[-1].reading.fields),10500)
         self.assertLess(self.store.budget.usage()['bytes'],30_000_000)
+        self.store.stop_run('run',records[-1].reading.end.wall_ns)  # saves the held process rows
         self.assertTrue(self.store.prune_oldest())
         lo=records[0].reading.start.wall_ns;hi=lo+3600*S
         for signal,component in [('process.cpu','cpu'),('process.ledger_swapins','memory'),('process.diskio_byteswritten','storage')]:
@@ -100,15 +101,18 @@ class ScaleTests(unittest.TestCase):
         procs=process_records(2000,7,step=12*60*S);base=procs[0].reading.end.wall_ns
         host=['synthetic.cpu','synthetic.memory','synthetic.disk','synthetic.net','synthetic.power','synthetic.heat','synthetic.gpu','synthetic.probe']
         sequence=0
-        for minute in range(73):
-            t=base+minute*60*S;a=t-10**18+S  # the adapter's clock: wall 10**18 ahead of awake
-            c0=Clock(t-60*S,a-60*S,a-60*S);c=Clock(t,a,a);batch=[]
-            for source in host:
-                sequence+=1;fields=(Field(source[10:]+'.work',float(minute),'seconds','counter'),Field(source[10:]+'.level',float(minute),'bytes'))
-                batch.append(Record(Reading(source,'cpu',c0,c,fields),'boot','run',sequence,t,c))
-            for p in procs[:-1]:
-                if t-60*S<p.reading.end.wall_ns<=t:sequence+=1;batch.append(Record(p.reading,'boot','run',sequence,t,c))
-            self.store.append(batch)
+        # Every instance keeps its rows here: a store saved before the top-consumer rule, or
+        # a span gathering many buckets' top sets, holds more entities than one bucket keeps.
+        with patch('machine_audit.store.TOP_N',2000):
+            for minute in range(73):
+                t=base+minute*60*S;a=t-10**18+S  # the adapter's clock: wall 10**18 ahead of awake
+                c0=Clock(t-60*S,a-60*S,a-60*S);c=Clock(t,a,a);batch=[]
+                for source in host:
+                    sequence+=1;fields=(Field(source[10:]+'.work',float(minute),'seconds','counter'),Field(source[10:]+'.level',float(minute),'bytes'))
+                    batch.append(Record(Reading(source,'cpu',c0,c,fields),'boot','run',sequence,t,c))
+                for p in procs[:-1]:
+                    if t-60*S<p.reading.end.wall_ns<=t:sequence+=1;batch.append(Record(p.reading,'boot','run',sequence,t,c))
+                self.store.append(batch)
         end=procs[-1].reading.end.wall_ns
         collector=Collector(self.store,run_id='tail',boot_id='boot',clock=lambda:procs[-1].reading.end)
         collector.ingest(procs[-1].reading)  # an unsaved pass ending the window
@@ -196,12 +200,11 @@ class ScaleTests(unittest.TestCase):
         self.assertEqual(brief,fresh.now(brief=True))
         self.assertEqual(query.now(limit=600),full)
 
-    def test_2000_process_minutes_keep_top_consumers_and_15_minute_rows_keep_all(self):
+    def test_2000_process_minutes_keep_top_consumers(self):
         # Big Mac grew 11.3 MB/min, half of it per-instance minute rows. Minute rows keep each
-        # minute's top 25 by CPU, memory and bytes written (75) plus the collector; 15-minute
-        # rows keep every process. The three top lists are disjoint. Processes 1000-1024 burst
-        # only after a flush splits minute 1, so a minute must be ranked whole, not on its
-        # first saved fragment.
+        # minute's top 25 by CPU, memory and bytes written (75) plus the collector. The three
+        # top lists are disjoint. Processes 1000-1024 burst only after a flush splits minute 1,
+        # so a minute must be ranked whole, not on its first saved fragment.
         def cpu(pid,t):
             if 1000<=pid<1025:return 9.0 if 90<t<=120 else 0.0
             return 2.0 if pid<25 else 0.01
@@ -224,9 +227,61 @@ class ScaleTests(unittest.TestCase):
                 entities={e for e, in self.store.db.execute("SELECT entity FROM summaries WHERE resolution='minute' AND bucket_ns=? AND component=?",(bucket*60*S,component))}
                 self.assertEqual({e for e in entities if e.startswith('process:')},named(top_cpu)|others,(bucket,component))
                 self.assertLessEqual(len({e for e in entities if e.startswith('program:')}),75,(bucket,component))
-        for component in ('cpu','memory','storage'):
-            count=self.store.db.execute("SELECT count(*) FROM summaries WHERE resolution='15-minute' AND bucket_ns=0 AND component=? AND entity LIKE 'process:%'",(component,)).fetchone()[0]
-            self.assertEqual(count,2000,component)
+
+    def test_each_quarter_and_hour_keep_their_own_top_processes_and_every_program(self):
+        # Hour rows for every process were 87% of Big Mac's hour payload and 15-minute rows
+        # cost as much again. Each bucket keeps its own top 25 by CPU (0-24 by the hour; 50-74
+        # burst in the first quarter only, after a save splits it), bytes written (25-49) and
+        # footprint (75-99), plus the collector (70). Every program keeps every row, and rows
+        # are ranked whole, so where saves fall changes nothing.
+        def cpu(pid,t):
+            if 50<=pid<75:return 40.0 if 800<t<=860 else 0.0
+            return 2.0 if pid<25 else 0.01
+        records=passes(100,3720,cpu,label=lambda pid:f'p{pid%40}',written=lambda pid:(pid+50)%100,own=70)
+        for lo in range(0,len(records),13):self.store.append(records[lo:lo+13])
+        def named(*ranges):return {f'process:{pid}' for r in ranges for pid in r}
+        def kept(store,resolution,bucket,kind='process:'):
+            return {component:{e for e, in store.db.execute("SELECT entity FROM summaries WHERE resolution=? AND bucket_ns=? AND component=? AND entity LIKE ?",(resolution,bucket*S,component,kind+'%'))}
+                    for component in ('cpu','memory','storage')}
+        rest=named(range(25,50),range(75,100),[70])
+        first_quarter=named(range(50,75))|rest
+        self.assertEqual(kept(self.store,'15-minute',0),dict.fromkeys(('cpu','memory','storage'),first_quarter))
+        hourly=dict.fromkeys(('cpu','memory','storage'),named(range(25))|rest)
+        self.assertEqual(kept(self.store,'15-minute',900),hourly)
+        self.assertEqual(kept(self.store,'hour',0),hourly)
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM summaries WHERE resolution IN ('15-minute','hour') AND bucket_ns=3600*? AND component!='self' AND entity LIKE 'process:%'",(S,)).fetchone()[0],0)  # held
+        self.store.stop_run('run',3720*S)
+        self.assertEqual(kept(self.store,'hour',3600),hourly)
+        self.assertEqual(kept(self.store,'15-minute',3600),hourly)
+        programs=dict(cpu={f'program:p{pid}' for pid in range(40)},memory=set(),storage={f'program:p{pid}' for pid in range(40)})
+        self.assertEqual(kept(self.store,'hour',0,'program:'),programs)
+        self.assertEqual(kept(self.store,'15-minute',900,'program:'),programs)
+        whole=Store(Path(self.tmp.name)/'whole.sqlite',self.store.budget)
+        whole.append(records);whole.stop_run('run',3720*S)
+        def saved(store):
+            return sorted((resolution,bucket,component,entity,row['signal'],row['total'] and round(row['total'],6),row['sample_count']) for resolution,bucket,component,entity,payload in store.db.execute(
+                "SELECT resolution,bucket_ns,component,entity,payload FROM summaries WHERE resolution IN ('15-minute','hour')") for row in unpack_summaries(payload))
+        self.assertEqual(saved(self.store),saved(whole))
+        whole.close()
+
+    def test_who_cpu_and_disk_totals_and_accounting_stay_exact_over_full_hours(self):
+        # who answers additive totals from program rows. A program ranked away at hour grain
+        # would leave its total out and read as CPU no program used. 60 processes share 40
+        # labels; each used 0.5 CPU s and wrote pid bytes a pass, and the machine used 1 s
+        # more a pass, for 720 passes after a baseline.
+        records=passes(60,7200,lambda pid,t:0.5,label=lambda pid:f'p{pid%40}')
+        records+=[Record(Reading('synthetic.cpu','cpu',r.reading.start,r.reading.end,(Field('cpu.user',(30+1)*(n+1),'seconds','counter'),Field('cpu.system',0.0,'seconds','counter'))),
+                         'boot','run',len(records)+n+1,r.due_wall_ns,r.received) for n,r in enumerate(records)]
+        records.sort(key=lambda r:(r.reading.end.wall_ns,r.sequence))
+        records=[replace(r,sequence=n+1) for n,r in enumerate(records)]
+        for lo in range(0,len(records),40):self.store.append(records[lo:lo+40])
+        cpu=Query(self.store).who(0,7200*S,signal='process.cpu',component='cpu',limit=2000)
+        self.assertEqual(cpu['total_rows'],40)
+        self.assertEqual({r['entity']:r['total'] for r in cpu['rows']},{f'program:p{p}':360.0*(1+(p<20)) for p in range(40)})
+        self.assertEqual(cpu['accounting'],{'additive':True,'unit':'CPU seconds','attributed':21600.0,'host_total':22320.0,'remainder':720.0,'status':'observed','reason':None,
+                                            'attributed_bounds':[0,7200*S],'host_bounds':[0,7200*S],'partial':True})  # the baseline pass
+        disk=Query(self.store).who(0,7200*S,signal='process.diskio_byteswritten',component='storage',limit=2000)
+        self.assertEqual({r['entity']:r['total'] for r in disk['rows']},{f'program:p{p}':720.0*(p+(p+40 if p<20 else 0)) for p in range(40)})
 
     def test_who_answers_a_process_outside_the_top_from_15_minute_rows(self):
         # Program 0 is below the top 25 on every measure except in minutes 32 and 33, so its
@@ -365,7 +420,8 @@ def measure_queries(path):
     for end in (3600*S,86400*S):
         cpu=query.who(0,end,signal='process.cpu',component='cpu',limit=2000)
         memory=query.who(0,end,signal='process.phys_footprint',component='memory',limit=2000)
-        check.assertEqual(cpu['total_rows'],600);check.assertEqual(memory['total_rows'],2000)
+        # Every program; memory ranks instances, the top 25 by CPU time and by footprint.
+        check.assertEqual(cpu['total_rows'],600);check.assertEqual(memory['total_rows'],50)
         check.assertTrue(cpu['totals_complete']);check.assertTrue(memory['totals_complete'])
         check.assertEqual(cpu['covered'],{'start_ns':0,'end_ns':end})
         check.assertTrue(all(row['total']==end//S for row in cpu['rows']))

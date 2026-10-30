@@ -10,9 +10,9 @@ implementation has not started.
   write logs and separate filesystem index together, not as independent caps.
 - **Preserve individual readings at collection cadence**, including process
   and GPU-client detail. Build summaries alongside them for efficient queries.
-- Favor more useful evidence within that budget. Minute summaries keep only
-  each minute's top processes and programs ([summary resolutions](#summary-resolutions));
-  group-only storage and fixed short-window expiry remain later candidates.
+- Favor more useful evidence within that budget. Summaries keep only each
+  bucket's top processes ([summary resolutions](#summary-resolutions));
+  fixed short-window expiry remains a later candidate.
   Choose reductions from measured growth and actual investigations.
 
 **Check growth and prune old records before reaching 10 GB, keeping recording
@@ -188,10 +188,10 @@ scope. The rule lives in one set in `store.py`. Its first user is the Linux
 `unit_detail` scope: unit limits, memory breakdowns, pressure, throttling and
 process counts. Mac scopes all keep every resolution.
 
-Per-process rollups, per process instance and per signal, at 15-minute and
-hourly grain (minute grain for each minute's top consumers), serve the
-[query design](query-design.md)'s process table and spike
-questions over long spans. Beyond the summary family above they keep the
+Per-process rollups, per process instance and per signal, for each bucket's
+top consumers, and per-program rollups for every program at 15-minute and
+hourly grain, serve the [query design](query-design.md)'s process table and
+spike questions over long spans. Beyond the summary family above they keep the
 highest pass rate with its time, retained as observed, plus seconds above a
 small fixed set of levels and a small histogram of pass rates, both weighted by
 each pass's covered duration. The histogram answers "time above a level" exactly only at a bin boundary;
@@ -199,9 +199,10 @@ inside a bin it bounds or estimates. All three describe pass-average rates: a
 burst shorter than the process cadence is averaged inside its pass and cannot
 be recovered. Rollups are keyed by process instance (pid, start time, boot).
 Compatible additive fields sum across instances; peaks, time above and
-histograms do not, so program-level spikes over pruned history need the query
+histograms do not, so program-level spikes over pruned history use the query
 design's time-aligned per-program rollup, with its grouping and coverage method
-recorded. Every
+recorded. A rollup's instances stay listed in its `members`, so instance counts
+survive when an instance's own rows do not. Every
 rollup carries a method version and can be rebuilt from retained readings; what
 it carries is fixed only once those readings are pruned. Rollup size and query
 cost are unmeasured and follow the growth measurements below.
@@ -217,26 +218,30 @@ govern the selected interval in both interfaces.
 | Resolution | Rows kept |
 | --- | --- |
 | Minute | Every entity, except processes and programs: only each minute's top consumers |
-| 15-minute | Every entity |
-| Hour | Every entity |
+| 15-minute | Every entity, except processes: only each quarter hour's top consumers |
+| Hour | Every entity, except processes: only each hour's top consumers |
 
-**Minute top consumers.** A minute keeps process and program rows for the union
-of the top 25 by CPU time, the top 25 by memory (Mac footprint, Linux resident
-set) and the top 25 by disk bytes read and written, ranked separately for
-processes and programs, plus the collector's own processes. At most 75
-processes and 75 programs, plus our own, have minute rows in each component.
-Every process and program keeps 15-minute and hour rows, so `who` over 15
-minutes or more answers for all of them. Host, device, unit and self rows
-keep every minute. The rule and `TOP_N` live in `store.py`, for the Mac and
-Linux alike.
+**Top consumers.** A bucket keeps process rows for the union of the top 25 by
+CPU time, the top 25 by memory (Mac footprint, Linux resident set) and the top
+25 by disk bytes read and written, plus the collector's own processes: at most
+75, plus our own, in each component. Minutes rank programs the same way. Every
+program keeps 15-minute and hour rows, so `who` answers additive totals (CPU,
+disk bytes, wake-ups, page-ins) exactly for all of them over 15 minutes or more,
+and `who` for a named gauge lists each bucket's top instances. Host, device,
+unit and self rows keep every bucket. The rule, `TOP_N` and `RANKED` live in
+`store.py`, for the Mac and Linux alike.
 
-A minute is ranked once it is complete. Saves are not aligned with minutes,
-so the collector holds the run's newest minute in memory until a later save
-completes it, then saves only its top consumers. A saved row always holds its
-whole minute; data arriving after the ranking extends only kept rows. Until
-then `who` answers that minute from 15-minute rows. Stopping the run saves the
-held minute. A crash loses only that minute's minute rows; its readings,
-15-minute and hour rows are already saved.
+A bucket is ranked once it is complete. Saves are not aligned with buckets, so
+the collector holds the run's newest minute, quarter hour and hour of ranked
+rows in memory, packed, until a later save completes each one, then saves only
+its top consumers, once. A saved row always holds its whole bucket; data
+arriving after the ranking extends only kept rows. Until then `who` answers
+that minute from 15-minute rows where they exist, and a process in an open
+quarter hour from the minute rows of its top minutes. Stopping the run saves
+the held buckets; a stop that only checkpoints carries them in the checkpoint.
+A crash loses only their ranked rows: an open minute's top consumers and an
+open quarter hour's and hour's processes. Its readings and its host, device,
+unit and program 15-minute and hour rows are already saved.
 
 Each save reserves room in proportion to the rows it writes. A save that does
 not fit prunes the oldest history and tries again; it merges its rows once,
@@ -244,11 +249,13 @@ whatever the number of attempts.
 
 **Answers across resolutions.** `series` uses minute rows; if they are pruned,
 15-minute rows, then hour rows, and names the resolution it used. `who` uses
-complete interior hours and, at each side, per process and quarter hour: its
+complete interior hours and, at each side, per entity and quarter hour: its
 minute rows when it has one for every minute of that quarter hour inside the
 window, otherwise its 15-minute row, marked `partial_boundary`. Each row names
 the coarsest resolution that set its edges. History saved before 15-minute
-rows existed answers from its minute rows. Coverage and export are unchanged.
+rows existed answers from its minute rows. An instance answers for the buckets
+it topped, so a gauge's mean over a long span is the mean of those buckets.
+Coverage and export are unchanged.
 
 **Measured and estimated cost.** A Mac-shaped synthetic run (2,000
 processes, 600 program labels, 10 s passes, saves every 60 s not aligned
@@ -263,9 +270,18 @@ with minutes) measured:
 
 The 11.3 MB a minute recorded for Big Mac's 2,000 processes (16 GB a day, in
 [development](development.md#review-regressions-and-scale-measurements)) scales
-to about 3 MB a minute, about 4.3 GB a day, against the 10 GB cap. The
-15-minute rows are rewritten at each save, like hour rows; that is most of
-the added save CPU.
+to about 3 MB a minute, about 4.3 GB a day, against the 10 GB cap.
+
+**Hour rows on Big Mac.** Before process rows were ranked at 15-minute and hour
+grain, a day of hour rows cost about 550 MB on disk: about 230 MB of payload,
+210 MB of empty space inside pages, 37 MB of row overhead and 56 MB of indexes.
+An hour held 10,800 rows and 9.4 MB, 87% of it process rows, because about 2,600
+instances appeared an hour and 95% lived under an hour; 43% of those bundles came
+from a single pass and held no counter data. Rows that a save wrote beside hour
+rows were pruned earlier, which left pages 45% empty, and rewriting about 16,000
+15-minute and hour rows a save matched the collector's 2.5–3.5 GB written an
+hour. The shipped ranking, replayed over three recorded hours, kept 1,410–1,771
+rows of 7,275–22,334 and 1.2–2.1 MB of 6.6–18.6 MB.
 
 Target B (Ubuntu, estimate from the [Linux adapter](linux-adapter.md)'s
 table, not measured): about 750 minute rows a minute today. Its roughly 115
