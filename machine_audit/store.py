@@ -5,6 +5,7 @@ from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 import heapq
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -20,8 +21,14 @@ from .summary_dictionary import SUMMARY_DICTIONARY
 MINUTE = 60_000_000_000
 QUARTER = 15 * MINUTE
 HOUR = 60 * MINUTE
-# Stored summary resolutions, finest first; pruning removes them in this order.
+# Stored summary resolutions, finest first.
 WIDTHS = {"minute": MINUTE, "15-minute": QUARTER, "hour": HOUR}
+# Retention floors, back from the newest reading (storage-approach.md). Fine detail of the
+# last 48 hours outlasts older hour rows; hour rows of the last 14 days outlast it when the
+# cap cannot hold both, which on Big Mac leaves 14 days of who rather than none.
+FINE_FLOOR = 48 * HOUR
+HOUR_FLOOR = 14 * 24 * HOUR
+FLOOR_UNMET = "fine_floor_unmet"
 # Each bucket keeps only its top consumers, ranked once it is complete: per-instance rows were
 # half of a 2,000-process Mac's minute growth and 87% of Big Mac's hour payload, most of it
 # from processes that lived under an hour (storage-approach.md). 25 each by CPU time, memory
@@ -514,7 +521,7 @@ class Store:
         self.db.execute("UPDATE runs SET last_sequence=?,last_saved_ns=? WHERE run_id=?",(last.sequence,max(r.reading.end.wall_ns for r in records),first.run_id))
 
     def maintain(self, required_bytes=0):
-        """Prune raw, then minute, 15-minute, hour and finally rare incident history.
+        """Prune in the order _prune_batch gives, finishing with rare incident history.
 
         Work starts well before the cap; if reserve cannot fit, fail without
         removing a file or discarding the collector's pending batch.
@@ -589,24 +596,35 @@ class Store:
         return batch
 
     def _prune_batch(self,window,preserved,skipped_raw):
+        """The next batch: raw, minute and 15-minute history older than the fine floor,
+        hour rows older than the hour floor, then the same inside the floors, and last
+        rare incidents. Covered raw stays first in each pass; uncovered raw stays intact."""
+        # The newest save, not the newest raw reading: pruning can remove every reading.
+        newest=self.db.execute("SELECT MAX(last_saved_ns) FROM runs").fetchone()[0]
+        fine=hours=math.inf  # With nothing saved, nothing to anchor a floor.
+        if newest is not None:
+            # Whole minutes, so no covered raw reading is older than a pruned summary.
+            fine=(newest-FINE_FLOOR)//MINUTE*MINUTE;hours=newest-HOUR_FLOOR
+        passes=(("raw",fine),("minute",fine),("15-minute",fine),("hour",hours),
+                ("raw",math.inf),("minute",math.inf),("15-minute",math.inf),("hour",math.inf))
         summary_heads=[]
-        if window:
-            kind,(start,end)="raw",window
-            table, condition, args = "readings", "wall_ns>=? AND wall_ns<?", (start,end)
-        else:
-            # Uncovered windows remain intact; covered raw still comes
-            # before summaries, even when it follows a retained window.
-            for kind,width in WIDTHS.items():
-                summary_heads=self._summary_heads(kind)
-                if summary_heads:
-                    start=min(t for _,t in summary_heads)
-                    end,table=start+width,"summaries"
+        for kind,limit in passes:
+            if kind=="raw":
+                if window and window[1]<=limit:
+                    start,end=window;table,condition,args="readings","wall_ns>=? AND wall_ns<?",window
                     break
-            else:
-                row=self.db.execute("SELECT MIN(wall_ns) FROM incidents").fetchone()
-                if row[0] is None:return None
-                kind,start,end="incident",row[0],(row[0]//MINUTE+1)*MINUTE
-                table,condition,args="incidents","wall_ns < ?",(end,)
+                continue
+            heads=self._summary_heads(kind)
+            if heads and min(t for _,t in heads)+WIDTHS[kind]<=limit:
+                summary_heads=heads;start=min(t for _,t in heads)
+                end,table=start+WIDTHS[kind],"summaries"
+                break
+        else:
+            row=self.db.execute("SELECT MIN(wall_ns) FROM incidents").fetchone()
+            if row[0] is None:return None
+            kind,start,end="incident",row[0],(row[0]//MINUTE+1)*MINUTE
+            table,condition,args="incidents","wall_ns < ?",(end,)
+        inside=newest is not None and limit==math.inf and kind!="incident"
         if summary_heads:
             rows=[]
             for component,first in summary_heads:
@@ -619,19 +637,19 @@ class Store:
             rows=self.db.execute(f"SELECT rowid,length(payload) FROM {table} WHERE {condition} LIMIT ?",(*args,PRUNE_BATCH)).fetchall()
         preserved=[(start,end) for start,end in preserved if not self.db.execute(
             "SELECT 1 FROM retention WHERE kind='raw_preserved' AND start_ns<=? AND end_ns>=?",(start,end)).fetchone()]
-        return kind,start,end,table,rows,preserved,skipped_raw
+        return kind,start,end,table,rows,preserved,skipped_raw,inside
 
     def prune_oldest(self):
         with self._mutex:
             batch=self._prune_candidates()
             if batch is None:return self._reclaim_free_pages()
-            kind,start,end,table,rows,preserved,skipped_raw=batch
+            kind,start,end,table,rows,preserved,skipped_raw,inside=batch
             def coverage(count):
                 if kind not in ('minute','hour'):return []
                 predicate="resolution='minute' AND end_ns<?" if kind=='minute' else 'end_ns<?'
                 with self._prune_precheck():
                     return self.db.execute(f'SELECT rowid,length(payload) FROM coverage WHERE {predicate} LIMIT ?',(end,count)).fetchall()
-            reason='storage_budget_raw_uncovered' if skipped_raw and kind!='raw' else 'storage_budget'
+            reason='storage_budget_raw_uncovered' if skipped_raw and kind!='raw' else FLOOR_UNMET if inside else 'storage_budget'
             return bool(self._delete_batch(table,rows,(kind,start,end,reason),preserved,coverage))
 
     def _delete_batch(self,table,rows,retention,preserved=(),coverage=lambda count:()):

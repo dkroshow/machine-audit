@@ -17,17 +17,50 @@ implementation has not started.
 
 **Check growth and prune old records before reaching 10 GB, keeping recording
 continuous.** If the cap is reached, prune old records to make room and keep
-writing. Prune in this order:
+writing. Two floors, counted back from the newest save, set the order, so that no
+tier of history can starve another:
 
-1. Oldest individual readings, after their summaries are safely stored.
-2. Oldest minute summaries, then oldest 15-minute summaries, retaining hourly
-   summaries longest.
-3. Retain rare incident records longer than routine readings.
+1. Individual readings older than 48 hours, oldest first, after their summaries are
+   safely stored.
+2. Minute summaries, then 15-minute summaries, older than 48 hours.
+3. Hour summaries older than 14 days.
+4. Only if that is not enough, the floors give: readings inside the 48 hours, oldest
+   first, then minute, 15-minute and last hour summaries. Each of these deletions
+   carries reason `fine_floor_unmet`.
+5. Rare incident records last, longer than routine readings.
 
 Use consistent time cutoffs across components and processes. Show remaining
-coverage and which history was removed. Exact cutoffs and reclaim amounts follow
-measured storage growth; this order does not promise indefinite retention.
-Pruning applies to Machine-audit's own records, not other files on the device.
+coverage and which history was removed. This order does not promise indefinite
+retention. Pruning applies to Machine-audit's own records, not other files on the
+device.
+
+**The floors and the 10 GB cap.** Pruning starts at 90% of the cap and everything
+Machine-audit stores shares it, including the scanner's map. The floors hold only
+while the room left covers them, and the cap always wins: a save still fits and
+recording continues. On a box where it cannot hold both floors, the newest detail
+and the last 14 days of hour rows stay, raw readings give first, and coverage reports
+each removed span as `pruned` with reason `fine_floor_unmet`. Hour rows of the last
+14 days outrank raw inside the 48 hours because they are about 50 times cheaper a day
+and the only record that goes back further. Without that floor, a box that cannot
+hold 48 hours of raw would keep no hour rows older than the 48 hours.
+
+| Per 48 hours on disk (Oct 2026 rates) | Big Mac | Small Ubuntu box |
+| --- | ---: | ---: |
+| Raw readings | 5.6 GB | about 1.5 GB |
+| Minute rows | 1.2 GB | together about 1.2 GB |
+| 15-minute rows and coverage | 0.4 GB | |
+| Scanner map | 3.7 GB | 0.01 GB |
+| 14 days of hour rows | 0.7–1.1 GB | unmeasured |
+| Total against the 9 GB pruning level | 11.6–12 GB | about 3 GB |
+
+Big Mac cannot hold the fine floor with its scanner map under the cap. By these
+estimates it keeps about 24 hours of raw readings (22–26), 48 hours of minute and
+15-minute rows and 14 days of hour rows, and records the rest as `fine_floor_unmet`.
+Big Mac's raw figure is measured at 1.88 MB a minute, 90% of it process passes; its
+summary figures apply the top-consumer rule and the dictionary to measured rows, and
+are not yet measured in place. The Ubuntu figures are the
+[recorded day](development.md#review-regressions-and-scale-measurements) doubled at
+its 1.66 disk-to-payload ratio.
 
 Counted writes reserve their transaction's growth and journal pages, rather
 than another copy of the entire database. The readings store starts proactive
@@ -85,14 +118,14 @@ copy of the entire database to delete old data. `max_page_count` enforces
 the admitted database-length limit. Each committed prune batch checkpoints
 before the next admission. Retention records expose the affected time windows,
 including partially removed windows; raw data without saved coverage is kept.
-This bounded pruning path lets recovery remove raw readings, then minute,
-15-minute and hourly summaries, retaining incident history longest, even
-when the ordinary whole-database write reservation no longer fits.
+This bounded pruning path lets recovery follow the order above, retaining
+incident history longest, even when the ordinary whole-database write
+reservation no longer fits.
 
 If crash recovery leaves a raw window without summary coverage, keep that
-window and search forward for the oldest fully covered raw window. Only after
-all covered raw windows are gone may pruning continue into minute, 15-minute
-and hour summaries and incidents. Coverage evidence must match both sequence and
+window and search forward for the oldest fully covered raw window. At each
+floor, only after the covered raw windows it allows are gone may pruning
+continue into summaries. Coverage evidence must match both sequence and
 observation time; a later high sequence alone does not prove an earlier window
 was summarized. Each retained window is recorded as `raw_preserved` with reason
 `missing_summary_coverage`. These records appear in retention history, but are
@@ -108,7 +141,7 @@ between windows. Each search passes over windows already recorded as
 `raw_preserved`, so it resumes where the last one stopped. A search that runs
 out before a covered window prunes the oldest summaries instead, with reason
 `storage_budget_raw_uncovered`, and records the uncovered windows it found.
-Only when nothing coarser remains does it report `prune_precheck_limit`, without
+Only when nothing else remains does it report `prune_precheck_limit`, without
 deleting history or discarding pending readings. Native I/O must return before
 SQLite can check its progress limit. No additional index or background scan is
 needed.

@@ -142,7 +142,7 @@ class BudgetRecoveryTests(unittest.TestCase):
                         self.assertLess(len(reasons),20)
                 self.assertEqual(raw(0,200*MINUTE),1200)  # uncovered readings stay
                 self.assertIn('storage_budget_raw_uncovered',reasons[:-1])  # ran out, pruned summaries
-                self.assertEqual(reasons[-1],'storage_budget')  # then reached covered raw
+                self.assertEqual(reasons[-1],'fine_floor_unmet')  # then reached covered raw, all under 48 hours old
             finally:store.close()
 
     def reads(self,collector,first,last):

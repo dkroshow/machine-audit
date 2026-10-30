@@ -215,9 +215,10 @@ on. The storage approach lists both.
 
 ## Pruned history
 
-Pruning follows the [retention order](storage-approach.md#requirements):
-oldest readings first, then oldest minute rollups, hourly and incident records
-longest. Answers over a span that crosses a cutoff say where detail ends:
+Pruning follows the [retention order](storage-approach.md#requirements): fine
+detail older than 48 hours, then hour rollups older than 14 days, then the rest,
+with incident records longest. Answers over a span that crosses a cutoff say where
+detail ends:
 
 - *series* names its resolution per span and marks the pruned range.
 - *who* keeps every program's rollup and each bucket's top instances. Additive
