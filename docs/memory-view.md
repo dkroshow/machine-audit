@@ -68,7 +68,7 @@ For any retained interval, show capacity and observed limits, usage by class,
 movement by kind, each contention signal, affected workloads and coverage.
 Preserve events separately from counts. Summary means must retain their weighting;
 maxima preserve observed magnitude, not the full sequence leading to a failure.
-The storage contract governs retention, including the default to keep process detail.
+The storage contract governs retention, including which process detail each summary bucket keeps.
 
 Measure expanded process reads and stored size on each initial device. The observed
 24 ms `TASK_VM_INFO` pass on Big Mac is not a total overhead measurement. Ubuntu
