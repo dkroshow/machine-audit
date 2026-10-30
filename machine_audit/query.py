@@ -12,7 +12,7 @@ from operator import itemgetter
 from dataclasses import replace
 from itertools import chain, groupby, takewhile
 from .derive import points, rollups, summarize, merge_summaries, GOOD, BUSY
-from .store import MINUTE, QUARTER, HOUR, WIDTHS, unpack_summaries
+from .store import MINUTE, QUARTER, HOUR, THINNED, WIDTHS, unpack_summaries
 from .model import (PROCESS_ENTITIES, WHO_TOTALS, Record, field_component, is_process_evidence, is_series,
                     who_ranks, who_row, who_value)
 
@@ -531,7 +531,7 @@ class Query:
                 gaps.append(dict(status="unobserved",reason="after_last_save",start_ns=max(start_ns,last),end_ns=effective_stop,run_id=run["run_id"]))
             cursor=max(cursor,effective_stop if not stopped else min(stopped,end_ns))
         if cursor<end_ns:gaps.append(dict(status="unobserved",reason="no_collector",start_ns=cursor,end_ns=end_ns))
-        gaps.extend(dict(r,status="pruned") for r in retention if r['kind']!='raw_preserved')
+        gaps.extend(dict(r,status="pruned") for r in retention if r['kind']!='raw_preserved' and r['reason']!=THINNED)
         empty_rows={}
         for record in records:
             reading=record.reading

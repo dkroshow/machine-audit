@@ -31,6 +31,10 @@ TOP_N = 25
 RANKED = {"minute": PROCESS_ENTITIES, "15-minute": ("process:",), "hour": ("process:",)}
 MEMORY_RANK = ("process.phys_footprint", "process.resident_size")  # Mac footprint, else Linux resident set
 IO_RANK = ("process.diskio_bytesread", "process.diskio_byteswritten")
+RANK_SIGNALS = frozenset({"process.cpu", *MEMORY_RANK, *IO_RANK})
+# The retention reason of rows thinned to a bucket's top consumers. The span stays
+# answered, so coverage lists the record and reports no pruned gap.
+THINNED = "top_consumers_kept"
 # Per-scope summary resolution (storage-approach.md): these scopes keep hour summaries only.
 # Raw readings still answer recent intervals.
 HOUR_ONLY_SCOPES = frozenset({"unit_detail"})
@@ -184,7 +188,8 @@ class Store:
                 self.db.execute("ALTER TABLE summaries ADD COLUMN who_rank REAL")
             # The first ranked bucket dates the column: later NULLs mean nothing ranks.
             self.db.execute("CREATE INDEX IF NOT EXISTS summaries_ranked ON summaries(resolution,bucket_ns) WHERE who_rank IS NOT NULL")
-            self.db.execute("PRAGMA user_version=2")
+            # A write only if needed: thinning opens a store beside the running collector.
+            if self.db.execute("PRAGMA user_version").fetchone()[0]!=2:self.db.execute("PRAGMA user_version=2")
             self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def close(self):
@@ -605,54 +610,104 @@ class Store:
                 if len(rows)==PRUNE_BATCH:break
         else:
             rows=self.db.execute(f"SELECT rowid,length(payload) FROM {table} WHERE {condition} LIMIT ?",(*args,PRUNE_BATCH)).fetchall()
-        page=self.db.execute('PRAGMA page_size').fetchone()[0]
         preserved=[(start,end) for start,end in preserved if not self.db.execute(
             "SELECT 1 FROM retention WHERE kind='raw_preserved' AND start_ns<=? AND end_ns>=?",(start,end)).fetchone()]
-        return kind,start,end,table,rows,preserved,skipped_raw,page
+        return kind,start,end,table,rows,preserved,skipped_raw
 
     def prune_oldest(self):
         with self._mutex:
             batch=self._prune_candidates()
             if batch is None:return self._reclaim_free_pages()
-            kind,start,end,table,rows,preserved,skipped_raw,page=batch
-            while rows:
-                payload_pages=sum((size+page-1)//page for _,size in rows)
-                coverage=[]
-                if kind in ('minute','hour'):
-                    predicate="resolution='minute' AND end_ns<?" if kind=='minute' else 'end_ns<?'
-                    with self._prune_precheck():
-                        coverage=self.db.execute(f'SELECT rowid,length(payload) FROM coverage WHERE {predicate} LIMIT ?',
-                                                 (end,len(rows))).fetchall()
-                coverage_pages=sum((size+page-1)//page for _,size in coverage)
-                vacuum_steps=min(PRUNE_BATCH,payload_pages+len(rows))
-                # Bounded delete/index work, overflow pages, then bounded page moves.
-                frames=64+(len(rows)+len(coverage)+len(preserved))*PRUNE_ROW_PAGES+payload_pages+coverage_pages+8*vacuum_steps
-                try:
-                    with self.budget.sqlite_write(self.db,self.path,0,max_growth_bytes=8*page,dirty_pages=frames):
-                        self.db.execute("BEGIN IMMEDIATE")
-                        try:
-                            ids=[row[0] for row in rows]
-                            placeholders=','.join('?' for _ in ids)
-                            if table=="readings":
-                                self.db.execute(f"DELETE FROM reading_components WHERE (run_id,sequence) IN (SELECT run_id,sequence FROM readings WHERE rowid IN ({placeholders}))",ids)
-                            self.db.execute(f"DELETE FROM {table} WHERE rowid IN ({placeholders})",ids)
-                            self.db.executemany('DELETE FROM coverage WHERE rowid=?',((row[0],) for row in coverage))
-                            self.db.executemany("INSERT INTO retention VALUES('raw_preserved',?,?,'missing_summary_coverage')",preserved)
-                            reason='storage_budget_raw_uncovered' if skipped_raw and kind!='raw' else 'storage_budget'
-                            previous=self.db.execute("SELECT rowid FROM retention WHERE kind=? AND start_ns<=? AND end_ns>=? AND reason=?",(kind,start,start,reason)).fetchone()
-                            if previous:self.db.execute("UPDATE retention SET end_ns=max(end_ns,?) WHERE rowid=?",(end,previous[0]))
-                            else:self.db.execute("INSERT INTO retention VALUES(?,?,?,?)",(kind,start,end,reason))
-                            for _ in range(min(vacuum_steps,self.db.execute("PRAGMA freelist_count").fetchone()[0])):
-                                self.db.execute("PRAGMA incremental_vacuum(1)")
-                            self.db.execute("COMMIT")
-                        except BaseException:
-                            if self.db.in_transaction:self.db.execute("ROLLBACK")
-                            raise
-                    return True
-                except (sqlite3.OperationalError,BudgetExceeded) as exc:
-                    if not self._capacity_error(exc) or len(rows)==1:raise
-                    rows=rows[:max(1,len(rows)//2)]
-            return False
+            kind,start,end,table,rows,preserved,skipped_raw=batch
+            def coverage(count):
+                if kind not in ('minute','hour'):return []
+                predicate="resolution='minute' AND end_ns<?" if kind=='minute' else 'end_ns<?'
+                with self._prune_precheck():
+                    return self.db.execute(f'SELECT rowid,length(payload) FROM coverage WHERE {predicate} LIMIT ?',(end,count)).fetchall()
+            reason='storage_budget_raw_uncovered' if skipped_raw and kind!='raw' else 'storage_budget'
+            return bool(self._delete_batch(table,rows,(kind,start,end,reason),preserved,coverage))
+
+    def _delete_batch(self,table,rows,retention,preserved=(),coverage=lambda count:()):
+        """Delete up to `rows` (rowid, payload size) in one counted transaction with the
+        related coverage and its retention record, halving when it does not fit. Return
+        the number of rows deleted."""
+        kind,start,end,reason=retention
+        page=self.db.execute('PRAGMA page_size').fetchone()[0]
+        while rows:
+            payload_pages=sum((size+page-1)//page for _,size in rows)
+            related=coverage(len(rows))
+            coverage_pages=sum((size+page-1)//page for _,size in related)
+            vacuum_steps=min(PRUNE_BATCH,payload_pages+len(rows))
+            # Bounded delete/index work, overflow pages, then bounded page moves.
+            frames=64+(len(rows)+len(related)+len(preserved))*PRUNE_ROW_PAGES+payload_pages+coverage_pages+8*vacuum_steps
+            try:
+                with self.budget.sqlite_write(self.db,self.path,0,max_growth_bytes=8*page,dirty_pages=frames):
+                    self.db.execute("BEGIN IMMEDIATE")
+                    try:
+                        ids=[row[0] for row in rows]
+                        placeholders=','.join('?' for _ in ids)
+                        if table=="readings":
+                            self.db.execute(f"DELETE FROM reading_components WHERE (run_id,sequence) IN (SELECT run_id,sequence FROM readings WHERE rowid IN ({placeholders}))",ids)
+                        self.db.execute(f"DELETE FROM {table} WHERE rowid IN ({placeholders})",ids)
+                        self.db.executemany('DELETE FROM coverage WHERE rowid=?',((row[0],) for row in related))
+                        self.db.executemany("INSERT INTO retention VALUES('raw_preserved',?,?,'missing_summary_coverage')",preserved)
+                        previous=self.db.execute("SELECT rowid FROM retention WHERE kind=? AND start_ns<=? AND end_ns>=? AND reason=?",(kind,start,start,reason)).fetchone()
+                        if previous:self.db.execute("UPDATE retention SET end_ns=max(end_ns,?) WHERE rowid=?",(end,previous[0]))
+                        else:self.db.execute("INSERT INTO retention VALUES(?,?,?,?)",(kind,start,end,reason))
+                        for _ in range(min(vacuum_steps,self.db.execute("PRAGMA freelist_count").fetchone()[0])):
+                            self.db.execute("PRAGMA incremental_vacuum(1)")
+                        self.db.execute("COMMIT")
+                    except BaseException:
+                        if self.db.in_transaction:self.db.execute("ROLLBACK")
+                        raise
+                return len(rows)
+            except (sqlite3.OperationalError,BudgetExceeded) as exc:
+                if not self._capacity_error(exc) or len(rows)==1:raise
+                rows=rows[:max(1,len(rows)//2)]
+        return 0
+
+    def _outside_top(self,run_id,resolution,bucket):
+        """The saved process rows (rowid, payload size) a bucket's top consumers do not
+        keep, and how many rows could not be read and so stay. Ranked on the rows still
+        there: the top of any set that holds them is the same, so a bucket thinned part
+        way, or saved under the rule, gives the same answer."""
+        found=self.db.execute("""SELECT id,component,entity,length(payload) FROM summaries WHERE run_id=? AND resolution=?
+            AND bucket_ns=? AND entity LIKE 'process:%'""",(run_id,resolution,bucket)).fetchall()
+        own={entity for _,component,entity,_ in found if component=="self"}
+        candidates=[row for row in found if ranked(resolution,row[1],row[2])]
+        rows=[];unread=set()
+        for lo in range(0,len(candidates),500):
+            ids=[row[0] for row in candidates[lo:lo+500]]
+            for identifier,payload in self.db.execute(f"SELECT id,payload FROM summaries WHERE id IN ({','.join('?'*len(ids))})",ids):
+                try:rows.extend(unpack_summaries(payload,lambda signal,kind,component:signal in RANK_SIGNALS))
+                except (zlib.error,ValueError):unread.add(identifier)
+        keep=top_consumers(rows)|own
+        return [(identifier,size) for identifier,_,entity,size in candidates if entity not in keep and identifier not in unread],len(unread)
+
+    def thin_process_rows(self,batches=None):
+        """Delete rows saved before the top-consumer rule: process rows outside each
+        bucket's top consumers. Each delete is one counted prune transaction. It keeps
+        no progress of its own: a thinned bucket gives nothing more to delete, so running
+        again resumes. Stops after `batches` transactions; `complete` says none remain."""
+        result=dict(complete=False,batches=0,rows_deleted=0,payload_bytes_deleted=0,rows_unread=0)
+        runs=[run for run, in self.db.execute("SELECT run_id FROM runs ORDER BY started_ns")]
+        for resolution in ("hour","15-minute"):
+            for run in runs:
+                bucket=None
+                while True:
+                    bucket=self.db.execute("SELECT MIN(bucket_ns) FROM summaries WHERE run_id=? AND resolution=? AND bucket_ns>?",(run,resolution,-2**63 if bucket is None else bucket)).fetchone()[0]
+                    if bucket is None:break
+                    outside,unread=self._outside_top(run,resolution,bucket)
+                    result["rows_unread"]+=unread
+                    while outside:
+                        if result["batches"]==batches:return result
+                        with self._mutex:
+                            count=self._delete_batch("summaries",outside[:PRUNE_BATCH],(resolution,bucket,bucket+WIDTHS[resolution],THINNED))
+                        result["batches"]+=1;result["rows_deleted"]+=count
+                        result["payload_bytes_deleted"]+=sum(size for _,size in outside[:count])
+                        outside=outside[count:]
+        result["complete"]=True
+        return result
 
     def _reclaim_free_pages(self):
         steps=min(PRUNE_BATCH,self.db.execute('PRAGMA freelist_count').fetchone()[0])
@@ -743,7 +798,7 @@ class Store:
                 with path.open("rb") as stream:
                     digest=hashlib.file_digest(stream,"sha256").hexdigest()
                     os.fsync(stream.fileno())
-                pruned=[dict(r) for r in source.execute("SELECT * FROM retention WHERE kind!='raw_preserved' ORDER BY start_ns LIMIT 1001")]
+                pruned=[dict(r) for r in source.execute("SELECT * FROM retention WHERE kind!='raw_preserved' AND reason!=? ORDER BY start_ns LIMIT 1001",(THINNED,))]
                 manifest={"schema_version":1,"format":"machine-audit-records-sqlite-v1","device_id":device_id,"run_id":run_id,
                           "after_sequence":after_sequence,"first_sequence":included[0][0] if included else None,
                           "last_sequence":included[-1][0] if included else None,"count":len(included),

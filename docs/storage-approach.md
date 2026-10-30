@@ -257,6 +257,20 @@ rows existed answers from its minute rows. An instance answers for the buckets
 it topped, so a gauge's mean over a long span is the mean of those buckets.
 Coverage and export are unchanged.
 
+**Rows saved before the rule.** `machine-audit thin-process-rows [--batches N]`
+applies the rule to 15-minute and hour rows an earlier release saved: for each
+run and bucket it ranks the saved process rows with the same function and deletes
+the rest. Only those rows go; minute rows, program, host, device, unit and self
+rows and raw readings stay. Each delete is one prune transaction, so it is counted
+the same way and holds at most 4,096 rows. Nothing records its progress: a thinned
+bucket ranks to the same top and offers nothing more to delete, so running it again
+resumes, and a bucket stopped part way finishes the same. It reads in short
+transactions and takes turns with the collector through the budget, so it can run
+while the collector saves. A thinned bucket gets a retention record for its
+resolution with reason `top_consumers_kept`. Coverage lists it but reports no pruned
+gap, and export leaves it out of `pruned_ranges`, because the span still answers. A
+row that cannot be read stays and is counted in `rows_unread`.
+
 **Measured and estimated cost.** A Mac-shaped synthetic run (2,000
 processes, 600 program labels, 10 s passes, saves every 60 s not aligned
 with minutes) measured:

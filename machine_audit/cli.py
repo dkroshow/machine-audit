@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import importlib
 import json
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -36,6 +37,8 @@ def parser():
         if command=="install":
             sub.add_argument("--yes",action="store_true",help="install without the confirmation question")
             sub.add_argument("--upgrade",action="store_true",help="replace an existing Linux installation, keeping the old one renamed")
+    thin=commands.add_parser("thin-process-rows",help="delete process rows saved before the top-consumer rule; run again to resume")
+    thin.add_argument("--batches",type=int,help="stop after this many delete transactions")
     scan=commands.add_parser("scan")
     scan.add_argument("--root")
     scan.add_argument("--full",action="store_true",help="walk in full now (Linux); one scan at a time still holds")
@@ -109,6 +112,20 @@ def _run(config,ready):
         if collector is None or collector._closer is None or not collector._closer.is_alive():store.close()
 
 
+def _thin(config,batches):
+    from .budget import Budget, BudgetExceeded
+    from .store import Store
+    if not config.store_path.is_file():
+        print("No saved history to thin.",file=sys.stderr);return 2
+    store=Store(config.store_path,Budget(config.root))
+    try:
+        print(json.dumps(store.thin_process_rows(batches)))
+    except (sqlite3.Error,BudgetExceeded) as exc:
+        print("Thinning stopped; run it again to resume: "+getattr(exc,"sqlite_errorname",str(exc)),file=sys.stderr);return 1
+    finally:store.close()
+    return 0
+
+
 def main(argv=None):
     args=parser().parse_args(argv)
     config=Config.load(args.config)
@@ -131,6 +148,8 @@ def main(argv=None):
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
             print("Installation action failed: " + type(exc).__name__, file=sys.stderr)
             return 2
+    if args.command=="thin-process-rows":
+        return _thin(config,args.batches)
     if args.command=="scan":
         module=importlib.import_module("machine_audit.scanner")
         return module.main(config,root=args.root,force=args.full)
