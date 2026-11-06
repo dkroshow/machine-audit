@@ -22,12 +22,19 @@ QUARTER = 15 * MINUTE
 HOUR = 60 * MINUTE
 # Stored summary resolutions, finest first.
 WIDTHS = {"minute": MINUTE, "15-minute": QUARTER, "hour": HOUR}
-# Retention floors, back from the newest reading (storage-approach.md). Fine detail of the
-# last 48 hours outlasts older hour rows; hour rows of the last 14 days outlast it when the
-# cap cannot hold both, which on Big Mac leaves 14 days of who rather than none.
-FINE_FLOOR = 48 * HOUR
-HOUR_FLOOR = 14 * 24 * HOUR
-FLOOR_UNMET = "fine_floor_unmet"
+# Retention, each from the question it serves (storage-approach.md#retention), counted back
+# from the newest save. Per-pass process detail answers an event noticed the same day or the
+# next morning; host readings and minute and 15-minute rows the last few days, so Friday can
+# still be looked at on Monday. Hour rows and incidents are the long history: no retention.
+PROCESS_RAW_RETENTION = 24 * HOUR
+RECENT_RETENTION = 3 * 24 * HOUR
+# The emergency order, finest and cheapest to lose first, and each tier's retention.
+TIERS = (("process_raw", PROCESS_RAW_RETENTION), ("raw", RECENT_RETENTION), ("minute", RECENT_RETENTION),
+         ("15-minute", RECENT_RETENTION), ("hour", None), ("incident", None))
+# Above this share of the cap, history goes oldest first by TIERS, each deletion recorded
+# as "storage_cap": an emergency, not a policy. The rest of the cap leaves room for the
+# largest counted write's journal and checkpoint (a 4,096-row prune) and a scanner write.
+EMERGENCY_LEVEL = 0.9
 # A bucket keeps a process or program as its own row when it was at least this share of the
 # bucket's use of a component by its kind; the rest of each kind become one row, so totals
 # still add up (storage-approach.md#main-contributors).
@@ -226,6 +233,7 @@ class Store:
         self._held = {}  # resolution -> the run's newest bucket of ranked rows
         self._conversion = None  # where converting a version 2 store resumes
         self.conversion_error = None
+        self.cap_pruning = False  # whether the last save had to prune at the emergency level
         if read_only:
             self.db=sqlite3.connect(f"file:{self.path}?mode=ro",uri=True,check_same_thread=False,isolation_level=None)
             if self.db.execute("PRAGMA user_version").fetchone()[0] not in (2,STORE_VERSION):
@@ -566,21 +574,42 @@ class Store:
         self.db.execute("UPDATE runs SET last_sequence=?,last_saved_ns=? WHERE run_id=?",(last.sequence,max(r.reading.end.wall_ns for r in records),first.run_id))
 
     def maintain(self, required_bytes=0):
-        """Prune in the order _prune_batch gives, finishing with rare incident history.
+        """Expire what has outlived its retention, take one step of converting a version 2
+        store, and only above the emergency level prune oldest first.
 
-        Work starts well before the cap; if reserve cannot fit, fail without
-        removing a file or discarding the collector's pending batch.
+        If reserve cannot fit, fail without removing a file or discarding the
+        collector's pending batch.
         """
+        self._expire()
         if self._conversion:
             try:self._convert_step()
             except Exception as exc:
                 # Converting is never worth a lost save: it stops until the next start and says why.
                 self._conversion=None
                 self.conversion_error=getattr(exc,"sqlite_errorname",None) or (str(exc) if isinstance(exc,BudgetExceeded) else type(exc).__name__)
-        target = self.budget.limit_bytes*.90
+        target = self.budget.limit_bytes*EMERGENCY_LEVEL
+        if self.budget.usage()["bytes"] + required_bytes <= target:self.cap_pruning=False
         while self.budget.usage()["bytes"] + required_bytes > target:
             if not self.prune_oldest():
                 break
+
+    def _expire(self):
+        """Delete each tier's history older than its retention, oldest first, one counted
+        transaction at a time. A backlog (after an upgrade) clears in the first saves. A
+        save at the cap expires nothing and leaves it to the emergency path."""
+        newest=self.db.execute("SELECT MAX(last_saved_ns) FROM runs").fetchone()[0]
+        if newest is None:return
+        for kind,retention in TIERS:
+            if retention is None:continue
+            # Whole minutes, so no covered raw reading is older than an expired summary.
+            before=(newest-retention)//MINUTE*MINUTE
+            while True:
+                try:
+                    batch=self._oldest(kind,before)
+                    if batch is None or not self._delete(batch,"retention"):break
+                except (sqlite3.OperationalError,BudgetExceeded) as exc:
+                    if not self._capacity_error(exc) and str(exc)!="prune_precheck_limit":raise
+                    break
 
     @contextmanager
     def _prune_precheck(self):
@@ -601,107 +630,119 @@ class Store:
         finally:
             self.db.set_progress_handler(None,0)
 
-    def _covered_raw(self,deadline,preserved):
-        """The oldest raw window whose every reading is proven summarized, and whether
-        an uncovered window came first. Uncovered windows found are added to
+    def _raw_filter(self,kind):
+        """The readings of one raw tier: per-process and per-workload passes (every field
+        their source has saved is process evidence), or everything else."""
+        series=defaultdict(bool)
+        for source,component,scope in self.db.execute("SELECT source,component,scope FROM signal_catalog"):
+            series[source]|=is_series(component,"host",scope)
+        detail=sorted(source for source,value in series.items() if not value)
+        return f"source {'IN' if kind=='process_raw' else 'NOT IN'} ({','.join('?'*len(detail))})",detail
+
+    def _covered_raw(self,deadline,preserved,kind):
+        """The oldest window of one raw tier whose every reading is proven summarized, and
+        whether an uncovered window came first. Uncovered windows found are added to
         `preserved`; windows already recorded as preserved are passed over, so each
         search resumes where the last one stopped."""
         skipped=False
-        row = self.db.execute("SELECT MIN(wall_ns) FROM readings").fetchone()
+        where,args=self._raw_filter(kind)
+        row = self.db.execute(f"SELECT MIN(wall_ns) FROM readings WHERE {where}",args).fetchone()
         while row[0] is not None:
             if time.monotonic()>=deadline:raise BudgetExceeded("prune_precheck_limit")
             start = row[0]
             resume = self.db.execute("SELECT max(end_ns) FROM retention WHERE kind='raw_preserved' AND start_ns<=? AND end_ns>?",(start,start)).fetchone()[0]
             if resume is not None:
                 skipped=True
-                row=self.db.execute('SELECT MIN(wall_ns) FROM readings WHERE wall_ns>=?',(resume,)).fetchone()
+                row=self.db.execute(f'SELECT MIN(wall_ns) FROM readings WHERE wall_ns>=? AND {where}',(resume,*args)).fetchone()
                 continue
             end = (start // MINUTE + 1) * MINUTE
             # Keep every proof condition, but seek recent coverage first.
             # EXISTS discards ORDER BY; the non-null scalar preserves it.
-            missing = self.db.execute("""SELECT 1 FROM readings r WHERE wall_ns>=? AND wall_ns<? AND
+            missing = self.db.execute(f"""SELECT 1 FROM readings r WHERE wall_ns>=? AND wall_ns<? AND {where} AND
             (SELECT s.start_ns FROM coverage s WHERE s.run_id=r.run_id AND s.resolution='minute'
              AND s.sequence_max>=r.sequence AND s.source=r.source AND s.start_ns<=r.wall_ns AND s.end_ns>=r.wall_ns
-             ORDER BY s.start_ns DESC LIMIT 1) IS NULL LIMIT 1""",(start,end)).fetchone()
+             ORDER BY s.start_ns DESC LIMIT 1) IS NULL LIMIT 1""",(start,end,*args)).fetchone()
             if not missing:return (start,end),skipped or bool(preserved)
             if preserved and preserved[-1][1]==start//MINUTE*MINUTE:
                 preserved[-1]=(preserved[-1][0],end)
             else:preserved.append((start,end))
-            row=self.db.execute('SELECT MIN(wall_ns) FROM readings WHERE wall_ns>=?',(end,)).fetchone()
+            row=self.db.execute(f'SELECT MIN(wall_ns) FROM readings WHERE wall_ns>=? AND {where}',(end,*args)).fetchone()
         return None,skipped or bool(preserved)
 
-    def _prune_candidates(self):
-        preserved=[]
-        exhausted=False
-        try:
-            with self._prune_precheck() as deadline:
-                window,skipped_raw=self._covered_raw(deadline,preserved)
-        except BudgetExceeded as exc:
-            # The search ran out before a covered window: prune coarser history now,
-            # and record the uncovered windows found so the next search goes further.
-            if str(exc)!="prune_precheck_limit":raise
-            window,skipped_raw,exhausted=None,True,True
-        with self._prune_precheck():
-            batch=self._prune_batch(window,preserved,skipped_raw)
-        if batch is None and exhausted:raise BudgetExceeded("prune_precheck_limit")
-        return batch
-
-    def _prune_batch(self,window,preserved,skipped_raw):
-        """The next batch: raw, minute and 15-minute history older than the fine floor,
-        hour rows older than the hour floor, then the same inside the floors, and last
-        rare incidents. Covered raw stays first in each pass; uncovered raw stays intact."""
-        # The newest save, not the newest raw reading: pruning can remove every reading.
-        newest=self.db.execute("SELECT MAX(last_saved_ns) FROM runs").fetchone()[0]
-        fine=hours=math.inf  # With nothing saved, nothing to anchor a floor.
-        if newest is not None:
-            # Whole minutes, so no covered raw reading is older than a pruned summary.
-            fine=(newest-FINE_FLOOR)//MINUTE*MINUTE;hours=newest-HOUR_FLOOR
-        passes=(("raw",fine),("minute",fine),("15-minute",fine),("hour",hours),
-                ("raw",math.inf),("minute",math.inf),("15-minute",math.inf),("hour",math.inf))
-        summary_heads=[]
-        for kind,limit in passes:
-            if kind=="raw":
-                if window and window[1]<=limit:
-                    start,end=window;table,condition,args="readings","wall_ns>=? AND wall_ns<?",window
-                    break
-                continue
-            heads=self._summary_heads(kind)
-            if heads and min(t for _,t in heads)+WIDTHS[kind]<=limit:
-                summary_heads=heads;start=min(t for _,t in heads)
-                end,table=start+WIDTHS[kind],"summaries"
-                break
+    def _oldest(self,kind,before=math.inf):
+        """One tier's oldest batch ending at or before `before`, or None. Raw goes only once
+        proven summarized: a raw search also returns the uncovered windows it found, and
+        whether it ran out before reaching a covered one."""
+        batch=dict(kind=kind,rows=[],preserved=[],skipped=False,exhausted=False)
+        if kind in ("process_raw","raw"):
+            try:
+                with self._prune_precheck() as deadline:
+                    window,batch["skipped"]=self._covered_raw(deadline,batch["preserved"],kind)
+            except BudgetExceeded as exc:
+                if str(exc)!="prune_precheck_limit":raise
+                window,batch["skipped"],batch["exhausted"]=None,True,True
+            if window is not None and window[1]<=before:
+                where,args=self._raw_filter(kind)
+                with self._prune_precheck():
+                    batch.update(start=window[0],end=window[1],table="readings",rows=self.db.execute(
+                        f"SELECT rowid,length(payload) FROM readings WHERE wall_ns>=? AND wall_ns<? AND {where} LIMIT ?",(*window,*args,PRUNE_BATCH)).fetchall())
+        elif kind in WIDTHS:
+            with self._prune_precheck():
+                heads=self._summary_heads(kind)
+                if not heads or min(t for _,t in heads)+WIDTHS[kind]>before:return None
+                start=min(t for _,t in heads);end=start+WIDTHS[kind];rows=[]
+                for component,first in heads:
+                    if first<end:
+                        rows.extend(self.db.execute("SELECT rowid,length(payload) FROM summaries WHERE resolution=? AND component=? AND bucket_ns<? LIMIT ?",
+                            (kind,component,end,PRUNE_BATCH-len(rows))).fetchall())
+                    if len(rows)==PRUNE_BATCH:break
+            batch.update(start=start,end=end,table="summaries",rows=rows)
         else:
             row=self.db.execute("SELECT MIN(wall_ns) FROM incidents").fetchone()
-            if row[0] is None:return None
-            kind,start,end="incident",row[0],(row[0]//MINUTE+1)*MINUTE
-            table,condition,args="incidents","wall_ns < ?",(end,)
-        inside=newest is not None and limit==math.inf and kind!="incident"
-        if summary_heads:
-            rows=[]
-            for component,first in summary_heads:
-                if first<end:
-                    rows.extend(self.db.execute('''SELECT rowid,length(payload) FROM summaries
-                        WHERE resolution=? AND component=? AND bucket_ns<? LIMIT ?''',
-                        (kind,component,end,PRUNE_BATCH-len(rows))).fetchall())
-                if len(rows)==PRUNE_BATCH:break
-        else:
-            rows=self.db.execute(f"SELECT rowid,length(payload) FROM {table} WHERE {condition} LIMIT ?",(*args,PRUNE_BATCH)).fetchall()
-        preserved=[(start,end) for start,end in preserved if not self.db.execute(
-            "SELECT 1 FROM retention WHERE kind='raw_preserved' AND start_ns<=? AND end_ns>=?",(start,end)).fetchone()]
-        return kind,start,end,table,rows,preserved,skipped_raw,inside
+            if row[0] is None or row[0]>=before:return None
+            end=(row[0]//MINUTE+1)*MINUTE
+            batch.update(start=row[0],end=end,table="incidents",rows=self.db.execute(
+                "SELECT rowid,length(payload) FROM incidents WHERE wall_ns<? LIMIT ?",(end,PRUNE_BATCH)).fetchall())
+        batch["preserved"]=[(a,b) for a,b in batch["preserved"] if not self.db.execute(
+            "SELECT 1 FROM retention WHERE kind='raw_preserved' AND start_ns<=? AND end_ns>=?",(a,b)).fetchone()]
+        return batch if batch["rows"] or batch["preserved"] or batch["skipped"] or batch["exhausted"] else None
+
+    def _delete(self,batch,reason):
+        """Delete one batch with its related coverage and retention record; with no rows,
+        only record the uncovered windows it found, so the next search passes them."""
+        kind,end,preserved=batch["kind"],batch.get("end"),batch["preserved"]
+        if not batch["rows"]:
+            if preserved:
+                with self.budget.sqlite_write(self.db,self.path,rows=len(preserved)):
+                    self.db.executemany("INSERT INTO retention VALUES('raw_preserved',?,?,'missing_summary_coverage')",preserved)
+            return False
+        def coverage(count):
+            if kind not in ('minute','hour'):return []
+            predicate="resolution='minute' AND end_ns<?" if kind=='minute' else 'end_ns<?'
+            with self._prune_precheck():
+                return self.db.execute(f'SELECT rowid,length(payload) FROM coverage WHERE {predicate} LIMIT ?',(end,count)).fetchall()
+        return bool(self._delete_batch(batch["table"],batch["rows"],(kind,batch["start"],end,reason),preserved,coverage))
 
     def prune_oldest(self):
+        """The emergency path: the first tier with history, oldest batch first, recorded as
+        "storage_cap". Uncovered raw stays: summaries pruned while it does are recorded
+        "storage_cap_raw_uncovered", with the uncovered windows found on the way."""
         with self._mutex:
-            batch=self._prune_candidates()
-            if batch is None:return self._reclaim_free_pages()
-            kind,start,end,table,rows,preserved,skipped_raw,inside=batch
-            def coverage(count):
-                if kind not in ('minute','hour'):return []
-                predicate="resolution='minute' AND end_ns<?" if kind=='minute' else 'end_ns<?'
-                with self._prune_precheck():
-                    return self.db.execute(f'SELECT rowid,length(payload) FROM coverage WHERE {predicate} LIMIT ?',(end,count)).fetchall()
-            reason='storage_budget_raw_uncovered' if skipped_raw and kind!='raw' else FLOOR_UNMET if inside else 'storage_budget'
-            return bool(self._delete_batch(table,rows,(kind,start,end,reason),preserved,coverage))
+            carried=[];uncovered=exhausted=False
+            for kind,_ in TIERS:
+                batch=self._oldest(kind)
+                if batch is None:continue
+                exhausted|=batch["exhausted"]
+                if not batch["rows"]:
+                    carried+=batch["preserved"];uncovered|=batch["skipped"];continue
+                batch["preserved"]=carried+batch["preserved"]
+                if kind in ("process_raw","raw"):uncovered=False
+                if self._delete(batch,"storage_cap_raw_uncovered" if uncovered else "storage_cap"):
+                    self.cap_pruning=True
+                    return True
+            if carried:self._delete(dict(kind="raw",rows=[],preserved=carried),"storage_cap")
+            if exhausted:raise BudgetExceeded("prune_precheck_limit")
+            return self._reclaim_free_pages()
 
     def _delete_batch(self,table,rows,retention,preserved=(),coverage=lambda count:(),insert=()):
         """Delete up to `rows` (rowid, payload size) in one counted transaction with the
@@ -721,7 +762,7 @@ class Store:
                 with self.budget.sqlite_write(self.db,self.path,0,max_growth_bytes=(8+inserted_pages+len(insert))*page,dirty_pages=frames):
                     self.db.execute("BEGIN IMMEDIATE")
                     try:
-                        self.db.executemany(UPSERT_SUMMARY,insert)
+                        if insert:self.db.executemany(UPSERT_SUMMARY,insert)
                         ids=[row[0] for row in rows]
                         placeholders=','.join('?' for _ in ids)
                         if table=="readings":

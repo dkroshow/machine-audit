@@ -20,6 +20,10 @@ from machine_audit.query import Query
 from machine_audit.store import Store, MINUTE, pack_summaries, unpack_summaries
 from test_conversion import saved_as_before
 
+# Readings from these collectors share their real clock, as in a running collector: start of
+# the previous hour, so retention counts them as recent and minute 1 is BASE+60 s.
+BASE=(time.time_ns()//(3600*10**9)-1)*3600*10**9
+
 
 class BudgetRecoveryTests(unittest.TestCase):
     def test_budget_refusal_carries_a_code_never_free_text(self):
@@ -58,7 +62,7 @@ class BudgetRecoveryTests(unittest.TestCase):
                 self.assertEqual(db.execute('SELECT count(*) FROM readings').fetchone()[0],count-per_minute+1)
                 self.assertEqual(db.execute('SELECT wall_ns FROM readings WHERE sequence=1').fetchone()[0],0)
                 self.assertEqual(db.execute("SELECT kind,reason FROM retention ORDER BY rowid").fetchall(),
-                                 [('raw_preserved','missing_summary_coverage'),('raw','storage_budget')])
+                                 [('raw_preserved','missing_summary_coverage'),('raw','storage_cap')])
                 self.assertEqual(db.execute('SELECT count(*) FROM coverage').fetchone()[0],history)
                 # Replay the exact precheck SQL against the pre-prune snapshot,
                 # measuring SQLite work without a machine-speed assertion.
@@ -142,13 +146,13 @@ class BudgetRecoveryTests(unittest.TestCase):
                         reasons.append(store.db.execute('SELECT reason FROM retention ORDER BY rowid DESC LIMIT 1').fetchone()[0])
                         self.assertLess(len(reasons),20)
                 self.assertEqual(raw(0,200*MINUTE),1200)  # uncovered readings stay
-                self.assertIn('storage_budget_raw_uncovered',reasons[:-1])  # ran out, pruned summaries
-                self.assertEqual(reasons[-1],'fine_floor_unmet')  # then reached covered raw, all under 48 hours old
+                self.assertIn('storage_cap_raw_uncovered',reasons[:-1])  # ran out, pruned summaries
+                self.assertEqual(reasons[-1],'storage_cap')  # then reached covered raw
             finally:store.close()
 
     def reads(self,collector,first,last):
         for t in range(first,last):
-            clock=Clock(t*10**9,t*10**9,t*10**9)
+            clock=Clock(BASE+t*10**9,BASE+t*10**9,BASE+t*10**9)
             collector.ingest(Reading('synthetic.process','cpu',clock,clock,tuple(
                 Field('process.cpu',float(t*pid),'seconds','counter',entity=f'process:{pid}',label=f'p{pid}',scope='process',additive=True)
                 for pid in (1,2))))
@@ -161,7 +165,7 @@ class BudgetRecoveryTests(unittest.TestCase):
 
     def held_minute(self,store,run):
         return {entity:[(row['sample_count'],row['total']) for row in unpack_summaries(payload)] for entity,payload in store.db.execute(
-            "SELECT entity,payload FROM summaries WHERE run_id=? AND resolution='minute' AND bucket_ns=? AND entity LIKE 'process:%'",(run,60*10**9))}
+            "SELECT entity,payload FROM summaries WHERE run_id=? AND resolution='minute' AND bucket_ns=? AND entity LIKE 'process:%'",(run,BASE+60*10**9))}
 
     def test_a_stop_at_the_cap_checkpoints_without_merging_and_the_next_start_saves_it(self):
         # Big Mac at the cap: stopping pruned or merged until it outlasted the stop and
@@ -177,11 +181,11 @@ class BudgetRecoveryTests(unittest.TestCase):
                 # Older raw-heavy history: pruning could make room, slowly and by deleting it.
                 history=[]
                 for n in range(300):
-                    clock=Clock((n*10-20000)*10**9,(n*10-20000)*10**9,(n*10-20000)*10**9)
+                    clock=Clock(BASE+(n*10-20000)*10**9,BASE+(n*10-20000)*10**9,BASE+(n*10-20000)*10**9)
                     history.append(Record(Reading('synthetic.blob','storage',clock,clock,tuple(
                         Field(f'storage.f{i}',(n*7919+i*104729)%10**9,'bytes') for i in range(300))),'boot','history',n+1,clock.wall_ns,clock))
                 for lo in range(0,300,60):store.append(history[lo:lo+60])
-                store.stop_run('history',-17000*10**9)
+                store.stop_run('history',BASE-17000*10**9)
                 first=Collector(store,(),run_id='first',boot_id='boot');first.start()
                 self.reads(first,0,70);self.assertTrue(first.flush())
                 self.reads(first,70,100)  # unsaved tail; minute 1 is held
@@ -350,7 +354,7 @@ class BudgetRecoveryTests(unittest.TestCase):
 import json,os,sys,threading,time
 from pathlib import Path
 from unittest.mock import patch
-repo,root,case=sys.argv[1:4]
+repo,root,case,base=sys.argv[1:5];base=int(base)
 sys.path.insert(0,repo)
 import machine_audit.store
 from machine_audit import startup
@@ -369,7 +373,7 @@ def run(ready):
     collector=Collector(store,[Hung()] if case=='hung_read' else [],run_id='stopped',boot_id='boot');collector.start()
     def reads(first,last):
         for t in range(first,last):
-            clock=Clock(t*10**9,t*10**9,t*10**9)
+            clock=Clock(base+t*10**9,base+t*10**9,base+t*10**9)
             collector.ingest(Reading('synthetic.process','cpu',clock,clock,tuple(
                 Field('process.cpu',float(t*pid),'seconds','counter',entity=f'process:{pid}',label=f'p{pid}',scope='process',additive=True)
                 for pid in (1,2))))
@@ -377,7 +381,7 @@ def run(ready):
     if case=='killed_while_checkpointing':
         # Another run's valid checkpoint, not yet saved, beside the one about to be cut short.
         store.start_run('earlier','boot',0)
-        store.spill('earlier',5000,[Record(Reading('synthetic.process','cpu',Clock(t,t,t),Clock(t,t,t)),'boot','earlier',t,t,Clock(t,t,t)).packed
+        store.spill('earlier',base+5000,[Record(Reading('synthetic.process','cpu',Clock(base+t,base+t,base+t),Clock(base+t,base+t,base+t)),'boot','earlier',t,base+t,Clock(base+t,base+t,base+t)).packed
                                     for t in (1,2,3)])
     ready()
     if case=='hung_read':assert entered.wait(5)
@@ -403,7 +407,7 @@ print(json.dumps(startup.read(config)))
         for case,outcome in (('hung_read','checkpointed'),('slow_derivation','checkpointed'),
                              ('blocked_reservation','failed'),('killed_while_checkpointing','killed')):
             with self.subTest(case),tempfile.TemporaryDirectory(dir=scratch) as root:
-                stopped=subprocess.run([sys.executable,'-I','-c',child,str(Path(__file__).parents[2]),root,case],
+                stopped=subprocess.run([sys.executable,'-I','-c',child,str(Path(__file__).parents[2]),root,case,str(BASE)],
                                        capture_output=True,text=True,timeout=60)
                 self.assertEqual(stopped.returncode,3 if outcome=='killed' else 0,stopped.stderr)
                 if outcome=='failed':
@@ -424,7 +428,7 @@ print(json.dumps(startup.read(config)))
                     # and still saves the other run's checkpoint beside it.
                     partial,=Path(root).glob('.unsaved-stopped-*.partial')
                     self.assertEqual(list(Path(root).glob('unsaved-stopped-*')),[])
-                    self.assertEqual([p.name for p in Path(root).glob('unsaved-earlier-*')],['unsaved-earlier-5000.json'])
+                    self.assertEqual([p.name for p in Path(root).glob('unsaved-earlier-*')],[f'unsaved-earlier-{BASE+5000}.json'])
                 store=Store(Path(root)/'readings.sqlite',Budget(root,free_margin_bytes=0))
                 try:
                     after=Collector(store,(),run_id='after',boot_id='boot');after.start()
@@ -434,10 +438,10 @@ print(json.dumps(startup.read(config)))
                     runs=dict(store.db.execute('SELECT run_id,stopped_ns FROM runs'))
                     sequences=[s for s, in store.db.execute("SELECT sequence FROM readings WHERE run_id='stopped' AND source='synthetic.process'")]
                     held={entity:[row['sample_count'] for row in unpack_summaries(payload)] for entity,payload in store.db.execute(
-                        "SELECT entity,payload FROM summaries WHERE run_id='stopped' AND resolution='minute' AND bucket_ns=? AND entity LIKE 'process:%'",(60*10**9,))}
+                        "SELECT entity,payload FROM summaries WHERE run_id='stopped' AND resolution='minute' AND bucket_ns=? AND entity LIKE 'process:%'",(BASE+60*10**9,))}
                     if outcome=='killed':
                         earlier=store.db.execute("SELECT count(*) FROM readings WHERE run_id='earlier'").fetchone()[0]
-                        self.assertEqual((runs['earlier'],earlier),(5000,3),'a valid checkpoint was blocked by a partial one')
+                        self.assertEqual((runs['earlier'],earlier),(BASE+5000,3),'a valid checkpoint was blocked by a partial one')
                         self.assertEqual(list(Path(root).glob('unsaved-earlier-*')),[])
                         self.assertEqual((len(sequences),runs['stopped'],held),(70,None,{}))  # an explicit, unstopped loss
                         self.assertTrue(partial.exists())
@@ -533,7 +537,7 @@ print(json.dumps(startup.read(config)))
                 if uncovered:
                     self.assertNotIn('raw',kinds)
                     self.assertEqual(store.db.execute("SELECT payload FROM readings WHERE run_id='recovered'").fetchone()[0],orphan.packed)
-                    self.assertIn('storage_budget_raw_uncovered',[r[0] for r in store.db.execute('SELECT reason FROM retention')])
+                    self.assertIn('storage_cap_raw_uncovered',[r[0] for r in store.db.execute('SELECT reason FROM retention')])
                 else:
                     self.assertIn('raw',kinds)
                     self.assertLess(kinds.index('raw'),kinds.index('minute'))

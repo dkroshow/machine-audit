@@ -118,11 +118,11 @@ class ReviewTests(unittest.TestCase):
                 name='slow';component='cpu';cadence_s=1
                 def read(self):
                     entered.set();release.wait(5)
-                    c=Clock(1,1,1)
+                    c=Clock.now()  # the collector's own clock, as a source's
                     return Reading(self.name,self.component,c,c,(Field('cpu.ready',1,'count'),))
             collector=Collector(self.store,[Source()],run_id=f'run-{during_checkpoint}');collector.start()
             self.assertTrue(entered.wait(1))
-            c=Clock(2,2,2)
+            c=Clock.now()
             collector.ingest(Reading('completed','cpu',c,c,(Field('cpu.ready',1,'count'),)))
             spill=self.store.spill
             def completing(*args):

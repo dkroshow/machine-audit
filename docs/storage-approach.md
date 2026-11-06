@@ -6,67 +6,93 @@ implementation has not started.
 
 ## Requirements
 
+The readings store exists to answer four questions, for the present and looking back.
+Every keep and retention rule below comes from one of them; none is a byte target.
+
+1. **Was this machine constrained, when, and for how long?** Across CPU, memory, disk
+   activity, network and disk space. Host rows (host, devices, volumes, units, self)
+   answer it, at hour resolution for the whole span and finer for recent time.
+2. **What were the main things responsible each time?** Each bucket's
+   [main contributors](#main-contributors), with one rest row per kind so totals
+   reconcile and the tail shows as a quantity.
+3. **What is growing?** Program and host hour rows over the whole span.
+4. **What happened in detail around a recent event?** Raw readings: process passes
+   briefly after they are summarized, host readings longer, since they show spikes
+   and cost little.
+
+Disk space history comes from the host's volume readings (`storage.used`,
+`storage.free` per volume), kept in hour rows for the whole span, and from the
+scanner's generations.
+
 - **10 GB limit per device; alerts start at 5 GB.** Account for the database,
-  write logs and separate filesystem index together, not as independent caps.
+  write logs and separate filesystem index together, not as independent caps. The
+  limit is an emergency stop, not a retention policy: see [below](#the-cap-is-an-emergency-stop).
 - **Preserve individual readings at collection cadence**, including process
-  and GPU-client detail. Build summaries alongside them for efficient queries.
-- Favor more useful evidence within that budget. Summaries keep only each
-  bucket's top processes ([summary resolutions](#summary-resolutions));
-  fixed short-window expiry remains a later candidate.
-  Choose reductions from measured growth and actual investigations.
+  and GPU-client detail, for as long as their retention. Build summaries alongside
+  them for efficient queries.
 
-**Check growth and prune old records before reaching 10 GB, keeping recording
-continuous.** If the cap is reached, prune old records to make room and keep
-writing. Two floors, counted back from the newest save, set the order, so that no
-tier of history can starve another:
+### Retention
 
-1. Individual readings older than 48 hours, oldest first, after their summaries are
-   safely stored.
-2. Minute summaries, then 15-minute summaries, older than 48 hours.
-3. Hour summaries older than 14 days.
-4. Only if that is not enough, the floors give: readings inside the 48 hours, oldest
-   first, then minute, 15-minute and last hour summaries. Each of these deletions
-   carries reason `fine_floor_unmet`.
-5. Rare incident records last, longer than routine readings.
+Counted back from the newest save; each tier expires a little at every save, oldest
+first, one counted transaction at a time, recorded with reason `retention`. Raw
+readings expire only once proven summarized (below).
 
-Use consistent time cutoffs across components and processes. Show remaining
-coverage and which history was removed. This order does not promise indefinite
-retention. Pruning applies to Machine-audit's own records, not other files on the
-device.
+| History | Kept | Question | Why this value |
+| --- | --- | --- | --- |
+| Process passes (raw readings whose every field is process or workload evidence) | 24 hours | 4 | An event is usually looked at the same day or the next morning. After that, minute rows keep each minute's main contributors and rest, which is the useful part of a pass; the passes themselves are 90% of raw (Big Mac: 1.7 MB a minute). |
+| Host raw readings (everything else) | 3 days | 1, 4 | Spike shape at the source's own cadence (1–60 s) for the last few days, so a problem from Friday can still be looked at on Monday. About a tenth of raw. |
+| Minute and 15-minute rows | 3 days | 1, 2 | The resolutions views of hours and days use (minute rows for windows up to about 10 hours, 15-minute rows to about 6 days at the default 600 rows). Kept as long as the host readings they summarize, so the recent few days zoom to the minute. |
+| Hour rows | Whole span | 1, 2, 3 | The long history. Host rows are never pruned ahead of anything else. |
+| Incidents | Whole span | 1 | Rare, small records of what changed state. |
 
-**The floors and the 10 GB cap.** Pruning starts at 90% of the cap and everything
-Machine-audit stores shares it, including the scanner's map. The floors hold only
-while the room left covers them, and the cap always wins: a save still fits and
-recording continues. On a box where it cannot hold both floors, the newest detail
-and the last 14 days of hour rows stay, raw readings give first, and coverage reports
-each removed span as `pruned` with reason `fine_floor_unmet`. Hour rows of the last
-14 days outrank raw inside the 48 hours because they are about 50 times cheaper a day
-and the only record that goes back further. Without that floor, a box that cannot
-hold 48 hours of raw would keep no hour rows older than the 48 hours.
+These are the only retention numbers. The 1% share that decides which processes and
+programs keep their own rows is under [main contributors](#main-contributors).
 
-| Per 48 hours on disk (Oct 2026 rates) | Big Mac | Small Ubuntu box |
-| --- | ---: | ---: |
-| Raw readings | 5.6 GB | about 1.5 GB |
-| Minute rows | 1.2 GB | together about 1.2 GB |
-| 15-minute rows and coverage | 0.4 GB | |
-| Scanner map | 3.7 GB | 0.01 GB |
-| 14 days of hour rows | 0.7–1.1 GB | unmeasured |
-| Total against the 9 GB pruning level | 11.6–12 GB | about 3 GB |
+### The cap is an emergency stop
 
-Big Mac cannot hold the fine floor with its scanner map under the cap. By these
-estimates it keeps about 24 hours of raw readings (22–26), 48 hours of minute and
-15-minute rows and 14 days of hour rows, and records the rest as `fine_floor_unmet`.
-Big Mac's raw figure is measured at 1.88 MB a minute, 90% of it process passes; its
-summary figures apply the top-consumer rule and the dictionary to measured rows, and
-are not yet measured in place. The Ubuntu figures are the
-[recorded day](development.md#review-regressions-and-scale-measurements) doubled at
-its 1.66 disk-to-payload ratio.
+Everything Machine-audit stores, the scanner's map included, shares the 10 GB cap.
+Retention, not the cap, decides what history exists. Only above 90% of the cap does
+history go to make room, oldest first in this order: process passes, host raw
+readings, minute rows, 15-minute rows, hour rows, and incidents last. Host and
+program hour rows are the last rows to go. Each such deletion is recorded with reason
+`storage_cap`, which coverage reports as a pruned gap, and the collector records an
+event, `self.storage_cap_pruning`, when emergency pruning starts and when it stops;
+its status shows `storage_cap_pruning`. A save is always admitted: recording never
+stops for the cap.
+
+Why 90%: the last tenth of the cap leaves room for the largest counted write's
+journal and checkpoint (a 4,096-row prune) and a concurrent scanner transaction, so a
+save that needs room can still be admitted while history is pruned.
+
+**Estimated outcome on Big Mac (reference only, an outcome not a target).** From
+measured rates (raw 1.88 MB a minute; host rows, main contributors and the dictionary
+applied to recorded rows), not yet measured in place:
+
+| History | Estimated size |
+| --- | ---: |
+| Process passes, 24 hours | 2.4 GB |
+| Host raw readings, 3 days | 0.8 GB |
+| Minute rows, 3 days | about 0.8 GB |
+| 15-minute rows and minute coverage, 3 days | about 0.15 GB |
+| Hour rows and their coverage | about 12 MB a day, growing |
+| Scanner map (not this store) | 3.7 GB |
+
+That is about 7.8 GB at first. The hour rows grow with no retention, so on Big Mac the
+cap is reached after about three months; from then the oldest process passes go first
+and each deletion is recorded. About a third of the hour growth is coverage rows,
+which are saved per save rather than per hour. A small Ubuntu box (0.32 MB of raw
+readings a minute, its map 9 MB) stays far below the cap for years.
+
+### Upgrade is one way
+
+A store this release has written is version 3 once converted, its bundles use the
+[preset dictionary](#main-contributors), and its stop checkpoints are format 2. A
+release before it can read none of these, so going back means starting a new store.
 
 Counted writes reserve their transaction's growth and journal pages, rather
-than another copy of the entire database. The readings store starts proactive
-pruning at 90% of the combined cap; admission can prune earlier when the pending
-transaction needs more room. Neither number promises a particular history span.
-See the measured [recording costs](development.md#review-regressions-and-scale-measurements).
+than another copy of the entire database. Emergency pruning starts at 90% of the
+combined cap; admission can prune earlier when the pending transaction needs more
+room. See the measured [recording costs](development.md#review-regressions-and-scale-measurements).
 
 For page size `p`, a transaction declaring `R` row mutations and `P` payload
 bytes reserves `F = 64 + 16R + ceil(P / (p - 64))` dirty-or-new pages. The
@@ -123,14 +149,14 @@ incident history longest, even when the ordinary whole-database write
 reservation no longer fits.
 
 If crash recovery leaves a raw window without summary coverage, keep that
-window and search forward for the oldest fully covered raw window. At each
-floor, only after the covered raw windows it allows are gone may pruning
-continue into summaries. Coverage evidence must match both sequence and
+window and search forward for the oldest fully covered raw window. In the
+emergency, only after the covered raw windows are gone may pruning continue
+into summaries. Coverage evidence must match both sequence and
 observation time; a later high sequence alone does not prove an earlier window
 was summarized. Each retained window is recorded as `raw_preserved` with reason
 `missing_summary_coverage`. These records appear in retention history, but are
 excluded from pruned gaps and export `pruned_ranges`. Summary deletions made
-while raw is retained carry reason `storage_budget_raw_uncovered`. Uncovered
+while raw is retained carry reason `storage_cap_raw_uncovered`. Uncovered
 raw must neither block startup recovery nor cause covered raw to accumulate.
 
 The raw-pruning proof searches the existing coverage-time index backward from
@@ -140,7 +166,7 @@ SQLite VM instructions or one second, checked every 1,000 instructions and
 between windows. Each search passes over windows already recorded as
 `raw_preserved`, so it resumes where the last one stopped. A search that runs
 out before a covered window prunes the oldest summaries instead, with reason
-`storage_budget_raw_uncovered`, and records the uncovered windows it found.
+`storage_cap_raw_uncovered`, and records the uncovered windows it found.
 Only when nothing else remains does it report `prune_precheck_limit`, without
 deleting history or discarding pending readings. Native I/O must return before
 SQLite can check its progress limit. No additional index or background scan is

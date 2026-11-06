@@ -243,6 +243,14 @@ class Collector:
             self.ingest(Reading("collector.budget","self",now,now,(
                 Field("self.storage_warning",warning,"boolean","event"),
             )))
+        # The cap deciding what history exists is an incident: say when it starts and ends.
+        pruning=self.store.cap_pruning
+        if self._transitions.get("cap_pruning") is not pruning:
+            self._transitions["cap_pruning"]=pruning
+            now=self.clock()
+            self.ingest(Reading("collector.budget","self",now,now,(
+                Field("self.storage_cap_pruning",pruning,"boolean","event"),
+            )))
 
     def _health_reading(self):
         with self.lock:
@@ -347,6 +355,7 @@ class Collector:
                     "unsaved_since_ns":self.tail[0][0].start_ns if self.tail else None,
                     "buffer_suspended_since_ns":self._paused_since,"save_error":self.last_save_error,
                     "recovery_error":self.recovery_error,"conversion_error":self.store.conversion_error,
+                    "storage_cap_pruning":self.store.cap_pruning,
                     "last_save_ns":self.last_save_ns,"sources":self.source_status(),
                     "operations":dict(self.operations,queries={name:dict(op) for name,op in self.query_operations.items()})}
 

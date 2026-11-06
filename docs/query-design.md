@@ -214,10 +214,10 @@ on. The storage approach lists both.
 
 ## Pruned history
 
-Pruning follows the [retention order](storage-approach.md#requirements): fine
-detail older than 48 hours, then hour rollups older than 14 days, then the rest,
-with incident records longest. Answers over a span that crosses a cutoff say where
-detail ends:
+History expires by [retention](storage-approach.md#retention): process passes
+after a day, host readings and minute and 15-minute rollups after three days, hour
+rollups and incidents never; the cap only stops runaway growth. Answers over a span
+that crosses a cutoff say where detail ends:
 
 - *series* names its resolution per span and marks the pruned range.
 - *who* keeps each bucket's main contributors and a rest row per kind, so
