@@ -370,8 +370,9 @@ of empty space inside pages, 37 MB of row overhead and 56 MB of indexes. An hour
 appeared an hour and 95% lived under an hour. Rows that a save wrote beside hour rows
 were pruned earlier, which left pages 45% empty, and rewriting about 16,000
 15-minute and hour rows a save matched the collector's 2.5–3.5 GB written an hour.
-Under the share rule an hour keeps about 313 host rows and 60–80 process and program
-rows.
+Replayed over three recorded hours, the share rule kept 274–315 host rows, 54–65
+process and program rows and 5 rest rows: 0.15–0.17 MB with the dictionary, against
+7,515–8,804 rows and 6.8–8.0 MB before.
 
 ## Saving, cost and retention
 
