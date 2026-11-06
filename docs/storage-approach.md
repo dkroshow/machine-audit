@@ -221,24 +221,21 @@ scope. The rule lives in one set in `store.py`. Its first user is the Linux
 `unit_detail` scope: unit limits, memory breakdowns, pressure, throttling and
 process counts. Mac scopes all keep every resolution.
 
-Per-process rollups, per process instance and per signal, for each bucket's
-top consumers, and per-program rollups for every program at 15-minute and
-hourly grain, serve the [query design](query-design.md)'s process table and
-spike questions over long spans. Beyond the summary family above they keep the
-highest pass rate with its time, retained as observed, plus seconds above a
-small fixed set of levels and a small histogram of pass rates, both weighted by
-each pass's covered duration. The histogram answers "time above a level" exactly only at a bin boundary;
-inside a bin it bounds or estimates. All three describe pass-average rates: a
-burst shorter than the process cadence is averaged inside its pass and cannot
-be recovered. Rollups are keyed by process instance (pid, start time, boot).
-Compatible additive fields sum across instances; peaks, time above and
-histograms do not, so program-level spikes over pruned history use the query
-design's time-aligned per-program rollup, with its grouping and coverage method
-recorded. A rollup's instances stay listed in its `members`, so instance counts
-survive when an instance's own rows do not. Every
-rollup carries a method version and can be rebuilt from retained readings; what
-it carries is fixed only once those readings are pruned. Rollup size and query
-cost are unmeasured and follow the growth measurements below.
+Per-process and per-program rollups, per signal, for each bucket's main
+contributors and one rest row per kind, serve the [query design](query-design.md)'s
+process table and spike questions over long spans. Beyond the summary family above
+they keep the highest pass rate with its time, retained as observed, plus seconds
+above a small fixed set of levels and a small histogram of pass rates, both weighted
+by each pass's covered duration. The histogram answers "time above a level" exactly
+only at a bin boundary; inside a bin it bounds or estimates. All three describe
+pass-average rates: a burst shorter than the process cadence is averaged inside its
+pass and cannot be recovered. Rollups are keyed by process instance (pid, start time,
+boot). Compatible additive fields sum across instances; peaks, time above and
+histograms do not, so program-level spikes use the query design's time-aligned
+per-program rollup, with its grouping and coverage method recorded. A program
+rollup's instances stay listed in its `members`. Every rollup carries a method
+version and can be rebuilt from retained readings; what it carries is fixed only
+once those readings are pruned.
 
 Summaries lose sample order, precise timing and the ability to regroup discarded
 identities. A stored maximum can preserve an observed peak's magnitude, but not
@@ -248,33 +245,58 @@ govern the selected interval in both interfaces.
 
 ### Summary resolutions
 
-| Resolution | Rows kept |
-| --- | --- |
-| Minute | Every entity, except processes and programs: only each minute's top consumers |
-| 15-minute | Every entity, except processes: only each quarter hour's top consumers |
-| Hour | Every entity, except processes: only each hour's top consumers |
+Every resolution keeps the same rows: every host, device, volume, unit and self
+entity, and each bucket's [main contributors](#main-contributors) among processes
+and programs, with one rest row for the others of each kind.
 
-**Top consumers.** A bucket keeps process rows for the union of the top 25 by
-CPU time, the top 25 by memory (Mac footprint, Linux resident set) and the top
-25 by disk bytes read and written, plus the collector's own processes: at most
-75, plus our own, in each component. Minutes rank programs the same way. Every
-program keeps 15-minute and hour rows, so `who` answers additive totals (CPU,
-disk bytes, wake-ups, page-ins) exactly for all of them over 15 minutes or more,
-and `who` for a named gauge lists each bucket's top instances. Host, device,
-unit and self rows keep every bucket. The rule, `TOP_N` and `RANKED` live in
+#### Main contributors
+
+The question these rows answer is what was responsible for a component's use in an
+interval. The answer is an 80/20 one: name what mattered and say how much the rest
+added up to, rather than keep every process.
+
+**The rule.** For each bucket, component and kind (process or program), an entity
+keeps its own row when its use was at least `SHARE` of that kind's whole use of the
+component in that bucket. Use is CPU seconds for CPU, bytes read and written for
+disk, and footprint summed over passes for memory (Mac footprint, Linux resident
+set), so a process present for part of the bucket counts for the part it was there.
+The others of that kind become one rest row, entity `rest:process` or
+`rest:program`, that reads like a single entity: its total is their combined total,
+its count is the bucket's passes so its mean is their combined level, `entities`
+says how many it holds, and `cut` is the use an entity needed to be kept. Totals
+therefore add up, and a long tail that matters shows as a large rest. Host,
+device, volume, unit and self rows are not ranked. `SHARE` and the rule live in
 `store.py`, for the Mac and Linux alike.
 
-A bucket is ranked once it is complete. Saves are not aligned with buckets, so
-the collector holds the run's newest minute, quarter hour and hour of ranked
-rows in memory, packed, until a later save completes each one, then saves only
-its top consumers, once. A saved row always holds its whole bucket; data
-arriving after the ranking extends only kept rows. Until then `who` answers
-that minute from 15-minute rows where they exist, and a process in an open
-quarter hour from the minute rows of its top minutes. Stopping the run saves
-the held buckets; a stop that only checkpoints carries them in the checkpoint.
-A crash loses only their ranked rows: an open minute's top consumers and an
-open quarter hour's and hour's processes. Its readings and its host, device,
-unit and program 15-minute and hour rows are already saved.
+**Why 1%.** An entity under 1% of an interval's use of a component did not drive
+it. At most 100 entities of a kind can reach 1%, so a bucket can never keep more
+than that, and a busy bucket with many real contributors keeps more rows than a
+bucket one process dominates. Measured on Big Mac's recorded hours (2,000–3,900
+processes and about 515 programs an hour, 24 CPUs), 1% kept:
+
+| Each hour | Kept | Share of that use they hold |
+| --- | ---: | ---: |
+| CPU, programs | 7–10 | 90–96% |
+| CPU, processes | 14–28 | 54–76% |
+| Disk bytes, programs | 7–12 | 93–98% |
+| Disk bytes, processes | 10–17 | 83–91% |
+| Memory, processes | 3–6 | 31–46% |
+
+Minutes kept about the same: 55–70 process and program rows a minute. Programs carry
+CPU and disk almost entirely. Memory is the exception: one process holds about 30%
+and thousands of small ones the rest, so the memory rest row holds 54–69% of process
+footprint. Programs have no memory rows (footprints overlap and are not added), so
+that tail is a quantity, not a list.
+
+**Held buckets.** A bucket is ranked once it is complete. Saves are not aligned with
+buckets, so the collector holds the run's newest minute, quarter hour and hour of
+process and program rows in memory, packed, until a later save completes each one,
+then saves its main contributors and rest, once. A saved row always holds its whole
+bucket. Data arriving after the ranking extends the rows it kept and adds the others
+to its rest. Stopping the run saves the held buckets; a stop that only checkpoints
+carries them in the checkpoint. A crash loses only the held process and program
+rows: an open minute's, quarter hour's and hour's. Its readings and host rows are
+already saved.
 
 Each save reserves room in proportion to the rows it writes. A save that does
 not fit prunes the oldest history and tries again; it merges its rows once,
@@ -285,66 +307,45 @@ whatever the number of attempts.
 complete interior hours and, at each side, per entity and quarter hour: its
 minute rows when it has one for every minute of that quarter hour inside the
 window, otherwise its 15-minute row, marked `partial_boundary`. Each row names
-the coarsest resolution that set its edges. History saved before 15-minute
-rows existed answers from its minute rows. An instance answers for the buckets
-it topped, so a gauge's mean over a long span is the mean of those buckets.
-Coverage and export are unchanged.
+the coarsest resolution that set its edges. An entity answers for the buckets it
+mattered in and is part of the rest in the others; `who` lists each rest row as
+one more row, so totals and the CPU accounting still reconcile. Coverage and
+export are unchanged.
 
 **Encoding.** A bundle is JSON compressed by zlib at level 6 with a fixed preset
 dictionary of names from the code ([privacy](privacy.md#what-a-reading-may-contain)),
-because each bundle is too short to teach zlib its own keys. Over Big Mac's recorded
-rows it saves 39–47% against the earlier level 1 without a dictionary. A bundle names
-the dictionary by checksum, so those bytes can never change. Bundles saved earlier
-decode as before; a release older than the dictionary cannot read the newer ones.
+because each bundle is too short to teach zlib its own keys. The rows kept for the
+whole span are mostly host rows, and they compress to about half with it (51–56%
+smaller on Big Mac's host minute and hour rows), so it halves the cost of the long
+history. A bundle names the dictionary by checksum, so those bytes can never change.
+Bundles saved earlier decode as before; a release older than the dictionary cannot
+read the newer ones.
 
-**Rows saved before the rule.** `machine-audit thin-process-rows [--batches N]`
-applies the rule to 15-minute and hour rows an earlier release saved: for each
-run and bucket it ranks the saved process rows with the same function and deletes
-the rest. Only those rows go; minute rows, program, host, device, unit and self
-rows and raw readings stay. Each delete is one prune transaction, so it is counted
-the same way and holds at most 4,096 rows. Nothing records its progress: a thinned
-bucket ranks to the same top and offers nothing more to delete, so running it again
-resumes, and a bucket stopped part way finishes the same. It reads in short
-transactions and takes turns with the collector through the budget, so it can run
-while the collector saves. A thinned bucket gets a retention record for its
-resolution with reason `top_consumers_kept`. Coverage lists it but reports no pruned
-gap, and export leaves it out of `pruned_ranges`, because the span still answers. A
-row that cannot be read stays and is counted in `rows_unread`.
+**Stores saved before.** A version 2 store, from the release that kept every
+process's 15-minute and hour rows, is converted once by the collector itself, in
+its own saves: one prune transaction a save, at most 4,096 rows, hour rows first.
+For each run and bucket it ranks the saved process rows with the same rule, writes
+their rest rows and deletes the others. Only process rows change, as Kenny approved
+(Oct 30): program, host, device, unit and self rows, minute rows and raw readings
+stay. It records no progress of its own: a converted bucket's rest holds its cut,
+so after a restart it finishes a bucket the same way and passes over finished ones.
+While one bucket is part way, its rest and its not yet deleted rows both count, for
+a few saves. Each converted bucket gets a retention record for its resolution with
+reason `main_contributors_kept`, which coverage lists but does not report as a
+pruned gap, and export leaves out of `pruned_ranges`. A row that cannot be read
+stays. When nothing remains the store is marked version 3. A step that fails stops
+converting until the next start, never costs the save, and shows as the collector
+status's `conversion_error`. Version 3 cannot be opened by a release before it.
 
-**Measured and estimated cost.** A Mac-shaped synthetic run (2,000
-processes, 600 program labels, 10 s passes, saves every 60 s not aligned
-with minutes) measured:
-
-| Per minute | Before | After |
-| --- | ---: | ---: |
-| New summary rows | 7,200 | about 320, plus 7,200 15-minute rows each quarter hour (480 a minute) |
-| Store growth | 12.6 MB | about 3.3 MB (2.6–5.2), of which raw readings 2.0 MB |
-| Save CPU | about 14 s | about 18 s |
-| Rows reserved per save | about 14,400 | about 14,800 |
-
-The 11.3 MB a minute recorded for Big Mac's 2,000 processes (16 GB a day, in
-[development](development.md#review-regressions-and-scale-measurements)) scales
-to about 3 MB a minute, about 4.3 GB a day, against the 10 GB cap.
-
-**Hour rows on Big Mac.** Before process rows were ranked at 15-minute and hour
-grain, a day of hour rows cost about 550 MB on disk: about 230 MB of payload,
-210 MB of empty space inside pages, 37 MB of row overhead and 56 MB of indexes.
-An hour held 10,800 rows and 9.4 MB, 87% of it process rows, because about 2,600
-instances appeared an hour and 95% lived under an hour; 43% of those bundles came
-from a single pass and held no counter data. Rows that a save wrote beside hour
-rows were pruned earlier, which left pages 45% empty, and rewriting about 16,000
-15-minute and hour rows a save matched the collector's 2.5–3.5 GB written an
-hour. The shipped ranking, replayed over three recorded hours, kept 1,410–1,771
-rows of 7,275–22,334 and 1.2–2.1 MB of 6.6–18.6 MB.
-
-Target B (Ubuntu, estimate from the [Linux adapter](linux-adapter.md)'s
-table, not measured): about 750 minute rows a minute today. Its roughly 115
-sampled processes fall to at most 51 (other users' disk bytes are denied, so
-the disk list holds only our own), about 200 to 90 rows; programs about 98 to
-70; units, host and devices are unchanged. With 15-minute rows (about 50 a
-minute) it writes about 660 rows a minute, roughly 10% fewer. Its growth, about
-1.7 MB a minute (Target A's 1.07 MB scaled by units and processes), is mostly
-raw workload records and unit rows, so it falls by about 5%.
+**Measured costs.** Before process rows were ranked at 15-minute and hour grain, a
+day of Big Mac's hour rows cost about 550 MB on disk: about 230 MB of payload, 210 MB
+of empty space inside pages, 37 MB of row overhead and 56 MB of indexes. An hour held
+10,800 rows and 9.4 MB, 87% of it process rows, because about 2,600 instances
+appeared an hour and 95% lived under an hour. Rows that a save wrote beside hour rows
+were pruned earlier, which left pages 45% empty, and rewriting about 16,000
+15-minute and hour rows a save matched the collector's 2.5–3.5 GB written an hour.
+Under the share rule an hour keeps about 313 host rows and 60–80 process and program
+rows.
 
 ## Saving, cost and retention
 

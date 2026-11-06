@@ -12,7 +12,7 @@ from operator import itemgetter
 from dataclasses import replace
 from itertools import chain, groupby, takewhile
 from .derive import points, rollups, summarize, merge_summaries, GOOD, BUSY
-from .store import MINUTE, QUARTER, HOUR, THINNED, WIDTHS, unpack_summaries
+from .store import CONVERTED, MINUTE, QUARTER, HOUR, WIDTHS, unpack_summaries
 from .model import (PROCESS_ENTITIES, WHO_TOTALS, Record, field_component, is_process_evidence, is_series,
                     who_ranks, who_row, who_value)
 
@@ -207,7 +207,7 @@ class Query:
             clause+=" AND (summaries.component='self' OR ("+" AND ".join("summaries.entity NOT LIKE ?" for _ in PROCESS_ENTITIES)+"))"
             args.extend(prefix+"%" for prefix in PROCESS_ENTITIES)
             clause+=" AND EXISTS(SELECT 1 FROM signal_catalog sc WHERE sc.source=summaries.source AND sc.component=summaries.component AND is_series(sc.component,summaries.entity,sc.scope))"
-        if program_only:clause+=" AND entity LIKE 'program:%'"
+        if program_only:clause+=" AND (entity LIKE 'program:%' OR entity='rest:program')"
         if entities is not None:
             if not entities:return None
             clause+=" AND (source,entity) IN (VALUES "+",".join("(?,?)" for _ in entities)+")"
@@ -531,7 +531,7 @@ class Query:
                 gaps.append(dict(status="unobserved",reason="after_last_save",start_ns=max(start_ns,last),end_ns=effective_stop,run_id=run["run_id"]))
             cursor=max(cursor,effective_stop if not stopped else min(stopped,end_ns))
         if cursor<end_ns:gaps.append(dict(status="unobserved",reason="no_collector",start_ns=cursor,end_ns=end_ns))
-        gaps.extend(dict(r,status="pruned") for r in retention if r['kind']!='raw_preserved' and r['reason']!=THINNED)
+        gaps.extend(dict(r,status="pruned") for r in retention if r['kind']!='raw_preserved' and r['reason']!=CONVERTED)
         empty_rows={}
         for record in records:
             reading=record.reading

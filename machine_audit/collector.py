@@ -346,7 +346,7 @@ class Collector:
                     "tail_bytes":self.tail_bytes,"tail_limit_bytes":self.tail_limit_bytes,
                     "unsaved_since_ns":self.tail[0][0].start_ns if self.tail else None,
                     "buffer_suspended_since_ns":self._paused_since,"save_error":self.last_save_error,
-                    "recovery_error":self.recovery_error,
+                    "recovery_error":self.recovery_error,"conversion_error":self.store.conversion_error,
                     "last_save_ns":self.last_save_ns,"sources":self.source_status(),
                     "operations":dict(self.operations,queries={name:dict(op) for name,op in self.query_operations.items()})}
 

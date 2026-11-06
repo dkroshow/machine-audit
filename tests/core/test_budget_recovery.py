@@ -18,6 +18,7 @@ from machine_audit.collector import Collector
 from machine_audit.model import Clock, Field, Reading, Record
 from machine_audit.query import Query
 from machine_audit.store import Store, MINUTE, pack_summaries, unpack_summaries
+from test_conversion import saved_as_before
 
 
 class BudgetRecoveryTests(unittest.TestCase):
@@ -249,7 +250,7 @@ class BudgetRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=scratch) as root:
             store=Store(Path(root)/'readings.sqlite',Budget(root,free_margin_bytes=0))
             try:
-                with patch('machine_audit.store.RANKED',{'minute':('process:','program:'),'15-minute':(),'hour':()}):
+                with saved_as_before():
                     run=Collector(store,(),run_id='run',boot_id='boot');run.start()
                     self.reads(run,0,70);self.assertTrue(run.flush());self.reads(run,70,100)
                     self.assertTrue(run.close())

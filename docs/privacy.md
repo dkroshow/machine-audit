@@ -19,7 +19,9 @@ evidence behind it.
 
 A summary row adds one derived number, `who_rank`: the largest value `who`
 ranks that bundle by, computed from the bundle's own measures (`who_rank` in
-`model.py`). It holds nothing new in kind and is not exported.
+`model.py`). It holds nothing new in kind and is not exported. A rest row's entity
+is a constant (`rest:process` or `rest:program`); it carries counts and sums of
+other rows, no label and no member identities.
 
 The zlib dictionary that compresses summary bundles (`summary_dictionary.py`)
 ships in the code, so it holds only names from the code: keys, signal, unit and

@@ -231,6 +231,9 @@ def merge_summaries(rows: list[dict]) -> dict:
     result["partial_boundary"] = any(r.get("partial_boundary",False) for r in rows)
     result["members"] = sorted({m for r in rows for m in r["members"]})
     result["instance_count"] = len(result["members"])
+    if "entities" in first:
+        # A rest row names no members; the most entities it held in one bucket is a floor.
+        result["entities"] = result["instance_count"] = max(r["entities"] for r in rows)
     result["partial_members"] = any(r["partial_members"] for r in rows)
     return result
 

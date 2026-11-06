@@ -392,6 +392,7 @@ class CoreTests(unittest.TestCase):
         result=Query(self.store).who(0,30*S,signal="process.cpu")
         self.assertEqual(result["rows"][0]["peak_rate"],4)
         self.assertEqual(result["rows"][0]["covered_s"],20)
+        self.store.stop_run("run",20*S)  # saves the held buckets
         self.store.prune_oldest()
         retained=Query(self.store).who(0,1000*S,signal="process.cpu")
         self.assertEqual(retained["rows"][0]["peak_rate"],4)

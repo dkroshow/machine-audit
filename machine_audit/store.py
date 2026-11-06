@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
-import heapq
 import json
 import math
 import os
@@ -14,7 +13,7 @@ import threading
 import time
 import zlib
 from .budget import Budget, BudgetExceeded
-from .derive import points, rollups, merge_summaries
+from .derive import points, rollups, merge_summaries, union_ns
 from .model import PROCESS_ENTITIES, Record, field_component, is_series, who_rank
 from .summary_dictionary import SUMMARY_DICTIONARY
 
@@ -29,20 +28,19 @@ WIDTHS = {"minute": MINUTE, "15-minute": QUARTER, "hour": HOUR}
 FINE_FLOOR = 48 * HOUR
 HOUR_FLOOR = 14 * 24 * HOUR
 FLOOR_UNMET = "fine_floor_unmet"
-# Each bucket keeps only its top consumers, ranked once it is complete: per-instance rows were
-# half of a 2,000-process Mac's minute growth and 87% of Big Mac's hour payload, most of it
-# from processes that lived under an hour (storage-approach.md). 25 each by CPU time, memory
-# and disk bytes names a bucket's heavy users.
-TOP_N = 25
-# Rows ranked at each resolution. Programs keep every 15-minute and hour row: who answers
-# additive totals from them, so those totals stay exact over any retained span.
-RANKED = {"minute": PROCESS_ENTITIES, "15-minute": ("process:",), "hour": ("process:",)}
+# A bucket keeps a process or program as its own row when it was at least this share of the
+# bucket's use of a component by its kind; the rest of each kind become one row, so totals
+# still add up (storage-approach.md#main-contributors).
+SHARE = 0.01
 MEMORY_RANK = ("process.phys_footprint", "process.resident_size")  # Mac footprint, else Linux resident set
 IO_RANK = ("process.diskio_bytesread", "process.diskio_byteswritten")
-RANK_SIGNALS = frozenset({"process.cpu", *MEMORY_RANK, *IO_RANK})
-# The retention reason of rows thinned to a bucket's top consumers. The span stays
+REST_META = ("source", "component", "signal", "scope", "kind", "unit", "scale", "rate_unit", "additive", "method")
+# The retention reason of buckets converted to main contributors and rest. The span stays
 # answered, so coverage lists the record and reports no pruned gap.
-THINNED = "top_consumers_kept"
+CONVERTED = "main_contributors_kept"
+# 3: process rows ranked by share with rest rows. A store saved at 2 kept a row for every
+# process at 15-minute and hour grain; the collector converts it once, then marks it 3.
+STORE_VERSION = 3
 # Per-scope summary resolution (storage-approach.md): these scopes keep hour summaries only.
 # Raw readings still answer recent intervals.
 HOUR_ONLY_SCOPES = frozenset({"unit_detail"})
@@ -99,30 +97,74 @@ def signal_key(row):
     return tuple(row[k] for k in ("signal", "unit", "kind", "scope", "scale"))
 
 
-def ranked(resolution, component, entity):
-    """Whether this row's bucket keeps only its top consumers."""
-    return component != "self" and entity.startswith(RANKED[resolution])
+def ranked(component, entity):
+    """Whether this row is a process or program that a bucket keeps only when it mattered."""
+    return component != "self" and entity.startswith(PROCESS_ENTITIES)
 
 
-def top_consumers(rows):
-    """The union of the top N processes and the top N programs by each measure."""
-    cpu, io, memory = defaultdict(float), defaultdict(float), {}
+def use(rows):
+    """Each entity's use of each component in a bucket: CPU seconds, bytes read and
+    written, and footprint summed over passes (Mac footprint, else Linux resident set),
+    keyed by (component, entity). Rest rows count as their kind's own entity."""
+    cpu_io, memory = defaultdict(float), {}
     for row in rows:
-        signal, entity = row["signal"], row["entity"]
+        key, signal = (row["component"], row["entity"]), row["signal"]
         if signal == "process.cpu" and row["total"] is not None:
-            cpu[entity] += row["total"]*row["scale"]
+            cpu_io[key] += row["total"]*row["scale"]
         elif signal in IO_RANK and row["total"] is not None:
-            io[entity] += row["total"]
-        elif signal in MEMORY_RANK and row["max"] is not None:
-            key = (-MEMORY_RANK.index(signal), row["max"])
-            memory[entity] = max(memory.get(entity, key), key)
-    measures = (cpu, {entity: value for entity, (_, value) in memory.items()}, io)
-    keep = set()
-    for measure in measures:
-        for kind in ("process:", "program:"):
-            keep.update(heapq.nlargest(TOP_N, (e for e, v in measure.items() if v > 0 and e.startswith(kind)),
-                                       key=lambda e: (measure[e], e)))
-    return keep
+            cpu_io[key] += row["total"]
+        elif signal in MEMORY_RANK and row["sum"] is not None:
+            memory[key] = max(memory.get(key, (-2, 0)), (-MEMORY_RANK.index(signal), row["sum"]))
+    return {**cpu_io, **{key: value for key, (_, value) in memory.items()}}
+
+
+def kind_of(entity):
+    return "program" if entity.startswith(("program:", "rest:program")) else "process"
+
+
+def main_contributors(rows):
+    """The (component, entity) pairs a bucket keeps, and each component and kind's cut:
+    SHARE of that kind's whole use of the component, a rest row's included."""
+    used = use(rows)
+    totals = defaultdict(float)
+    for (component, entity), value in used.items():totals[(component, kind_of(entity))] += value
+    cuts = {key: SHARE*total for key, total in totals.items()}
+    keep = {key for key, value in used.items() if not key[1].startswith("rest:") and value > 0 and value >= cuts[(key[0], kind_of(key[1]))]}
+    return keep, cuts
+
+
+def rest_rows(dropped, rows, cuts):
+    """One row per source, component, kind and signal for the entities a bucket did not
+    keep, read as one entity: its count is the bucket's passes, so its mean is their
+    combined level and its total their combined total. `entities` says how many it holds;
+    `cut` is the use an entity needed to be kept."""
+    passes = defaultdict(int)
+    for row in rows:
+        key = (row["source"], row["component"], signal_key(row))
+        passes[key] = max(passes[key], row["count"])
+    groups = defaultdict(list)
+    for row in dropped:groups[(row["source"], row["component"], kind_of(row["entity"]), signal_key(row))].append(row)
+    result = []
+    for (source, component, kind, key), group in groups.items():
+        first, n = group[0], passes[(source, component, key)]
+        windows = defaultdict(list)
+        for row in group:
+            for run, spans in row.get("covered_windows", {}).items():windows[run].extend(spans)
+        covered = {run: union_ns(spans) for run, spans in windows.items()}
+        totals = [row["total"] for row in group if row["total"] is not None]
+        rest = dict({k: first[k] for k in REST_META}, entity="rest:"+kind, label=None, aggregation="rest-of-bucket",
+                    cut=cuts.get((component, kind)), members=[],
+                    count=n, sample_count=n, sum=sum(row["sum"] for row in group), total=sum(totals) if totals else None,
+                    covered_windows=covered, covered_s=sum(b-a for spans in covered.values() for a, b in spans)/1e9,
+                    start_ns=min(row["start_ns"] for row in group), end_ns=max(row["end_ns"] for row in group),
+                    min=None, max=None, max_ns=None, last=None, last_ns=None, peak_rate=None, peak_ns=None,
+                    statuses={}, sleep_s=0.0, above_s={}, histogram_s=[], partial_members=False, value=None)
+        rest["entities"] = rest["instance_count"] = sum(row.get("entities", 1) for row in group)
+        rest["mean"] = rest["sum"]/n if n else None
+        if rest["total"] is not None and rest["covered_s"]:rest["mean_rate"] = rest["total"]*first["scale"]/rest["covered_s"]
+        rest["status"] = "observed" if rest["sum"] or rest["total"] else "measured_zero"
+        result.append(rest)
+    return result
 
 
 def held_rows(held):
@@ -141,7 +183,7 @@ def merged_bundle(payload,rows):
     return list(merged.values())
 
 
-def extended(held,bucket,rows,run_id,own,lower,upper):
+def extended(held,bucket,rows,run_id,lower,upper):
     """The bucket held after `rows` join it. Only rows' entities are unpacked, and the
     held bucket passed in is left as it was, so a save that fails changes nothing."""
     previous=held is not None and held["bucket"]==bucket
@@ -149,8 +191,7 @@ def extended(held,bucket,rows,run_id,own,lower,upper):
     groups=defaultdict(list)
     for row in rows:groups[(row["source"],row["component"],row["entity"])].append(row)
     for key,group in groups.items():packed[key]=pack_summaries(merged_bundle(packed.get(key),group))
-    return dict(run_id=run_id,bucket=bucket,own=own|held["own"] if previous else own,
-                lower=held["lower"] if previous else lower,upper=upper,rows=packed)
+    return dict(run_id=run_id,bucket=bucket,lower=held["lower"] if previous else lower,upper=upper,rows=packed)
 
 
 def unpack_summaries(payload, keep=None):
@@ -183,14 +224,18 @@ class Store:
             raise ValueError("store must be a regular file in the budget directory")
         self._mutex = threading.RLock()
         self._held = {}  # resolution -> the run's newest bucket of ranked rows
+        self._conversion = None  # where converting a version 2 store resumes
+        self.conversion_error = None
         if read_only:
             self.db=sqlite3.connect(f"file:{self.path}?mode=ro",uri=True,check_same_thread=False,isolation_level=None)
-            if self.db.execute("PRAGMA user_version").fetchone()[0]!=2:
+            if self.db.execute("PRAGMA user_version").fetchone()[0] not in (2,STORE_VERSION):
                 self.db.close();raise ValueError("unsupported_private_store_schema")
             return
         with self.budget.reserve(256 * 1024):
             self.db = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None, timeout=5)
-            if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").fetchone() and self.db.execute("PRAGMA user_version").fetchone()[0]!=2:
+            saved=self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").fetchone()
+            version=self.db.execute("PRAGMA user_version").fetchone()[0] if saved else STORE_VERSION
+            if version not in (2,STORE_VERSION):
                 self.db.close();raise ValueError("unsupported_private_store_schema")
             os.chmod(self.path, 0o600)
             self.db.execute("PRAGMA auto_vacuum=INCREMENTAL")
@@ -202,8 +247,8 @@ class Store:
                 self.db.execute("ALTER TABLE summaries ADD COLUMN who_rank REAL")
             # The first ranked bucket dates the column: later NULLs mean nothing ranks.
             self.db.execute("CREATE INDEX IF NOT EXISTS summaries_ranked ON summaries(resolution,bucket_ns) WHERE who_rank IS NOT NULL")
-            # A write only if needed: thinning opens a store beside the running collector.
-            if self.db.execute("PRAGMA user_version").fetchone()[0]!=2:self.db.execute("PRAGMA user_version=2")
+            if not saved:self.db.execute(f"PRAGMA user_version={STORE_VERSION}")
+            if version==2:self._conversion=["hour",None,None]
             self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def close(self):
@@ -235,24 +280,28 @@ class Store:
         """Mark the run stopped and save its held buckets, which are now complete."""
         self.append([],run_id=run_id,stopped_ns=stopped_ns)
 
-    def _kept(self,run_id,resolution,bucket,rows,own):
-        """The entities a complete bucket saves. Rows it already saved fix the set, so
-        late data extends only them, and rows an older release saved keep their tail."""
-        kinds=" OR ".join("entity LIKE ?" for _ in RANKED[resolution])
-        saved={entity for entity, in self.db.execute(f"""SELECT entity FROM summaries WHERE run_id=? AND resolution=?
-            AND bucket_ns=? AND component!='self' AND ({kinds})""",(run_id,resolution,bucket,*(k+"%" for k in RANKED[resolution])))}
-        return saved or top_consumers(rows)|own
+    def _ranked(self,run_id,resolution,bucket,rows):
+        """A complete bucket's rows to save: its main contributors as they are, and rest
+        rows for the others. Entities it already saved fix who is kept, so late data
+        extends them and adds to the rest, and rows an older release saved keep their tail."""
+        saved={(component,entity) for component,entity in self.db.execute("""SELECT component,entity FROM summaries
+            WHERE run_id=? AND resolution=? AND bucket_ns=? AND component!='self' AND (entity LIKE 'process:%' OR entity LIKE 'program:%')""",
+            (run_id,resolution,bucket))}
+        groups=defaultdict(list)
+        for row in rows:groups[(row["source"],row["component"],row["entity"])].append(row)
+        rows=[row for group in groups.values() for row in merged_bundle(None,group)]  # held and new fragments
+        keep,cuts=(saved,{}) if saved else main_contributors(rows)
+        kept=[row for row in rows if (row["component"],row["entity"]) in keep]
+        return kept+rest_rows([row for row in rows if (row["component"],row["entity"]) not in keep],rows,cuts)
 
     def _stop_rows(self,held,run_id):
-        """Each held bucket's top consumers, saved when its run stops, and the saved
-        payload they replace."""
+        """Each held bucket's main contributors and rest, saved when its run stops, and
+        the saved payload they replace."""
         prepared=[];replaced=0
         for resolution,bucket in held.items():
-            rows=held_rows(bucket)
-            keep=self._kept(run_id,resolution,bucket["bucket"],rows,bucket["own"])
             groups=defaultdict(list)
-            for row in rows:
-                if row["entity"] in keep:groups[(row["source"],row["component"],row["entity"])].append(row)
+            for row in self._ranked(run_id,resolution,bucket["bucket"],held_rows(bucket)):
+                groups[(row["source"],row["component"],row["entity"])].append(row)
             for key,group in groups.items():
                 values,old=self._merged(run_id,(resolution,bucket["bucket"],*key),group,bucket["lower"],bucket["upper"])
                 prepared.append(values);replaced+=old
@@ -277,7 +326,7 @@ class Store:
             committed=self.db.execute("SELECT last_sequence FROM runs WHERE run_id=?",(run_id,)).fetchone()[0]
             data=encode({"format":CHECKPOINT,"run_id":run_id,"stopped_ns":stopped_ns,"committed":committed,
                          "records":[base64.b64encode(p).decode() for p in payloads],
-                         "held":{resolution:{"bucket":held["bucket"],"lower":held["lower"],"upper":held["upper"],"own":sorted(held["own"]),
+                         "held":{resolution:{"bucket":held["bucket"],"lower":held["lower"],"upper":held["upper"],
                                              "rows":[[*key,base64.b64encode(payload).decode()] for key,payload in held["rows"].items()]}
                                  for resolution,held in self._held.items() if held["run_id"]==run_id}}).encode()
             directory=self.path.parent
@@ -328,7 +377,7 @@ class Store:
                         # A save after the checkpoint (an older release's recovery) leaves
                         # its held buckets stale; it is kept rather than saved wrong.
                         if last!=data["committed"]:raise ValueError("unsaved_checkpoint_mismatch")
-                        self._held={resolution:dict(run_id=run_id,bucket=h["bucket"],lower=h["lower"],upper=h["upper"],own=set(h["own"]),
+                        self._held={resolution:dict(run_id=run_id,bucket=h["bucket"],lower=h["lower"],upper=h["upper"],
                                                     rows={tuple(row[:3]):base64.b64decode(row[3]) for row in h["rows"]})
                                     for resolution,h in held.items()}
                         try:self.append(records,run_id=run_id,stopped_ns=stopped_ns)
@@ -372,24 +421,22 @@ class Store:
             if records:
                 derived = points(records, self._previous(records))
                 buckets={resolution:defaultdict(list) for resolution in WIDTHS}
-                own=set()
                 coarser=defaultdict(list)
                 for bucket,row in rollups(derived,MINUTE):
                     # From every row: a signal only held rows carry is still known.
                     catalog.add((row["source"],row["signal"],row["component"],row["kind"],row["unit"],row["scope"],row["scale"]))
                     if row["scope"] not in HOUR_ONLY_SCOPES:
-                        if ranked("minute",row["component"],row["entity"]):buckets["minute"][bucket].append(row)
+                        if ranked(row["component"],row["entity"]):buckets["minute"][bucket].append(row)
                         else:summaries[("minute",bucket,row["source"],row["component"],row["entity"])].append(row)
-                        if row["scope"]=="managed_process":own.add(row["entity"])
                         coarser[("15-minute",bucket//QUARTER*QUARTER,row["source"],row["component"],row["entity"],row["signal"],row["unit"],row["scope"],row["kind"],row["scale"])].append(row)
                     coarser[("hour",bucket//HOUR*HOUR,row["source"],row["component"],row["entity"],row["signal"],row["unit"],row["scope"],row["kind"],row["scale"])].append(row)
                 for key,rows in coarser.items():
                     resolution,bucket,source,component,entity=key[:5]
                     row=merge_summaries(rows) if len(rows)>1 else rows[0]
-                    if ranked(resolution,component,entity):buckets[resolution][bucket].append(row)
+                    if ranked(component,entity):buckets[resolution][bucket].append(row)
                     else:summaries[key[:5]].append(row)
                 self.maintain()
-                held,lowers=self._top_buckets(records,buckets,own,summaries,held)
+                held,lowers=self._top_buckets(records,buckets,summaries,held)
             stop=None
             if stopped_ns is not None:
                 stop=(stopped_ns,*self._stop_rows(held,run_id));held={}
@@ -402,16 +449,16 @@ class Store:
     def _capacity_error(exc):
         return getattr(exc,"sqlite_errorcode",None)==sqlite3.SQLITE_FULL or str(exc) in {"managed_storage_limit","sqlite_checkpoint_headroom"}
 
-    def _top_buckets(self,records,buckets,own,summaries,held):
-        """Add each complete bucket's top consumers to summaries; return the buckets to
-        hold, per resolution, and each saved row's first sequence.
+    def _top_buckets(self,records,buckets,summaries,held):
+        """Add each complete bucket's main contributors and rest to summaries; return the
+        buckets to hold, per resolution, and each saved row's first sequence.
 
         Saves are not aligned with buckets. Each resolution's newest bucket is held here,
         packed, until a later save completes it, so its rows are neither saved nor
-        counted at every save. Ranking then saves only its top consumers, once, so a
-        saved row always holds its whole bucket. Later data for a ranked bucket extends
-        only the rows it kept. Stopping the run saves the held buckets; a crash loses
-        only their ranked rows, never readings or the rows of other entities."""
+        counted at every save. Ranking then saves its main contributors and rest, once,
+        so a saved row always holds its whole bucket. Later data for a ranked bucket
+        extends the rows it kept and its rest. Stopping the run saves the held buckets;
+        a crash loses only their process and program rows, never readings or host rows."""
         first,last=records[0],records[-1]
         lowers={};kept={}
         for resolution,arrived in buckets.items():
@@ -423,16 +470,14 @@ class Store:
             newest=max(found)
             for bucket in sorted(found):
                 if bucket==newest:
-                    if bucket in arrived:current=extended(current,bucket,arrived[bucket],first.run_id,own,first.sequence,last.sequence)
+                    if bucket in arrived:current=extended(current,bucket,arrived[bucket],first.run_id,first.sequence,last.sequence)
                     continue
-                rows=arrived.get(bucket,[]);mine=own;lower=first.sequence
+                rows=arrived.get(bucket,[]);lower=first.sequence
                 if current and current["bucket"]==bucket:
-                    rows=held_rows(current)+rows;mine=own|current["own"];lower=current["lower"]
-                keep=self._kept(first.run_id,resolution,bucket,rows,mine)
-                for row in rows:
-                    if row["entity"] in keep:
-                        key=(resolution,bucket,row["source"],row["component"],row["entity"])
-                        summaries[key].append(row);lowers[key]=lower
+                    rows=held_rows(current)+rows;lower=current["lower"]
+                for row in self._ranked(first.run_id,resolution,bucket,rows):
+                    key=(resolution,bucket,row["source"],row["component"],row["entity"])
+                    summaries[key].append(row);lowers[key]=lower
             if current and current["bucket"]==newest:kept[resolution]=current
         return kept,lowers
 
@@ -526,6 +571,12 @@ class Store:
         Work starts well before the cap; if reserve cannot fit, fail without
         removing a file or discarding the collector's pending batch.
         """
+        if self._conversion:
+            try:self._convert_step()
+            except Exception as exc:
+                # Converting is never worth a lost save: it stops until the next start and says why.
+                self._conversion=None
+                self.conversion_error=getattr(exc,"sqlite_errorname",None) or (str(exc) if isinstance(exc,BudgetExceeded) else type(exc).__name__)
         target = self.budget.limit_bytes*.90
         while self.budget.usage()["bytes"] + required_bytes > target:
             if not self.prune_oldest():
@@ -652,23 +703,25 @@ class Store:
             reason='storage_budget_raw_uncovered' if skipped_raw and kind!='raw' else FLOOR_UNMET if inside else 'storage_budget'
             return bool(self._delete_batch(table,rows,(kind,start,end,reason),preserved,coverage))
 
-    def _delete_batch(self,table,rows,retention,preserved=(),coverage=lambda count:()):
+    def _delete_batch(self,table,rows,retention,preserved=(),coverage=lambda count:(),insert=()):
         """Delete up to `rows` (rowid, payload size) in one counted transaction with the
-        related coverage and its retention record, halving when it does not fit. Return
-        the number of rows deleted."""
+        related coverage and its retention record, and upsert `insert` summary rows,
+        halving the deletes when it does not fit. Return the number of rows deleted."""
         kind,start,end,reason=retention
         page=self.db.execute('PRAGMA page_size').fetchone()[0]
+        inserted_pages=sum((len(row[-1])+page-1)//page for row in insert)
         while rows:
             payload_pages=sum((size+page-1)//page for _,size in rows)
             related=coverage(len(rows))
             coverage_pages=sum((size+page-1)//page for _,size in related)
             vacuum_steps=min(PRUNE_BATCH,payload_pages+len(rows))
             # Bounded delete/index work, overflow pages, then bounded page moves.
-            frames=64+(len(rows)+len(related)+len(preserved))*PRUNE_ROW_PAGES+payload_pages+coverage_pages+8*vacuum_steps
+            frames=64+(len(rows)+len(related)+len(preserved)+len(insert))*PRUNE_ROW_PAGES+payload_pages+coverage_pages+inserted_pages+8*vacuum_steps
             try:
-                with self.budget.sqlite_write(self.db,self.path,0,max_growth_bytes=8*page,dirty_pages=frames):
+                with self.budget.sqlite_write(self.db,self.path,0,max_growth_bytes=(8+inserted_pages+len(insert))*page,dirty_pages=frames):
                     self.db.execute("BEGIN IMMEDIATE")
                     try:
+                        self.db.executemany(UPSERT_SUMMARY,insert)
                         ids=[row[0] for row in rows]
                         placeholders=','.join('?' for _ in ids)
                         if table=="readings":
@@ -691,48 +744,58 @@ class Store:
                 rows=rows[:max(1,len(rows)//2)]
         return 0
 
-    def _outside_top(self,run_id,resolution,bucket):
-        """The saved process rows (rowid, payload size) a bucket's top consumers do not
-        keep, and how many rows could not be read and so stay. Ranked on the rows still
-        there: the top of any set that holds them is the same, so a bucket thinned part
-        way, or saved under the rule, gives the same answer."""
-        found=self.db.execute("""SELECT id,component,entity,length(payload) FROM summaries WHERE run_id=? AND resolution=?
-            AND bucket_ns=? AND entity LIKE 'process:%'""",(run_id,resolution,bucket)).fetchall()
-        own={entity for _,component,entity,_ in found if component=="self"}
-        candidates=[row for row in found if ranked(resolution,row[1],row[2])]
-        rows=[];unread=set()
-        for lo in range(0,len(candidates),500):
-            ids=[row[0] for row in candidates[lo:lo+500]]
-            for identifier,payload in self.db.execute(f"SELECT id,payload FROM summaries WHERE id IN ({','.join('?'*len(ids))})",ids):
-                try:rows.extend(unpack_summaries(payload,lambda signal,kind,component:signal in RANK_SIGNALS))
-                except (zlib.error,ValueError):unread.add(identifier)
-        keep=top_consumers(rows)|own
-        return [(identifier,size) for identifier,_,entity,size in candidates if entity not in keep and identifier not in unread],len(unread)
+    def _convert_step(self):
+        """One bounded step of converting a version 2 store, whose 15-minute and hour rows
+        held every process: hour rows first, run by run, bucket by bucket. A step writes at
+        most one prune transaction. It needs no record of progress: a converted bucket's
+        rest rows hold its cut, so a step after a restart finishes it the same way and
+        passes over finished buckets. Once nothing remains the store is marked 3."""
+        while self._conversion:
+            resolution,run,bucket=self._conversion
+            if run is not None:
+                bucket=self.db.execute("SELECT MIN(bucket_ns) FROM summaries WHERE run_id=? AND resolution=? AND bucket_ns>=?",(run,resolution,bucket)).fetchone()[0]
+            if run is None or bucket is None:
+                row=self.db.execute("SELECT run_id FROM runs WHERE run_id>? ORDER BY run_id LIMIT 1",("" if run is None else run,)).fetchone()
+                if row is not None:self._conversion=[resolution,row[0],-2**63];continue
+                if resolution=="hour":self._conversion=["15-minute",None,None];continue
+                with self.budget.sqlite_write(self.db,self.path,rows=1):
+                    self.db.execute(f"PRAGMA user_version={STORE_VERSION}")
+                self._conversion=None;return
+            self._conversion=[resolution,run,bucket]
+            if self._convert_bucket(run,resolution,bucket):return
+            self._conversion=[resolution,run,bucket+1]
 
-    def thin_process_rows(self,batches=None):
-        """Delete rows saved before the top-consumer rule: process rows outside each
-        bucket's top consumers. Each delete is one counted prune transaction. It keeps
-        no progress of its own: a thinned bucket gives nothing more to delete, so running
-        again resumes. Stops after `batches` transactions; `complete` says none remain."""
-        result=dict(complete=False,batches=0,rows_deleted=0,payload_bytes_deleted=0,rows_unread=0)
-        runs=[run for run, in self.db.execute("SELECT run_id FROM runs ORDER BY started_ns")]
-        for resolution in ("hour","15-minute"):
-            for run in runs:
-                bucket=None
-                while True:
-                    bucket=self.db.execute("SELECT MIN(bucket_ns) FROM summaries WHERE run_id=? AND resolution=? AND bucket_ns>?",(run,resolution,-2**63 if bucket is None else bucket)).fetchone()[0]
-                    if bucket is None:break
-                    outside,unread=self._outside_top(run,resolution,bucket)
-                    result["rows_unread"]+=unread
-                    while outside:
-                        if result["batches"]==batches:return result
-                        with self._mutex:
-                            count=self._delete_batch("summaries",outside[:PRUNE_BATCH],(resolution,bucket,bucket+WIDTHS[resolution],THINNED))
-                        result["batches"]+=1;result["rows_deleted"]+=count
-                        result["payload_bytes_deleted"]+=sum(size for _,size in outside[:count])
-                        outside=outside[count:]
-        result["complete"]=True
-        return result
+    def _convert_bucket(self,run_id,resolution,bucket):
+        """Delete one batch of a saved bucket's process rows that its main contributors do
+        not keep, writing its rest rows with the first. Return whether it wrote. Rows that
+        cannot be read stay. Only process rows change: Kenny approved deleting those."""
+        found=self.db.execute("""SELECT id,component,entity,sequence_min,sequence_max,payload FROM summaries WHERE run_id=? AND resolution=?
+            AND bucket_ns=? AND component!='self' AND (entity LIKE 'process:%' OR entity='rest:process')""",(run_id,resolution,bucket)).fetchall()
+        rows=defaultdict(list);ids={};unread=set()
+        for identifier,component,entity,_,_,payload in found:
+            ids[(component,entity)]=(identifier,len(payload))
+            try:rows[component].extend(unpack_summaries(payload))
+            except (zlib.error,ValueError):unread.add((component,entity))
+        doomed=[];rests=[]
+        for component,bundle in rows.items():
+            rest=[row for row in bundle if row["entity"]=="rest:process"]
+            if rest and rest[0].get("cut") is not None:
+                # Converted, or part way: the cut decides; its rest already counts the others.
+                cut=rest[0]["cut"]
+                drop={key for key,value in use(bundle).items() if not key[1].startswith("rest:") and not (value>0 and value>=cut)}
+                drop|={(component,row["entity"]) for row in bundle if row["entity"]!="rest:process"}-set(use(bundle))
+            else:
+                keep,cuts=main_contributors(bundle)
+                drop={(component,row["entity"]) for row in bundle if row["entity"]!="rest:process"}-keep
+                if not drop:continue
+                # A rest without a cut (a recovered tail) joins the new rest as one more member.
+                fresh=rest_rows([row for row in bundle if (component,row["entity"]) in drop]+rest,bundle,cuts)
+                lower,upper=min(r[3] for r in found),max(r[4] for r in found)
+                for source in {row["source"] for row in fresh}:
+                    rests.append(summary_values(run_id,lower,upper,resolution,bucket,source,component,"rest:process",[row for row in fresh if row["source"]==source]))
+            doomed.extend(ids[key] for key in sorted(drop-unread) if key in ids)
+        if not doomed:return False
+        return bool(self._delete_batch("summaries",doomed[:PRUNE_BATCH],(resolution,bucket,bucket+WIDTHS[resolution],CONVERTED),insert=rests))
 
     def _reclaim_free_pages(self):
         steps=min(PRUNE_BATCH,self.db.execute('PRAGMA freelist_count').fetchone()[0])
@@ -823,7 +886,7 @@ class Store:
                 with path.open("rb") as stream:
                     digest=hashlib.file_digest(stream,"sha256").hexdigest()
                     os.fsync(stream.fileno())
-                pruned=[dict(r) for r in source.execute("SELECT * FROM retention WHERE kind!='raw_preserved' AND reason!=? ORDER BY start_ns LIMIT 1001",(THINNED,))]
+                pruned=[dict(r) for r in source.execute("SELECT * FROM retention WHERE kind!='raw_preserved' AND reason!=? ORDER BY start_ns LIMIT 1001",(CONVERTED,))]
                 manifest={"schema_version":1,"format":"machine-audit-records-sqlite-v1","device_id":device_id,"run_id":run_id,
                           "after_sequence":after_sequence,"first_sequence":included[0][0] if included else None,
                           "last_sequence":included[-1][0] if included else None,"count":len(included),

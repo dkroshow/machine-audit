@@ -268,8 +268,9 @@ def who_ranks(signal: str, kind: str, component: str) -> bool:
 
 
 def who_row(row: dict) -> bool:
+    """Programs, and their rest, carry additive totals; processes, and theirs, the rest."""
     return (is_process_evidence(row["entity"], row["scope"]) and row["scope"] != "unit_detail" and
-            (row["entity"].startswith("program:") or not row["additive"] or row["component"] == "self" or row["scope"] == "unit"))
+            (row["entity"].startswith(("program:", "rest:program")) or not row["additive"] or row["component"] == "self" or row["scope"] == "unit"))
 
 
 def who_value(row: dict) -> float:

@@ -119,7 +119,7 @@ includes all measured Machine-audit components, not only the collector process.
   say; the method is visible in the answer.
 - **Resolution follows the span and a row cap.** Raw readings for a few
   minutes, minute rollups for hours, hourly rollups for days; an entity
-  outside a minute's top consumers answers from its 15-minute rollup. The answer
+  that did not matter in a minute answers from its 15-minute rollup. The answer
   names its resolution and the cadence behind it. Nothing is interpolated.
 - **Peaks keep their meaning.** A maximum is the maximum of the samples the
   rollup saw, with its time. A process peak is a 10-second pass rate; a host
@@ -194,12 +194,11 @@ approximate, and the answer must say so.
 
 - Minute and hourly rollups per host signal, carrying the summary family their
   kind requires, with max and its time.
-- Minute, 15-minute and hourly rollups per signal for each bucket's top
-  process instances, and per-program rollups for every program at 15-minute
-  and hourly grain, with the spike fields listed in the storage approach.
-  These are the additions the query design makes to the architecture's
-  rollups. Their measured growth set the
-  [top-consumer rule](storage-approach.md#summary-resolutions).
+- Minute, 15-minute and hourly rollups per signal for each bucket's
+  [main contributors](storage-approach.md#main-contributors), process instances
+  and programs, with the spike fields listed in the storage approach, and one
+  rest row per kind holding the others' combined use. These are the additions
+  the query design makes to the architecture's rollups.
 - Coverage per source per minute: reads due, done, late, skipped, failed.
 - The recent-read cache for *now*, owned by the collector.
 
@@ -221,12 +220,12 @@ with incident records longest. Answers over a span that crosses a cutoff say whe
 detail ends:
 
 - *series* names its resolution per span and marks the pruned range.
-- *who* keeps every program's rollup and each bucket's top instances. Additive
-  totals over complete covered windows stay exact per program. What is lost is
+- *who* keeps each bucket's main contributors and a rest row per kind, so
+  additive totals over complete covered windows still reconcile. What is lost is
   within-window order, the detailed readings and burst shape around the
-  retained peak time, instance rollups outside each bucket's top consumers, and
-  any new grouping of additive totals, peaks, time above and histograms; the
-  answer names which fields are exact and which are unavailable for the span.
+  retained peak time, the identity of everything in a rest row, and any new
+  grouping of additive totals, peaks, time above and histograms; the answer
+  names which fields are exact and which are unavailable for the span.
 - *around* a pruned time returns rollup rows and events, and says the pass
   behind a peak is gone.
 - A maximum survives pruning with its time; the shape of the burst around it
