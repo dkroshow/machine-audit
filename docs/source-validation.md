@@ -84,12 +84,11 @@ Self metadata reports `self.config_identity` and the named
 The revision uses the `git_commit` unit; absent or invalid revision values are
 explicit gaps, never a guessed build identity.
 
-Original process fields include `process.user_time`, `system_time`,
-`runnable_time`, `child_user_time`, `child_system_time` in Mach ticks;
-`diskio_bytesread`, `diskio_byteswritten`, `logical_writes` in bytes; and wakeup
-counts. Footprint, resident, compressed and graphics ledgers remain separate
-memory scopes. Converted CPU rates say CPUs; raw totals retain source units.
-Reaped-child CPU is preserved but never added to observed child CPU.
+Original process fields are `process.user_time`, `system_time` and
+`runnable_time` in Mach ticks; `phys_footprint`, `diskio_bytesread` and
+`diskio_byteswritten` in bytes; and `ledger_swapins` and `decompressions` from
+`TASK_VM_INFO`. Converted CPU rates say CPUs; raw totals retain source units.
+Runnable time is running plus waiting to run, not waiting alone.
 
 GPU device reading requires `enabled.gpu` and the installation's exclusive-reader
 gate. Selecting dictionary fields does not avoid AMD reset effects. Reset

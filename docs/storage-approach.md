@@ -191,7 +191,7 @@ exposes; matching cadence does not make different signals equivalent.
 | --- | --- | --- |
 | CPU usage and runnable demand | 1 s | macOS host CPU ticks and processor-set load; Ubuntu `/proc/stat` and supported host contention counters |
 | Machine memory, swap and pressure | 1 s | macOS VM page classes/counters, swap usage, pressure level and swap-housekeeping counters; Ubuntu `meminfo`, `vmstat`, host memory PSI |
-| User-process CPU, memory, writes and wake-ups | 30 s ([cost](#collector-cost)) | macOS `proc_pid_rusage` plus `TASK_VM_INFO` memory effects, graphics footprint and limit headroom; Ubuntu process CPU and `status` memory fields, other counters where available |
+| User-process CPU, memory and disk | 30 s ([cost](#collector-cost)) | macOS `proc_pid_rusage` CPU, runnable time, footprint and disk bytes, plus `TASK_VM_INFO` swap-ins and decompressions; Ubuntu process CPU, `status` resident set and swap, and disk bytes where readable |
 | System-process CPU and memory via Mac helper | About 60 s (planned) | Helper not shipped yet; separate privileged source, not an idle setting |
 | Ubuntu workload-group memory | 30 s, in the same pass as its processes | cgroup usage, movement, PSI and event counters; use one non-overlapping level for totals |
 | GPU device activity and memory | 5 s | Per GPU; IORegistry on macOS, supported driver interfaces on Ubuntu; include exposed engines, memory classes, clocks and limits |
@@ -442,9 +442,33 @@ or less derives every pass in it; building only the fields it needs took 10 minu
 from 11.0 s and 369 MiB to 5.4 s and 261 MiB. For Big Mac's measured hours that
 estimates saves at about 145 s an hour, the process pass about 90 s and other sources 37
 s: about 280 s in all. That is under the bar in those hours but not in a quiet one, and
-four times the margin. What remains is mostly building a full point for every field of
-every pass (half of a save), the number of fields per process, and the per-read cost of
-the 1-second sources.
+four times the margin.
+
+**Eight fields a process.** A pass now reads, for each process, what answers who used
+the CPU, memory and disk and who paid under memory pressure: user, system and runnable
+time, footprint, bytes read and written, swap-ins and decompressions, and its age (on
+the Mac only when the previous pass lacked it, the one case derive reads it). Ubuntu
+keeps the resident set as its footprint, and swap. Dropped: reaped-child CPU (it overlaps children already counted), wakeups,
+logical writes, the lifetime peak, compressed and graphics footprint, limit headroom,
+the Mac resident set (footprint answers it), page-ins (the host's VM counters give them
+every second) and the executable's UUID (nothing read it). `self.idle_wakeups` and
+`self.interrupt_wakeups` were copies of the collector's own wakeups from the pass; they
+are retired with it. Measured on this Mac (about 1,500 processes), from 22 fields a
+process to 8:
+
+| | 22 fields | 8 fields |
+| --- | ---: | ---: |
+| CPU a process pass, with its admission | 0.57–0.62 s | 0.28–0.29 s |
+| Packed process pass | 358 kB | 183 kB |
+| CPU a save (31 minutes of Big Mac's readings, replayed) | 2.05 s | 1.29 s |
+| Peak memory a save adds | 243 MiB | 64 MiB |
+| Store after 28 saves | 38 MB | 27 MB |
+
+The replay keeps, in each recorded pass, only the fields this release reads. For Big Mac's
+measured hours that estimates saves at about 95 s an hour, the process pass about 55 s,
+other sources 37 s: about 195 s in all, twice what it would need for the margin. What
+remains is mostly building a full point for every field of every pass, and the per-read
+cost of the 1-second sources.
 
 **Process passes every 30 s.** Minute rows keep each minute's main contributors from two
 passes, and the host's own readings stay at 1 s, so a constraint's timing and shape

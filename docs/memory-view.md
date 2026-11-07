@@ -48,7 +48,7 @@ within the byte budget, record that explicitly. Raw reports are not retained.
 
 | Platform | Usage gauges | Effects and context |
 | --- | --- | --- |
-| macOS | `proc_pid_rusage` footprint; `TASK_VM_INFO` compressed and graphics footprint, limit headroom | Page-ins, swap-ins, decompressions, lifetime high-water mark |
+| macOS | `proc_pid_rusage` footprint | `TASK_VM_INFO` swap-ins and decompressions |
 | Ubuntu | Process `status` RSS/swap; cgroup memory charges | cgroup movement, PSI and limit-event counters |
 
 Retain both kinds at their scheduled cadence. Nonzero effect rows can accelerate

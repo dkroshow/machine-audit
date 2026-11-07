@@ -157,9 +157,13 @@ class MacOS:
             try:
                 r = n.process(pid)
                 entity = process_identity(pid, r.proc_start_abstime, self.boot_id)
+                # The executable's UUID keys the label cache only: passes no longer store it as
+                # process.exec_uuid, which nothing read and was 9% of their bytes.
                 cache_key=(pid,r.proc_start_abstime,bytes(r.uuid))
                 seen.add(cache_key)
-                if cache_key not in self.labels:self.labels[cache_key]=self.labeler(n.process_path(pid))
+                # The label cache holds the previous pass's processes.
+                new=cache_key not in self.labels
+                if new:self.labels[cache_key]=self.labeler(n.process_path(pid))
                 label=self.labels[cache_key]
                 try:
                     vm, length = n.task_memory(pid)
@@ -168,28 +172,26 @@ class MacOS:
                 # Each field is built once with its read bounds: the pass's largest cost was
                 # copying 30,000 fields a second time to set them.
                 kw = dict(entity=entity, label=label, scope='process', start=observed, end=self.clock())
-                fields.append(field('process.exec_uuid', bytes(r.uuid).hex(), 'uuid', 'state', **kw))
-                # Start and read times are both mach absolute time, the awake clock.
-                fields.append(field(PROCESS_AGE, (kw['end'].awake_ns - r.proc_start_abstime * n.numer // n.denom) / 1e9, 'seconds', **kw))
+                # Derive counts a process from zero only when the previous pass lacked it, so
+                # only such a process carries its age. Start and read times are both mach
+                # absolute time, the awake clock.
+                if new:fields.append(field(PROCESS_AGE, (kw['end'].awake_ns - r.proc_start_abstime * n.numer // n.denom) / 1e9, 'seconds', **kw))
+                # The fields that answer who used the CPU, memory and disk, and who paid under
+                # memory pressure (storage-approach.md#collector-cost).
                 for k, unit in [('user_time', 'mach_ticks'), ('system_time', 'mach_ticks'), ('runnable_time', 'mach_ticks'),
-                    ('child_user_time', 'mach_ticks'), ('child_system_time', 'mach_ticks'), ('phys_footprint', 'bytes'),
-                    ('resident_size', 'bytes'), ('lifetime_max_phys_footprint', 'bytes'), ('diskio_bytesread', 'bytes'),
-                    ('diskio_byteswritten', 'bytes'), ('logical_writes', 'bytes'), ('pkg_idle_wkups', 'count'),
-                    ('interrupt_wkups', 'count'), ('pageins', 'pages')]:
-                    gauge = k in ('phys_footprint', 'resident_size', 'lifetime_max_phys_footprint')
+                    ('phys_footprint', 'bytes'), ('diskio_bytesread', 'bytes'), ('diskio_byteswritten', 'bytes')]:
+                    gauge = k == 'phys_footprint'
                     fields.append(field('process.' + k, getattr(r, k), unit, 'gauge' if gauge else 'counter',
                                         additive=not gauge, scale=n.numer / n.denom / 1e9 if unit == 'mach_ticks' else 1,
                                         rate_unit='CPUs' if unit == 'mach_ticks' else None, **kw))
                 if length is None:
                     fields.append(field('process.ledger_swapins', None, 'bytes', 'counter', status=error_status(vm), **kw))
                 else:
-                    for k in ('compressed', 'ledger_swapins', 'decompressions', 'limit_bytes_remaining',
-                              'ledger_tag_graphics_footprint', 'ledger_tag_graphics_footprint_compressed'):
+                    for k in ('ledger_swapins', 'decompressions'):
                         typ = dict(vm._fields_)[k]
                         available = getattr(type(vm), k).offset + C.sizeof(typ) <= length
                         fields.append(field('process.' + k, getattr(vm, k) if available else None,
-                                            'count' if k == 'decompressions' else 'bytes',
-                                            'counter' if k in ('ledger_swapins', 'decompressions') else 'gauge', **kw))
+                                            'count' if k == 'decompressions' else 'bytes', 'counter', **kw))
                 # Identity is rechecked after the separate VM call, avoiding PID-reuse joins.
                 if n.process(pid).proc_start_abstime != r.proc_start_abstime:
                     fields = [f for f in fields if f.entity != entity]

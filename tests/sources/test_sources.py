@@ -49,6 +49,30 @@ class SourceTests(unittest.TestCase):
         self.assertEqual({(f.start,f.end) for f in fields},{(user.start,user.end)})
         self.assertFalse(any(f.name=='process.cpu' for f in fields))
 
+    def test_process_pass_carries_the_approved_fields_and_a_new_process_its_age(self):
+        # The list approved on Nov 7: who used the CPU, memory and disk, and who paid under
+        # memory pressure. Derive reads an age only for a process the previous pass lacked.
+        native=Mock()
+        native.numer=native.denom=1
+        native.bytes.side_effect=lambda name: struct.pack('=4i',100,10000,0,100) if name=='kern.clockrate' else b'boot'
+        native.absolute.side_effect=range(100,100000,100)
+        native.continuous.side_effect=range(100,100000,100)
+        passes=[[7],[7,8]]
+        native.processes.side_effect=lambda:passes.pop(0)
+        def process(pid):
+            r=RUsage4();r.proc_start_abstime=pid;return r
+        native.process.side_effect=process
+        native.process_path.return_value='/usr/bin/python3'
+        native.task_memory.side_effect=lambda pid:(TaskVM(),ctypes.sizeof(TaskVM))
+        mac=MacOS(native)
+        first,second=mac.processes(),mac.processes()
+        kept={'process.user_time','process.system_time','process.runnable_time','process.phys_footprint',
+              'process.diskio_bytesread','process.diskio_byteswritten','process.ledger_swapins','process.decompressions'}
+        names=lambda fields,pid:{f.name for f in fields if f.entity.endswith(f':{pid}:{pid}')}
+        self.assertEqual(names(first,7),kept|{'process.age'})
+        self.assertEqual(names(second,7),kept)
+        self.assertEqual(names(second,8),kept|{'process.age'})
+
     def test_failure_is_gap_and_exception_path_is_never_stored(self):
         def fail():raise PermissionError('/private/customer-secret')
         reading=ReadSource('test.source','cpu',1,fail).read()

@@ -18,8 +18,8 @@ from unittest.mock import patch
 from machine_audit.budget import Budget
 from machine_audit.collector import Collector
 from machine_audit.model import Clock,Field,Reading,Record
-from machine_audit.query import Query
-from machine_audit.derive import summarize
+from machine_audit.query import BRIEF_PASS_FIELDS,Query
+from machine_audit.derive import points,summarize
 from machine_audit.store import Store, unpack_summaries
 from test_conversion import saved_as_before
 
@@ -87,7 +87,7 @@ class ScaleTests(unittest.TestCase):
         with self.store.read() as db:
             saved=[Record.unpack(row[0]) for row in db.execute('SELECT payload FROM readings ORDER BY sequence')]
         self.assertEqual([r.to_dict() for r in saved],[r.to_dict() for r in records])
-        self.assertEqual(len(saved[-1].reading.fields),11000)  # 22 a process, its age among them
+        self.assertEqual(len(saved[-1].reading.fields),4000)  # 8 a process; its age only in its first pass
         self.assertLess(self.store.budget.usage()['bytes'],30_000_000)
         self.store.stop_run('run',records[-1].reading.end.wall_ns)  # saves the held process rows
         self.assertTrue(self.store.prune_oldest())
@@ -193,12 +193,17 @@ class ScaleTests(unittest.TestCase):
         # pass is kept until the next one; a new pass replaces it, and the first brief after
         # it derives only the fields brief ranks.
         ingest(procs[2],32*10**9)
-        began=time.thread_time();brief=query.now(brief=True);brief_cpu=time.thread_time()-began
+        derived=[]
+        def counted(records,*args):
+            derived.append({f.name for r in records for f in r.reading.fields if f.entity.startswith('process:')})
+            return points(records,*args)
+        with patch('machine_audit.query.points',side_effect=counted):brief=query.now(brief=True)
+        process_fields=[names for names in derived if names]
+        self.assertEqual(len(process_fields),1)
+        self.assertLessEqual(process_fields[0],BRIEF_PASS_FIELDS)
         self.assertEqual([r['value'] for r in brief['components']['memory']['host']],[32*10**9])
         fresh=Query(self.store,collector)
-        began=time.thread_time();full=fresh.now(limit=600);full_cpu=time.thread_time()-began
-        # Relative to the same box: an absolute bound failed on a slower 2-vCPU host.
-        self.assertLess(brief_cpu,0.6*full_cpu)
+        full=fresh.now(limit=600)
         self.assertEqual(brief,fresh.now(brief=True))
         self.assertEqual(query.now(limit=600),full)
 
@@ -410,7 +415,7 @@ class ScaleTests(unittest.TestCase):
 
     def test_large_ordinary_record_exports_at_explicit_64_mib_bound(self):
         record=process_records(2000,1)[0]
-        self.assertEqual(len(record.reading.fields),44000)
+        self.assertEqual(len(record.reading.fields),18000)
         self.store.append([record])
         path=Path(self.tmp.name)/'transfer.sqlite'
         with self.assertRaisesRegex(ValueError,'increase max_bytes'):

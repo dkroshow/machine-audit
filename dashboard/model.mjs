@@ -40,7 +40,7 @@ const signalLabels = {
   'cpu.user':'User CPU time', 'cpu.system':'System CPU time', 'cpu.idle':'Idle CPU time',
   'process.cpu':'CPU use', 'process.memory':'Memory footprint', 'process.phys_footprint':'Memory footprint',
   'process.resident_size':'Resident memory', 'process.ledger_swapins':'Swap-ins', 'process.decompressions':'Decompressions',
-  'process.user_time':'User CPU time', 'process.system_time':'System CPU time', 'process.runnable_time':'Runnable time',
+  'process.user_time':'User CPU time', 'process.system_time':'System CPU time', 'process.runnable_time':'Running or waiting to run',
   'memory.available':'Available memory', 'memory.pressure':'Memory pressure', 'memory.pressure_level':'Memory pressure level',
   'memory.swapins':'Swap-in pages', 'memory.swap_used':'Swap used', 'memory.swap_total':'Swap capacity',
   'memory.psi.some':'Memory stalls · some work', 'memory.macos_stall':'Memory stall time',

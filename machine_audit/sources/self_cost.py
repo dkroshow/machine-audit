@@ -48,10 +48,11 @@ class SelfCost:
             role = role_of[f.entity]
             if role is None:
                 continue
+            # The process pass reads no wakeups, so self.idle_wakeups and self.interrupt_wakeups
+            # are retired with them (storage-approach.md#collector-cost).
             names = {'process.user_time':'self.user_time','process.system_time':'self.system_time',
                      self.memory:'self.memory','process.diskio_bytesread':'self.read',
-                     'process.diskio_byteswritten':'self.write','process.pkg_idle_wkups':'self.idle_wakeups',
-                     'process.interrupt_wkups':'self.interrupt_wakeups'}
+                     'process.diskio_byteswritten':'self.write'}
             if f.name in names:
                 fields.append(replace(f,name=names[f.name],label=role,scope='managed_process'))
         # Child CPU is retained by the process source, but never added here: it overlaps

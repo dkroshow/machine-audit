@@ -46,8 +46,6 @@ class Stat:
     start: int
     user: int
     system: int
-    child_user: int
-    child_system: int
     resident_pages: int
 
     @classmethod
@@ -55,7 +53,7 @@ class Stat:
         # comm may hold spaces and parentheses; the fields after the last ')' are positional (proc(5)).
         head, _, tail = text.rpartition(')')
         f = tail.split()
-        return cls(pid, head.partition('(')[2], int(f[19]), int(f[11]), int(f[12]), int(f[13]), int(f[14]), int(f[21]))
+        return cls(pid, head.partition('(')[2], int(f[19]), int(f[11]), int(f[12]), int(f[21]))
 
 
 class LinuxHost:
@@ -199,8 +197,7 @@ class LinuxHost:
         kw = dict(entity=process_identity(p.pid, p.start, self.boot_id), label=self.label(p.comm), scope='process')
         fields = [field('process.' + name, value, 'ticks', 'counter', additive=True, scale=1 / self.hz,
                         rate_unit='CPUs', **kw)
-                  for name, value in (('user_time', p.user), ('system_time', p.system),
-                                      ('child_user_time', p.child_user), ('child_system_time', p.child_system))]
+                  for name, value in (('user_time', p.user), ('system_time', p.system))]
         try:
             status = keyed(self.text(f'proc/{p.pid}/status'), ':')
             fields.append(field('process.resident_size', kib(status, 'VmRSS'), 'bytes', **kw))

@@ -113,6 +113,5 @@ is a separate, disclosed choice. Never enable them silently. Without the Mac roo
 helper, own processes are measured and other CPU use remains a labeled remainder.
 Thread-level Linux waiting needs extra reads; its coverage and cost require validation.
 
-The implementation must prevent overlap between live-child CPU and parent-reported
-exited-child CPU. Raw counters allow later correction of that derivation; they do
-not justify presenting an unverified attribution total as exact.
+The process pass does not read parent-reported exited-child CPU: it overlaps live
+children already counted, so an attribution total stays each process's own CPU.

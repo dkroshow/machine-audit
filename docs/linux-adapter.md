@@ -120,7 +120,8 @@ first user's 24 h growth figure, with the operator if the contract moves.
   Core format work; its gain needs real data.
 
 The Mac's bundled `macos.process` record carries every own-user process, about
-22 fields each, every 30 s, with no split. Linux per-process fields match it.
+8 fields each, every 30 s, with no split. Linux per-process fields are the
+equivalents: CPU times, resident set, swap and disk bytes.
 
 ## Devices and network
 
