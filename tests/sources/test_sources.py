@@ -73,6 +73,26 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(names(second,7),kept)
         self.assertEqual(names(second,8),kept|{'process.age'})
 
+    def test_disk_read_follows_media_swaps_and_removals(self):
+        # A disk read remembers which children are whole disks; a card swapped or removed
+        # behind the same driver must still change what it reports.
+        media=[[11],[11],[12],[]]
+        class IO:
+            decoded=0
+            def objects(self,name):return [1]
+            def children(self,obj):return media[0]
+            def identity(self,obj):return obj
+            def property(self,obj,key):
+                if key=='Statistics':return {'Bytes (Read)':5}
+                IO.decoded+=1;return True
+        devices=Devices(IO())
+        disks=[]
+        for _ in range(4):
+            disks.append({f.entity for f in devices.disk() if f.name=='disk.read'})
+            media.pop(0)
+        self.assertEqual(disks,[{'disk:11'},{'disk:11'},{'disk:12'},set()])
+        self.assertEqual(IO.decoded,2)
+
     def test_failure_is_gap_and_exception_path_is_never_stored(self):
         def fail():raise PermissionError('/private/customer-secret')
         reading=ReadSource('test.source','cpu',1,fail).read()

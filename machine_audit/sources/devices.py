@@ -47,6 +47,9 @@ class Devices:
         self.io = io
         self.clock = clock
         self.thermal_token = None
+        # Whether each block-storage child, by registry id, is a whole disk. A child is fixed
+        # for its life; new media is a new child, so a disk read decodes only new children.
+        self.whole = {}
 
     def gpu(self):
         for obj in self.io.objects('IOAccelerator'):
@@ -97,10 +100,14 @@ class Devices:
                 # Driver visibility is not permission to name another user's process.
 
     def disk(self):
+        seen = {}
         for driver in self.io.objects('IOBlockStorageDriver'):
             stats = self.io.property(driver, 'Statistics') or {}
-            whole = [self.io.identity(c) for c in self.io.children(driver)
-                     if self.io.property(c, 'Whole') is True]
+            whole = []
+            for c in self.io.children(driver):
+                child = self.io.identity(c)
+                seen[child] = self.whole[child] if child in self.whole else self.io.property(c, 'Whole') is True
+                if seen[child]:whole.append(child)
             if len(whole) != 1:
                 continue
             entity = 'disk:' + str(whole[0])
@@ -110,6 +117,7 @@ class Devices:
                             entity=entity, scope='physical_disk', additive=True,
                             scale=1e-9 if unit == 'ns' else 1)
         yield field('disk.pressure', None, 'ns', 'counter', scope='host')
+        self.whole = seen
 
     def supply(self):
         source={'AC Power':'ac','Battery Power':'battery','UPS Power':'ups'}.get(self.io.power_supply())
