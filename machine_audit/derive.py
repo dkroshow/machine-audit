@@ -92,72 +92,105 @@ def points(records: list[Record], previous: dict[str, Record] | None = None) -> 
             elif f.name in BUSY:
                 busy_inputs.append(f)
         pass_points = []
+        # Summing each pass first preserves simultaneous peaks and union elapsed time.
+        groups = defaultdict(list)
+        # A pass repeats a few field descriptors over every process: each point starts as a
+        # copy of its descriptor's template.
+        templates = {}
+        status_of_reading = reading.status
+        good_reading = status_of_reading in GOOD
         fields = source_fields(reading)
         indexed[reading.source] = (record, {(f.name, f.entity): f for f in fields})
         for field in fields:
-            if field.name == PROCESS_AGE:continue
+            name, kind = field.name, field.kind
+            if name == PROCESS_AGE:continue
             end_clock = field.end or reading.end
             start_clock = field.start or reading.start
-            p = dict(source=reading.source, component=field_component(field,reading.component), signal=field.name,
-                     entity=field.entity, label=field.label, scope=field.scope, kind=field.kind,
-                     unit=field.unit, additive=field.additive, scale=field.scale,
-                     start_ns=end_clock.wall_ns, end_ns=end_clock.wall_ns,
-                     rate_unit=field.rate_unit or (field.unit+"/s"),
-                     status=field.status if reading.status in GOOD else reading.status,
-                     value=field.value, total=None, covered_s=0.0, sleep_s=0.0,
-                     run_id=record.run_id, sequence=record.sequence, method=METHOD,
-                     awake_start_ns=end_clock.awake_ns, awake_end_ns=end_clock.awake_ns)
-            old = prior_fields.get((field.name, field.entity))
-            age = ages.get(field.entity) if not old and prior_entities is not None and field.entity not in prior_entities else None
-            if field.kind == "counter" and p["status"] in GOOD and age and 0 < age <= (end_clock.awake_ns-prior.reading.end.awake_ns)/1e9:
+            descriptor = (name, field.unit, kind, field.scope, field.additive, field.scale, field.rate_unit, field.component)
+            template = templates.get(descriptor)
+            if template is None:
+                component = field_component(field, reading.component)
+                template = templates[descriptor] = (
+                    dict(source=reading.source, component=component, signal=name, entity=None, label=None,
+                         scope=field.scope, kind=kind, unit=field.unit, additive=field.additive, scale=field.scale,
+                         start_ns=None, end_ns=None, rate_unit=field.rate_unit or (field.unit+"/s"), status=None,
+                         value=None, total=None, covered_s=0.0, sleep_s=0.0, run_id=record.run_id,
+                         sequence=record.sequence, method=METHOD, awake_start_ns=None, awake_end_ns=None),
+                    # Programs group instances by label; a Linux unit is already one workload.
+                    field.additive and component != "self" and field.scope not in ("unit", "unit_detail"))
+            p = template[0].copy()
+            entity, label, value = field.entity, field.label, field.value
+            p["entity"] = entity
+            p["label"] = label
+            p["start_ns"] = p["end_ns"] = end_clock.wall_ns
+            status = p["status"] = field.status if good_reading else status_of_reading
+            p["value"] = value
+            p["awake_start_ns"] = p["awake_end_ns"] = end_clock.awake_ns
+            old = prior_fields.get((name, entity))
+            age = ages.get(entity) if not old and prior_entities is not None and entity not in prior_entities else None
+            if kind == "counter" and status in GOOD and age and 0 < age <= (end_clock.awake_ns-prior.reading.end.awake_ns)/1e9:
                 span = int(age*1e9)
-                p.update(total=field.value, covered_s=age, value=field.value*field.scale/age, start_ns=end_clock.wall_ns-span,
-                         awake_start_ns=end_clock.awake_ns-span, status="measured_zero" if field.value == 0 else "observed")
-            elif field.kind == "counter" and p["status"] in GOOD:
+                p["total"] = value
+                p["covered_s"] = age
+                p["value"] = value*field.scale/age
+                p["start_ns"] = end_clock.wall_ns-span
+                p["awake_start_ns"] = end_clock.awake_ns-span
+                p["status"] = "measured_zero" if value == 0 else "observed"
+            elif kind == "counter" and status in GOOD:
                 if not old or old.status not in GOOD or prior.reading.status not in GOOD:
-                    p.update(status="unobserved", reason="baseline")
-                elif (old.unit, old.kind, old.scale) != (field.unit, field.kind, field.scale):
-                    p.update(status="invalid", reason="field_changed")
+                    p["status"] = "unobserved"
+                    p["reason"] = "baseline"
+                elif (old.unit, old.kind, old.scale) != (field.unit, kind, field.scale):
+                    p["status"] = "invalid"
+                    p["reason"] = "field_changed"
                 else:
                     old_end = old.end or prior.reading.end
                     dt = (end_clock.awake_ns - old_end.awake_ns) / 1e9
                     continuous = (end_clock.continuous_ns - old_end.continuous_ns) / 1e9
-                    delta = field.value - old.value
+                    delta = value - old.value
                     p["start_ns"] = old_end.wall_ns
-                    if dt <= 0 or continuous < 0 or end_clock.wall_ns <= p["start_ns"] or delta < 0:
-                        p.update(status="invalid", reason="clock_or_counter_reset")
+                    if dt <= 0 or continuous < 0 or end_clock.wall_ns <= old_end.wall_ns or delta < 0:
+                        p["status"] = "invalid"
+                        p["reason"] = "clock_or_counter_reset"
                     else:
-                        p.update(total=delta, covered_s=dt, value=delta * field.scale / dt,
-                                 awake_start_ns=old_end.awake_ns,
-                                 sleep_s=continuous-dt if continuous-dt >= SLEEP_TOLERANCE_S else 0.0,
-                                 status="measured_zero" if delta == 0 else "observed")
-            elif field.kind == "accumulator" and p["status"] in GOOD:
+                        p["total"] = delta
+                        p["covered_s"] = dt
+                        p["value"] = delta * field.scale / dt
+                        p["awake_start_ns"] = old_end.awake_ns
+                        p["sleep_s"] = continuous-dt if continuous-dt >= SLEEP_TOLERANCE_S else 0.0
+                        p["status"] = "measured_zero" if delta == 0 else "observed"
+            elif kind == "accumulator" and status in GOOD:
                 dt = (end_clock.awake_ns - start_clock.awake_ns) / 1e9
                 if dt <= 0:
-                    p.update(status="invalid", reason="missing_accumulator_window")
+                    p["status"] = "invalid"
+                    p["reason"] = "missing_accumulator_window"
                 else:
-                    p.update(start_ns=start_clock.wall_ns, awake_start_ns=start_clock.awake_ns, total=field.value,
-                             covered_s=dt, value=field.value * field.scale / dt)
-            elif field.kind == "rate" and p["status"] in GOOD:
-                p.update(start_ns=start_clock.wall_ns, awake_start_ns=start_clock.awake_ns,
-                         covered_s=(end_clock.awake_ns-start_clock.awake_ns)/1e9)
-            if field.kind in {"state","event"}:
+                    p["start_ns"] = start_clock.wall_ns
+                    p["awake_start_ns"] = start_clock.awake_ns
+                    p["total"] = value
+                    p["covered_s"] = dt
+                    p["value"] = value * field.scale / dt
+            elif kind == "rate" and status in GOOD:
                 p["start_ns"] = start_clock.wall_ns
-            if field.name in {"process.cpu","self.cpu","cpu.busy"} and p["status"] in GOOD and old:
-                prefix=field.name.split(".")[0]
-                inputs = busy_inputs if field.name == "cpu.busy" else inputs_by_entity[(prefix, field.entity)]
+                p["awake_start_ns"] = start_clock.awake_ns
+                p["covered_s"] = (end_clock.awake_ns-start_clock.awake_ns)/1e9
+            if kind in {"state","event"}:
+                p["start_ns"] = start_clock.wall_ns
+            if name in {"process.cpu","self.cpu","cpu.busy"} and p["status"] in GOOD and old:
+                prefix=name.split(".")[0]
+                inputs = busy_inputs if name == "cpu.busy" else inputs_by_entity[(prefix, entity)]
                 if any((f.name,f.entity) not in prior_inputs or prior_inputs[(f.name,f.entity)].status not in GOOD or f.value<prior_inputs[(f.name,f.entity)].value for f in inputs):
-                    p.update(status="invalid",reason="constituent_reset",total=None,covered_s=0,value=None)
+                    p["status"] = "invalid"
+                    p["reason"] = "constituent_reset"
+                    p["total"] = None
+                    p["covered_s"] = 0
+                    p["value"] = None
             if p["status"] in GOOD and p["value"] == 0:
                 p["status"] = "measured_zero"
             pass_points.append(p)
+            if template[1] and label is not None:
+                groups[(name, label, field.unit, kind, field.scope, field.scale)].append(p)
         result.extend(pass_points)
-        # Summing each pass first preserves simultaneous peaks and union elapsed time.
-        groups = defaultdict(list)
-        for p in pass_points:
-            # Programs group instances by label; a Linux unit is already one workload.
-            if p["additive"] and p["label"] is not None and p["component"]!="self" and p["scope"] not in ("unit","unit_detail"):
-                groups[(p["signal"], p["label"], p["unit"], p["kind"], p["scope"],p["scale"])].append(p)
         for (signal, label, unit, kind, scope,scale), members in groups.items():
             valid = [p for p in members if p["status"] in GOOD]
             p = dict(members[0], entity="program:"+label, label=label,
@@ -165,12 +198,13 @@ def points(records: list[Record], previous: dict[str, Record] | None = None) -> 
                      instance_count=len(members), partial_members=len(valid) != len(members),
                      members=[m["entity"] for m in members])
             if valid:
-                p["windows"]=union_ns([(m["awake_start_ns"],m["awake_end_ns"]) for m in valid])
-                p.update(awake_start_ns=min(m["awake_start_ns"] for m in valid),
-                         awake_end_ns=max(m["awake_end_ns"] for m in valid),
+                spans = [(m["awake_start_ns"],m["awake_end_ns"]) for m in valid]
+                p["windows"] = windows = union_ns(spans)
+                p.update(awake_start_ns=min(a for a,_ in spans),
+                         awake_end_ns=max(b for _,b in spans),
                          start_ns=min(m["start_ns"] for m in valid),
                          end_ns=max(m["end_ns"] for m in valid),
-                         covered_s=sum(b-a for a,b in union_ns([(m["awake_start_ns"],m["awake_end_ns"]) for m in valid]))/1e9,
+                         covered_s=sum(b-a for a,b in windows)/1e9,
                          value=sum(m["value"] for m in valid))
                 totals = [m["total"] for m in valid if m["total"] is not None]
                 p["total"] = sum(totals) if totals else None
