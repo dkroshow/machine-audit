@@ -427,9 +427,9 @@ far from the margin. The collector's saves took 177–233 s an hour, the process
 **Reading the collector's cost.** `self.user_time` and `self.system_time` labelled
 `collector` are the whole process. Its parts are `self.flush_cpu_s` (saves),
 `self.source_read_thread_cpu_s` per source (each read and its admission) and
-`self.query_cpu_s` (queries). On Big Mac the parts came within 2–9 s an hour of the
-whole; the rest is startup, the minute's status and health readings, the HTTP listener
-and encoding answers. The scanner is another process, labelled `scanner`, with
+`self.query_cpu_s` (queries, encoding their answers included). On Big Mac the parts came
+within 2–9 s an hour of the whole; the rest is startup, the minute's status and health
+readings and the HTTP listener. The scanner is another process, labelled `scanner`, with
 `self.scanner_cpu_total` per scan: 28–182 s an hour in those hours. The two labels stay
 apart in the self rows; together they are Machine-audit's cost, the one the bar judges.
 

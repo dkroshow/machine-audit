@@ -26,7 +26,9 @@ def make_server(query, token: str, port=8765, dashboard=None, allowed_hosts=()):
             pass
 
         def _send(self,status,payload,kind="application/json; charset=utf-8",timing=None):
+            began=time.thread_time()
             body=payload if isinstance(payload,bytes) else json.dumps(payload,separators=(",",":"),allow_nan=False).encode()
+            encoded=time.thread_time()-began
             self.send_response(status)
             self.send_header("Content-Type",kind)
             self.send_header("Content-Length",str(len(body)))
@@ -39,7 +41,10 @@ def make_server(query, token: str, port=8765, dashboard=None, allowed_hosts=()):
             self.wfile.write(body)
             if query.collector:
                 with query.collector.lock:
-                    query.collector.operations["http_sent_bytes"]+=len(body)
+                    ops=query.collector.operations
+                    ops["http_sent_bytes"]+=len(body)
+                    # Encoding an answer is part of what it cost.
+                    if not isinstance(payload,bytes):ops["query_cpu_s"]=ops.get("query_cpu_s",0)+encoded
 
         def do_GET(self):
             port=self.server.server_port
