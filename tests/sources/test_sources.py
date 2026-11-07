@@ -44,6 +44,9 @@ class SourceTests(unittest.TestCase):
         self.assertGreater(user.end.awake_ns,user.start.awake_ns)
         gap=next(f for f in fields if f.name=='process.ledger_swapins')
         self.assertIsNone(gap.value);self.assertEqual(gap.status,'denied')
+        # One read: every field of the process, the denied memory read's gap included,
+        # carries the bounds from before its first OS call to after its last.
+        self.assertEqual({(f.start,f.end) for f in fields},{(user.start,user.end)})
         self.assertFalse(any(f.name=='process.cpu' for f in fields))
 
     def test_failure_is_gap_and_exception_path_is_never_stored(self):

@@ -10,7 +10,6 @@ import pwd
 import socket
 import re
 import time
-from dataclasses import replace
 from collections.abc import Callable
 
 from machine_audit.model import Clock, Field, Reading, process_identity
@@ -155,7 +154,13 @@ class MacOS:
                 seen.add(cache_key)
                 if cache_key not in self.labels:self.labels[cache_key]=self.labeler(n.process_path(pid))
                 label=self.labels[cache_key]
-                kw = dict(entity=entity, label=label, scope='process')
+                try:
+                    vm, length = n.task_memory(pid)
+                except OSError as exc:
+                    vm, length = exc, None
+                # Each field is built once with its read bounds: the pass's largest cost was
+                # copying 30,000 fields a second time to set them.
+                kw = dict(entity=entity, label=label, scope='process', start=observed, end=self.clock())
                 fields.append(field('process.exec_uuid', bytes(r.uuid).hex(), 'uuid', 'state', **kw))
                 for k, unit in [('user_time', 'mach_ticks'), ('system_time', 'mach_ticks'), ('runnable_time', 'mach_ticks'),
                     ('child_user_time', 'mach_ticks'), ('child_system_time', 'mach_ticks'), ('phys_footprint', 'bytes'),
@@ -166,8 +171,9 @@ class MacOS:
                     fields.append(field('process.' + k, getattr(r, k), unit, 'gauge' if gauge else 'counter',
                                         additive=not gauge, scale=n.numer / n.denom / 1e9 if unit == 'mach_ticks' else 1,
                                         rate_unit='CPUs' if unit == 'mach_ticks' else None, **kw))
-                try:
-                    vm, length = n.task_memory(pid)
+                if length is None:
+                    fields.append(field('process.ledger_swapins', None, 'bytes', 'counter', status=error_status(vm), **kw))
+                else:
                     for k in ('compressed', 'ledger_swapins', 'decompressions', 'limit_bytes_remaining',
                               'ledger_tag_graphics_footprint', 'ledger_tag_graphics_footprint_compressed'):
                         typ = dict(vm._fields_)[k]
@@ -175,11 +181,7 @@ class MacOS:
                         fields.append(field('process.' + k, getattr(vm, k) if available else None,
                                             'count' if k == 'decompressions' else 'bytes',
                                             'counter' if k in ('ledger_swapins', 'decompressions') else 'gauge', **kw))
-                except OSError as exc:
-                    fields.append(field('process.ledger_swapins', None, 'bytes', 'counter', status=error_status(exc), **kw))
                 # Identity is rechecked after the separate VM call, avoiding PID-reuse joins.
-                ended = self.clock()
-                fields[first:] = [replace(f,start=observed,end=ended) for f in fields[first:]]
                 if n.process(pid).proc_start_abstime != r.proc_start_abstime:
                     fields = [f for f in fields if f.entity != entity]
                     fields.append(field('process.coverage', None, 'state', 'state', status='invalid', entity=f'pid:{pid}', scope='process'))

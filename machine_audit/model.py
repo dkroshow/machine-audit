@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import cached_property
+from functools import cached_property, lru_cache
 import json
 import math
 import re
@@ -26,13 +26,25 @@ _CODE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
 _LABEL = re.compile(r"[\w .()+-]{1,80}\Z", re.UNICODE)
 
 
+@lru_cache(maxsize=1 << 16)
+def _named(text) -> bool:
+    """Whether an identifier is admitted. A pass repeats the same few thousand, so each
+    is checked once; the check itself is unchanged."""
+    return _NAME.fullmatch(text) is not None
+
+
+@lru_cache(maxsize=1 << 16)
+def _admitted(label: str) -> str:
+    return label if _LABEL.fullmatch(label) and ".." not in label else "redacted"
+
+
 def admit_label(label: str | None) -> str | None:
     """Admit a short display name, never paths, commands, addresses or arguments."""
     if label is None:
         return None
-    if not isinstance(label, str) or not _LABEL.fullmatch(label) or ".." in label:
+    if not isinstance(label, str):
         return "redacted"
-    return label
+    return _admitted(label)
 
 
 def process_identity(pid: int, start: int | str, boot_id: str) -> str:
@@ -78,9 +90,9 @@ class Field:
     component: str | None = None
 
     def __post_init__(self) -> None:
-        if not _NAME.fullmatch(self.name) or not _NAME.fullmatch(self.entity) or not _NAME.fullmatch(self.scope):
+        if not _named(self.name) or not _named(self.entity) or not _named(self.scope):
             raise ValueError("invalid field identifier")
-        if self.component is not None and not _NAME.fullmatch(self.component):
+        if self.component is not None and not _named(self.component):
             raise ValueError("invalid field component")
         if self.start is not None and self.end is not None and self.end.awake_ns < self.start.awake_ns:
             raise ValueError("invalid field read bounds")
