@@ -122,7 +122,7 @@ includes all measured Machine-audit components, not only the collector process.
   that did not matter in a minute answers from its 15-minute rollup. The answer
   names its resolution and the cadence behind it. Nothing is interpolated.
 - **Peaks keep their meaning.** A maximum is the maximum of the samples the
-  rollup saw, with its time. A process peak is a 10-second pass rate; a host
+  rollup saw, with its time. A process peak is a 30-second pass rate; a host
   peak is a 1-second reading. Answers say which, and never mix them.
 - **Bounded work.** A small fixed number of queries run at once. Each answer
   is bounded by its interval, a row cap and a tail copy limited to what it

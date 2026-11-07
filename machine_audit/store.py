@@ -2,6 +2,7 @@
 from __future__ import annotations
 import base64
 from collections import defaultdict
+from dataclasses import replace
 from contextlib import contextmanager, nullcontext
 import json
 import math
@@ -13,8 +14,8 @@ import threading
 import time
 import zlib
 from .budget import Budget, BudgetExceeded
-from .derive import points, rollups, merge_summaries, union_ns
-from .model import PROCESS_ENTITIES, Record, field_component, is_series, who_rank
+from .derive import GOOD, bucket_of, points, rollups, merge_summaries, source_fields, union_ns
+from .model import PROCESS_AGE, PROCESS_ENTITIES, Record, field_component, is_series, who_rank
 from .summary_dictionary import SUMMARY_DICTIONARY
 
 MINUTE = 60_000_000_000
@@ -41,6 +42,7 @@ EMERGENCY_LEVEL = 0.9
 SHARE = 0.01
 MEMORY_RANK = ("process.phys_footprint", "process.resident_size")  # Mac footprint, else Linux resident set
 IO_RANK = ("process.diskio_bytesread", "process.diskio_byteswritten")
+RANK_SIGNALS = frozenset({"process.cpu", *MEMORY_RANK, *IO_RANK})
 REST_META = ("source", "component", "signal", "scope", "kind", "unit", "scale", "rate_unit", "additive", "method")
 # The retention reason of buckets converted to main contributors and rest. The span stays
 # answered, so coverage lists the record and reports no pruned gap.
@@ -55,8 +57,10 @@ PRUNE_BATCH = 4096
 PRUNE_ROW_PAGES = 16
 PRUNE_PRECHECK_STEPS = 1_000_000
 PRUNE_PRECHECK_SECONDS = 1.0
-CHECKPOINT = "machine-audit-unsaved-v2"
-CHECKPOINT_V1 = "machine-audit-unsaved-v1"
+# A stop's checkpoint: its unsaved readings and the process passes of its unfinished minute.
+# Formats 1 and 2, from earlier releases, held summary rows instead; they still recover.
+CHECKPOINT = "machine-audit-unsaved-v3"
+CHECKPOINT_ROWS = ("machine-audit-unsaved-v1", "machine-audit-unsaved-v2")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs(run_id TEXT PRIMARY KEY, boot_id TEXT NOT NULL, started_ns INTEGER NOT NULL, stopped_ns INTEGER, last_sequence INTEGER NOT NULL DEFAULT 0, last_saved_ns INTEGER);
 CREATE TABLE IF NOT EXISTS readings(run_id TEXT NOT NULL, sequence INTEGER NOT NULL, wall_ns INTEGER NOT NULL, source TEXT NOT NULL, component TEXT NOT NULL, payload BLOB NOT NULL, PRIMARY KEY(run_id,sequence));
@@ -151,11 +155,27 @@ def main_contributors(rows):
     return keep, cuts
 
 
+def _rest(first, kind, cut, entities, passes, total, total_sum, windows, start_ns, end_ns):
+    """A rest row: the entities a bucket did not keep, read as one entity. Its count is the
+    bucket's passes, so its mean is their combined level and its total their combined
+    total; `entities` says how many it holds; `cut` is the use an entity needed to be kept."""
+    covered = {run: union_ns(spans) for run, spans in windows.items()}
+    rest = dict({k: first[k] for k in REST_META}, entity="rest:"+kind, label=None, aggregation="rest-of-bucket",
+                cut=cut, members=[], entities=entities, instance_count=entities,
+                count=passes, sample_count=passes, sum=total_sum, total=total,
+                covered_windows=covered, covered_s=sum(b-a for spans in covered.values() for a, b in spans)/1e9,
+                start_ns=start_ns, end_ns=end_ns, min=None, max=None, max_ns=None, last=None, last_ns=None,
+                peak_rate=None, peak_ns=None, statuses={}, sleep_s=0.0, above_s={}, histogram_s=[],
+                partial_members=False, value=None)
+    rest["mean"] = total_sum/passes if passes else None
+    if total is not None and rest["covered_s"]:rest["mean_rate"] = total*first["scale"]/rest["covered_s"]
+    rest["status"] = "observed" if total_sum or total else "measured_zero"
+    return rest
+
+
 def rest_rows(dropped, rows, cuts):
-    """One row per source, component, kind and signal for the entities a bucket did not
-    keep, read as one entity: its count is the bucket's passes, so its mean is their
-    combined level and its total their combined total. `entities` says how many it holds;
-    `cut` is the use an entity needed to be kept."""
+    """Rest rows, per source, component, kind and signal, for dropped summary rows (rest rows
+    among them join as one more member)."""
     passes = defaultdict(int)
     for row in rows:
         key = (row["source"], row["component"], signal_key(row))
@@ -164,32 +184,60 @@ def rest_rows(dropped, rows, cuts):
     for row in dropped:groups[(row["source"], row["component"], kind_of(row["entity"]), signal_key(row))].append(row)
     result = []
     for (source, component, kind, key), group in groups.items():
-        first, n = group[0], passes[(source, component, key)]
         windows = defaultdict(list)
         for row in group:
             for run, spans in row.get("covered_windows", {}).items():windows[run].extend(spans)
-        covered = {run: union_ns(spans) for run, spans in windows.items()}
         totals = [row["total"] for row in group if row["total"] is not None]
-        rest = dict({k: first[k] for k in REST_META}, entity="rest:"+kind, label=None, aggregation="rest-of-bucket",
-                    cut=cuts.get((component, kind)), members=[],
-                    count=n, sample_count=n, sum=sum(row["sum"] for row in group), total=sum(totals) if totals else None,
-                    covered_windows=covered, covered_s=sum(b-a for spans in covered.values() for a, b in spans)/1e9,
-                    start_ns=min(row["start_ns"] for row in group), end_ns=max(row["end_ns"] for row in group),
-                    min=None, max=None, max_ns=None, last=None, last_ns=None, peak_rate=None, peak_ns=None,
-                    statuses={}, sleep_s=0.0, above_s={}, histogram_s=[], partial_members=False, value=None)
-        rest["entities"] = rest["instance_count"] = sum(row.get("entities", 1) for row in group)
-        rest["mean"] = rest["sum"]/n if n else None
-        if rest["total"] is not None and rest["covered_s"]:rest["mean_rate"] = rest["total"]*first["scale"]/rest["covered_s"]
-        rest["status"] = "observed" if rest["sum"] or rest["total"] else "measured_zero"
-        result.append(rest)
+        result.append(_rest(group[0], kind, cuts.get((component, kind)), sum(row.get("entities", 1) for row in group),
+                            passes[(source, component, key)], sum(totals) if totals else None, sum(row["sum"] for row in group),
+                            windows, min(row["start_ns"] for row in group), max(row["end_ns"] for row in group)))
     return result
 
 
-def held_rows(held):
-    rows=[]
-    for payload in held["rows"].values():
-        rows.extend(unpack_summaries(payload))
-    return rows
+def rest_from_points(dropped, cuts):
+    """Rest rows straight from the points of a minute's dropped entities: nothing is
+    summarized per entity for the long tail. One pass, as most of a minute's points go here."""
+    acc = {}
+    for p in dropped:
+        key = (p["source"], p["component"], kind_of(p["entity"]), p["signal"], p["unit"], p["kind"], p["scope"], p["scale"])
+        a = acc.get(key)
+        if a is None:
+            a = acc[key] = dict(first=p, entities=set(), passes=set(), total=None, sum=0, windows=defaultdict(list), start=p["start_ns"], end=p["end_ns"])
+        a["entities"].add(p["entity"])
+        a["start"] = min(a["start"], p["start_ns"]);a["end"] = max(a["end"], p["end_ns"])
+        if p["status"] in GOOD and isinstance(p["value"], (int, float)):
+            a["passes"].add((p["run_id"], p["sequence"]));a["sum"] += p["value"]
+            if p["total"] is not None:a["total"] = (a["total"] or 0)+p["total"]
+            a["windows"][p["run_id"]].extend(p.get("windows", [(p["awake_start_ns"], p["awake_end_ns"])]))
+    return [_rest(a["first"], kind, cuts.get((component, kind)), len(a["entities"]), len(a["passes"]), a["total"], a["sum"],
+                  a["windows"], a["start"], a["end"]) for (source, component, kind, *_), a in acc.items()]
+
+
+def point_use(pts):
+    """What `use` reads, summed per entity and signal over a bucket's points."""
+    acc = {}
+    for p in pts:
+        if p["signal"] not in RANK_SIGNALS:continue
+        key = (p["component"], p["entity"], p["signal"])
+        row = acc.get(key)
+        if row is None:row = acc[key] = dict(component=p["component"], entity=p["entity"], signal=p["signal"], scale=p["scale"], total=None, sum=None)
+        if p["status"] in GOOD and isinstance(p["value"], (int, float)):
+            if p["total"] is not None:row["total"] = (row["total"] or 0)+p["total"]
+            row["sum"] = (row["sum"] or 0)+p["value"]
+    return list(acc.values())
+
+
+def ranks(field, default):
+    """Whether a field gives process or program points, which a minute ranks once complete."""
+    return field_component(field, default) != "self" and (field.entity.startswith("process:") or
+           (field.additive and field.label is not None and field.scope not in ("unit", "unit_detail")))
+
+
+def part(record, ranking):
+    """The reading with only its fields that rank, or only those that do not."""
+    default = record.reading.component
+    fields = tuple(f for f in record.reading.fields if ranks(f, default) == ranking)
+    return record if len(fields) == len(record.reading.fields) else replace(record, reading=replace(record.reading, fields=fields))
 
 
 def merged_bundle(payload,rows):
@@ -199,17 +247,6 @@ def merged_bundle(payload,rows):
         k=signal_key(row)
         merged[k]=merge_summaries([merged[k],row]) if k in merged else row
     return list(merged.values())
-
-
-def extended(held,bucket,rows,run_id,lower,upper):
-    """The bucket held after `rows` join it. Only rows' entities are unpacked, and the
-    held bucket passed in is left as it was, so a save that fails changes nothing."""
-    previous=held is not None and held["bucket"]==bucket
-    packed=dict(held["rows"]) if previous else {}
-    groups=defaultdict(list)
-    for row in rows:groups[(row["source"],row["component"],row["entity"])].append(row)
-    for key,group in groups.items():packed[key]=pack_summaries(merged_bundle(packed.get(key),group))
-    return dict(run_id=run_id,bucket=bucket,lower=held["lower"] if previous else lower,upper=upper,rows=packed)
 
 
 def unpack_summaries(payload, keep=None):
@@ -241,7 +278,7 @@ class Store:
         if self.path.parent.resolve() != self.budget.root.resolve() or self.path.is_symlink():
             raise ValueError("store must be a regular file in the budget directory")
         self._mutex = threading.RLock()
-        self._held = {}  # resolution -> the run's newest bucket of ranked rows
+        self._runs = {}  # run_id -> what its next save continues from (see _state)
         self._conversion = None  # where converting a version 2 store resumes
         self.conversion_error = None
         self.cap_pruning = False  # whether the last save had to prune at the emergency level
@@ -288,43 +325,145 @@ class Store:
             db.close()
 
     def start_run(self, run_id, boot_id, started_ns):
+        """Start a run. A run that ended without a stop or a checkpoint (a crash) left its last
+        quarter and hour open: they are ranked here from its saved minute rows, in the same
+        transaction. A run whose checkpoint waits is left to it."""
         with self._mutex:
             self.maintain()
+            prepared=[];payload=0
+            waiting={path.name[len("unsaved-"):].rsplit("-",1)[0] for path in self.path.parent.glob("unsaved-*.json")}
+            for crashed, in self.db.execute("SELECT run_id FROM runs WHERE stopped_ns IS NULL").fetchall():
+                if crashed in waiting:continue
+                summaries=defaultdict(list)
+                for resolution,bucket in self._state(crashed)["open"].items():
+                    if bucket is not None:self._close(crashed,resolution,bucket,summaries)
+                if summaries:
+                    rows,_,_,size=self._prepare(crashed,[],[],summaries,set())
+                    prepared+=rows;payload+=size
             def write():
-                with self.budget.sqlite_write(self.db,self.path,rows=1):
-                    self.db.execute("INSERT INTO runs(run_id,boot_id,started_ns) VALUES(?,?,?)", (run_id, boot_id, started_ns))
+                with self.budget.sqlite_write(self.db,self.path,rows=1+len(prepared),payload_bytes=payload):
+                    self.db.execute("BEGIN IMMEDIATE")
+                    try:
+                        if prepared:self.db.executemany(UPSERT_SUMMARY,prepared)
+                        self.db.execute("INSERT INTO runs(run_id,boot_id,started_ns) VALUES(?,?,?)", (run_id, boot_id, started_ns))
+                        self.db.execute("COMMIT")
+                    except BaseException:
+                        if self.db.in_transaction:self.db.execute("ROLLBACK")
+                        raise
             self._pruning_until_admitted(write)
 
     def stop_run(self, run_id, stopped_ns):
-        """Mark the run stopped and save its held buckets, which are now complete."""
+        """Mark the run stopped, summarizing its unfinished minute and open quarter and hour."""
         self.append([],run_id=run_id,stopped_ns=stopped_ns)
 
-    def _ranked(self,run_id,resolution,bucket,rows):
-        """A complete bucket's rows to save: its main contributors as they are, and rest
-        rows for the others. Entities it already saved fix who is kept, so late data
-        extends them and adds to the rest, and rows an older release saved keep their tail."""
-        saved={(component,entity) for component,entity in self.db.execute("""SELECT component,entity FROM summaries
-            WHERE run_id=? AND resolution=? AND bucket_ns=? AND component!='self' AND (entity LIKE 'process:%' OR entity LIKE 'program:%')""",
-            (run_id,resolution,bucket))}
+    def _ranked(self,run_id,resolution,bucket,rows,saved=None):
+        """A bucket's rows to save: its main contributors as they are, and rest rows for the
+        others. `saved`, the entities it kept when first ranked, fixes who is kept, so later
+        data extends them and adds to the rest."""
         groups=defaultdict(list)
         for row in rows:groups[(row["source"],row["component"],row["entity"])].append(row)
-        rows=[row for group in groups.values() for row in merged_bundle(None,group)]  # held and new fragments
-        keep,cuts=(saved,{}) if saved else main_contributors(rows)
+        rows=[row for group in groups.values() for row in merged_bundle(None,group)]  # fragments of one bucket
+        keep,cuts=(saved,{}) if saved is not None else main_contributors(rows)
         kept=[row for row in rows if (row["component"],row["entity"]) in keep]
         return kept+rest_rows([row for row in rows if (row["component"],row["entity"]) not in keep],rows,cuts)
 
-    def _stop_rows(self,held,run_id):
-        """Each held bucket's main contributors and rest, saved when its run stops, and
-        the saved payload they replace."""
-        prepared=[];replaced=0
-        for resolution,bucket in held.items():
-            groups=defaultdict(list)
-            for row in self._ranked(run_id,resolution,bucket["bucket"],held_rows(bucket)):
-                groups[(row["source"],row["component"],row["entity"])].append(row)
-            for key,group in groups.items():
-                values,old=self._merged(run_id,(resolution,bucket["bucket"],*key),group,bucket["lower"],bucket["upper"])
-                prepared.append(values);replaced+=old
-        return prepared,replaced
+    def _kept(self,run_id,resolution,bucket,summaries):
+        """The process and program entities a ranked bucket kept, saved or in this save."""
+        saved={(c,e) for c,e in self.db.execute("""SELECT component,entity FROM summaries WHERE run_id=? AND resolution=?
+            AND bucket_ns=? AND component!='self' AND (entity LIKE 'process:%' OR entity LIKE 'program:%')""",(run_id,resolution,bucket))}
+        return saved|{(k[3],k[4]) for k in summaries if k[:2]==(resolution,bucket) and ranked(k[3],k[4])}
+
+    def _closed(self,run_id,resolution,bucket,summaries):
+        """Whether a quarter or hour has been ranked: it holds process, program or rest rows."""
+        return any(k[:2]==(resolution,bucket) and (ranked(k[3],k[4]) or k[4].startswith("rest:")) for k in summaries) or bool(
+            self.db.execute("""SELECT 1 FROM summaries WHERE run_id=? AND resolution=? AND bucket_ns=? AND component!='self'
+            AND (entity LIKE 'process:%' OR entity LIKE 'program:%' OR entity LIKE 'rest:%') LIMIT 1""",(run_id,resolution,bucket)).fetchone())
+
+    def _close(self,run_id,resolution,bucket,summaries):
+        """Rank a quarter or hour from the minute rows saved for it: each minute's main
+        contributors and rest. An entity's row sums the minutes it mattered in; its other
+        minutes are in the rest, so totals still add up."""
+        if self._closed(run_id,resolution,bucket,summaries):return
+        end=bucket+WIDTHS[resolution];rows=[]
+        for payload, in self.db.execute("""SELECT payload FROM summaries WHERE run_id=? AND resolution='minute' AND bucket_ns>=? AND bucket_ns<?
+                AND component!='self' AND (entity LIKE 'process:%' OR entity LIKE 'program:%' OR entity LIKE 'rest:%')""",(run_id,bucket,end)):
+            rows.extend(unpack_summaries(payload))
+        for key,group in list(summaries.items()):
+            if key[0]=="minute" and bucket<=key[1]<end and (ranked(key[3],key[4]) or key[4].startswith("rest:")):rows.extend(group)
+        for row in self._ranked(run_id,resolution,bucket,rows):
+            summaries[(resolution,bucket,row["source"],row["component"],row["entity"])].append(row)
+
+    def _state(self,run_id):
+        """A copy of what a run's next save continues from: its unfinished minute's process
+        passes, the newest minute ranked, the open quarter and hour, and each source's last
+        reading summarized at once (`now`) and once ranked (`last`). A run this store has not
+        saved for starts from its saved rows."""
+        state=self._runs.get(run_id)
+        if state is None:
+            derived=self.db.execute("""SELECT MAX(bucket_ns) FROM summaries WHERE run_id=? AND resolution='minute' AND component!='self'
+                AND (entity LIKE 'process:%' OR entity LIKE 'program:%' OR entity LIKE 'rest:%')""",(run_id,)).fetchone()[0]
+            state=dict(pending=[],derived=derived,last={},now={},deferred=set(),
+                       open={r:(None if derived is None else derived//WIDTHS[r]*WIDTHS[r]) for r in ("15-minute","hour")})
+        return dict(state,pending=list(state["pending"]),last=dict(state["last"]),now=dict(state["now"]),open=dict(state["open"]),deferred=set(state["deferred"]))
+
+    def _previous(self,records,last):
+        """Each source's reading before the first of `records`: the last one summarized, else
+        the last saved before it, else its baseline."""
+        result={}
+        for r in records:
+            source=r.reading.source
+            if source in result:continue
+            known=last.get(source)
+            if known is not None and known.sequence<r.sequence:
+                result[source]=known;continue
+            row=self.db.execute("SELECT payload FROM readings WHERE run_id=? AND source=? AND sequence<? ORDER BY sequence DESC LIMIT 1",(r.run_id,source,r.sequence)).fetchone()
+            if not row:
+                row=self.db.execute("SELECT payload FROM baselines WHERE run_id=? AND source=?",(r.run_id,source)).fetchone()
+            if row:result[source]=Record.unpack(row[0])
+        return result
+
+    @staticmethod
+    def _host_rows(pts,summaries,catalog):
+        """Rows of entities every bucket keeps, merged at each save into minute, 15-minute and
+        hour rows."""
+        coarser=defaultdict(list)
+        for bucket,row in rollups(pts,MINUTE):
+            catalog.add((row["source"],row["signal"],row["component"],row["kind"],row["unit"],row["scope"],row["scale"]))
+            if row["scope"] not in HOUR_ONLY_SCOPES:
+                summaries[("minute",bucket,row["source"],row["component"],row["entity"])].append(row)
+                coarser[("15-minute",bucket//QUARTER*QUARTER,row["source"],row["component"],row["entity"],*signal_key(row))].append(row)
+            coarser[("hour",bucket//HOUR*HOUR,row["source"],row["component"],row["entity"],*signal_key(row))].append(row)
+        for key,rows in coarser.items():
+            summaries[key[:5]].append(merge_summaries(rows) if len(rows)>1 else rows[0])
+
+    def _rank_minutes(self,run_id,records,state,summaries,catalog):
+        """Summarize complete minutes of process passes once: rank each minute's entities by
+        their use, summarize only those kept, and build the rest straight from the others'
+        points. Data for a minute already ranked extends what it kept and its rest, and so
+        do the minute's quarter and hour once they are closed."""
+        records=[part(r,True) for r in records]
+        pts=points(records,self._previous(records,state["last"]))
+        for r in records:state["last"][r.reading.source]=r
+        minutes=defaultdict(list)
+        for p in pts:minutes[bucket_of(p,MINUTE)].append(p)
+        for bucket in sorted(minutes):
+            late=state["derived"] is not None and bucket<=state["derived"]
+            if late:keep,cuts=self._kept(run_id,"minute",bucket,summaries),{}
+            else:keep,cuts=main_contributors(point_use(minutes[bucket]))
+            kept=[p for p in minutes[bucket] if (p["component"],p["entity"]) in keep]
+            rows=[row for _,row in rollups(kept,MINUTE)]+rest_from_points([p for p in minutes[bucket] if (p["component"],p["entity"]) not in keep],cuts)
+            for row in rows:
+                summaries[("minute",bucket,row["source"],row["component"],row["entity"])].append(row)
+                catalog.add((row["source"],row["signal"],row["component"],row["kind"],row["unit"],row["scope"],row["scale"]))
+            if not late:state["derived"]=bucket
+            for resolution in ("15-minute","hour"):
+                coarse=bucket//WIDTHS[resolution]*WIDTHS[resolution]
+                if self._closed(run_id,resolution,coarse,summaries):
+                    for row in self._ranked(run_id,resolution,coarse,rows,self._kept(run_id,resolution,coarse,summaries)):
+                        summaries[(resolution,coarse,row["source"],row["component"],row["entity"])].append(row)
+                elif state["open"][resolution] is None or coarse>state["open"][resolution]:
+                    if state["open"][resolution] is not None:self._close(run_id,resolution,state["open"][resolution],summaries)
+                    state["open"][resolution]=coarse
 
     def _pruning_until_admitted(self,write):
         """Run a write, pruning the oldest history between attempts until it fits."""
@@ -335,19 +474,18 @@ class Store:
                 if not self._capacity_error(exc) or not self.prune_oldest():raise
 
     def spill(self, run_id, stopped_ns, payloads):
-        """Checkpoint a stopping run: its unsaved readings, held buckets and saved
-        sequence, for the next start to save. The file is written under a hidden name
+        """Checkpoint a stopping run: its unsaved readings, its unfinished minute's process
+        passes and saved sequence, for the next start to save. The file is written under a hidden name
         and published only once complete and synced, so a stop killed mid-write never
         leaves a partial checkpoint for recovery. Publication never replaces another
         stop's file. A killed write leaves its hidden file, which recovery ignores."""
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}",run_id):raise ValueError("invalid run id")
         with self._mutex:
             committed=self.db.execute("SELECT last_sequence FROM runs WHERE run_id=?",(run_id,)).fetchone()[0]
+            pending=self._runs.get(run_id,{}).get("pending",[])
             data=encode({"format":CHECKPOINT,"run_id":run_id,"stopped_ns":stopped_ns,"committed":committed,
                          "records":[base64.b64encode(p).decode() for p in payloads],
-                         "held":{resolution:{"bucket":held["bucket"],"lower":held["lower"],"upper":held["upper"],
-                                             "rows":[[*key,base64.b64encode(payload).decode()] for key,payload in held["rows"].items()]}
-                                 for resolution,held in self._held.items() if held["run_id"]==run_id}}).encode()
+                         "pending":[base64.b64encode(r.packed).decode() for r in pending]}).encode()
             directory=self.path.parent
             path=directory/f"unsaved-{run_id}-{stopped_ns}.json"
             partial=directory/f".{path.name}.partial"
@@ -375,10 +513,8 @@ class Store:
                 try:
                     with os.fdopen(os.open(path,os.O_RDONLY|os.O_NOFOLLOW),"rb") as stream:
                         data=json.loads(stream.read())
-                    # An older release's checkpoint holds a minute only.
-                    if data.get("format")==CHECKPOINT_V1:data["held"]={"minute":data["held"]} if data["held"] else {}
-                    elif data.get("format")!=CHECKPOINT:raise ValueError("unsupported_unsaved_file")
-                    run_id,stopped_ns,held=data["run_id"],data["stopped_ns"],data["held"]
+                    if data.get("format") not in (CHECKPOINT,*CHECKPOINT_ROWS):raise ValueError("unsupported_unsaved_file")
+                    run_id,stopped_ns=data["run_id"],data["stopped_ns"]
                     records=[Record.unpack(base64.b64decode(p)) for p in data["records"]]
                     row=self.db.execute("SELECT last_sequence,stopped_ns,boot_id FROM runs WHERE run_id=?",(run_id,)).fetchone()
                     sequences=[r.sequence for r in records]
@@ -394,35 +530,33 @@ class Store:
                             raise ValueError("unsaved_checkpoint_mismatch")
                     else:
                         # A save after the checkpoint (an older release's recovery) leaves
-                        # its held buckets stale; it is kept rather than saved wrong.
+                        # what it held stale; it is kept rather than saved wrong.
                         if last!=data["committed"]:raise ValueError("unsaved_checkpoint_mismatch")
-                        self._held={resolution:dict(run_id=run_id,bucket=h["bucket"],lower=h["lower"],upper=h["upper"],
-                                                    rows={tuple(row[:3]):base64.b64decode(row[3]) for row in h["rows"]})
-                                    for resolution,h in held.items()}
-                        try:self.append(records,run_id=run_id,stopped_ns=stopped_ns)
-                        finally:self._held={}
+                        state=self._state(run_id)
+                        state["pending"]=[Record.unpack(base64.b64decode(p)) for p in data.get("pending",[])]
+                        self._runs[run_id]=state
+                        try:self.append(records,run_id=run_id,stopped_ns=stopped_ns,held=self._held_rows(data))
+                        finally:self._runs.pop(run_id,None)
                     path.unlink()
                 except Exception as exc:
                     kept.append(exc)
         return kept
 
-    def _previous(self, records):
-        result = {}
-        for r in records:
-            source = r.reading.source
-            if source in result:
-                continue
-            row = self.db.execute("SELECT payload FROM readings WHERE run_id=? AND source=? ORDER BY sequence DESC LIMIT 1", (r.run_id,source)).fetchone()
-            if not row:
-                row = self.db.execute("SELECT payload FROM baselines WHERE run_id=? AND source=?",(r.run_id,source)).fetchone()
-            if row:
-                result[source] = Record.unpack(row[0])
-        return result
+    @staticmethod
+    def _held_rows(data):
+        """The summary rows an earlier release's checkpoint held, by resolution and bucket:
+        format 1 a minute, format 2 a minute, quarter and hour, each for every entity."""
+        held=data.get("held")
+        if data["format"]==CHECKPOINT_ROWS[0]:held={"minute":held} if held else {}
+        return {(resolution,h["bucket"]):[row for *_,payload in h["rows"] for row in unpack_summaries(base64.b64decode(payload))]
+                for resolution,h in (held or {}).items()}
 
-    def append(self, records: list[Record], *, run_id=None, stopped_ns=None, commit_lock=None, on_commit=None):
-        """Save records. With `stopped_ns`, the same transaction also saves the held
-        buckets and marks the run stopped; `run_id` names the run when there are no
-        records."""
+    def append(self, records: list[Record], *, run_id=None, stopped_ns=None, commit_lock=None, on_commit=None, held=None):
+        """Save records. Host readings are summarized at once; process passes once their
+        minute is complete. With `stopped_ns`, the same transaction also summarizes the
+        unfinished minute, closes the open quarter and hour and marks the run stopped;
+        `run_id` names the run when there are no records. `held` is an earlier release's
+        checkpointed rows: each bucket is ranked as it was and later data joins it."""
         if not records and stopped_ns is None:
             return
         with self._mutex:
@@ -435,70 +569,50 @@ class Store:
             if run_id is None:raise ValueError("a stop requires its run")
             raw = [(r, r.packed, record_components(r)) for r in records]
             summaries = defaultdict(list)
-            held={resolution:h for resolution,h in self._held.items() if h["run_id"]==run_id}
-            lowers={};catalog=set()
-            if records:
-                derived = points(records, self._previous(records))
-                buckets={resolution:defaultdict(list) for resolution in WIDTHS}
-                coarser=defaultdict(list)
-                for bucket,row in rollups(derived,MINUTE):
-                    # From every row: a signal only held rows carry is still known.
-                    catalog.add((row["source"],row["signal"],row["component"],row["kind"],row["unit"],row["scope"],row["scale"]))
-                    if row["scope"] not in HOUR_ONLY_SCOPES:
-                        if ranked(row["component"],row["entity"]):buckets["minute"][bucket].append(row)
-                        else:summaries[("minute",bucket,row["source"],row["component"],row["entity"])].append(row)
-                        coarser[("15-minute",bucket//QUARTER*QUARTER,row["source"],row["component"],row["entity"],row["signal"],row["unit"],row["scope"],row["kind"],row["scale"])].append(row)
-                    coarser[("hour",bucket//HOUR*HOUR,row["source"],row["component"],row["entity"],row["signal"],row["unit"],row["scope"],row["kind"],row["scale"])].append(row)
-                for key,rows in coarser.items():
-                    resolution,bucket,source,component,entity=key[:5]
-                    row=merge_summaries(rows) if len(rows)>1 else rows[0]
-                    if ranked(component,entity):buckets[resolution][bucket].append(row)
-                    else:summaries[key[:5]].append(row)
-                self.maintain()
-                held,lowers=self._top_buckets(records,buckets,summaries,held)
+            catalog=set()
+            state=self._state(run_id)
+            if records:self.maintain()
+            for (resolution,bucket),rows in (held or {}).items():
+                for row in self._ranked(run_id,resolution,bucket,rows):
+                    summaries[(resolution,bucket,row["source"],row["component"],row["entity"])].append(row)
+                if resolution=="minute":state["derived"]=max(bucket,state["derived"] if state["derived"] is not None else bucket)
+            # A source of process passes stays one, so its passes are summarized in order. Their
+            # fields that never rank (failed process reads, Linux units) are summarized at once.
+            later={r.reading.source for r in records if any(ranks(f,r.reading.component) for f in r.reading.fields)}|state["deferred"]
+            state["deferred"]=later
+            deferred=[r for r in records if r.reading.source in later]
+            now=[r if r.reading.source not in later else part(r,False) for r in records]
+            if now:
+                self._host_rows(points(now,self._previous(now,state["now"])),summaries,catalog)
+                for r in now:state["now"][r.reading.source]=r
+            # Signals are known when saved, before their minute is summarized: one pass per source.
+            for r in {r.reading.source:r for r in deferred}.values():
+                for f in source_fields(r.reading):
+                    if f.name!=PROCESS_AGE:catalog.add((r.reading.source,f.name,field_component(f,r.reading.component),f.kind,f.unit,f.scope,f.scale))
+            pending=state["pending"]+deferred
+            if stopped_ns is None and pending:
+                # A pass waits for the latest minute any of its points can fall in.
+                minute=lambda r:max(r.reading.end.wall_ns-1,r.reading.start.wall_ns)//MINUTE
+                newest=max(minute(r) for r in pending)
+                ready=[r for r in pending if minute(r)<newest]
+                state["pending"]=[r for r in pending if minute(r)>=newest]
+            else:
+                ready,state["pending"]=pending,[]
+            if ready:self._rank_minutes(run_id,ready,state,summaries,catalog)
             stop=None
             if stopped_ns is not None:
-                stop=(stopped_ns,*self._stop_rows(held,run_id));held={}
+                for resolution,bucket in state["open"].items():
+                    if bucket is not None:self._close(run_id,resolution,bucket,summaries)
+                stop=stopped_ns
             # Prepare once: a save that must prune to fit repeats only admission and commit.
-            batch=self._prepare(records,raw,summaries,lowers,catalog) if records else ([],set(),0,0)
+            batch=self._prepare(run_id,records,raw,summaries,catalog)
             self._pruning_until_admitted(lambda:self._write(records,raw,batch,commit_lock,on_commit,run_id,stop))
-            self._held=held
+            if stopped_ns is None:self._runs[run_id]=state
+            else:self._runs.pop(run_id,None)
 
     @staticmethod
     def _capacity_error(exc):
         return getattr(exc,"sqlite_errorcode",None)==sqlite3.SQLITE_FULL or str(exc) in {"managed_storage_limit","sqlite_checkpoint_headroom"}
-
-    def _top_buckets(self,records,buckets,summaries,held):
-        """Add each complete bucket's main contributors and rest to summaries; return the
-        buckets to hold, per resolution, and each saved row's first sequence.
-
-        Saves are not aligned with buckets. Each resolution's newest bucket is held here,
-        packed, until a later save completes it, so its rows are neither saved nor
-        counted at every save. Ranking then saves its main contributors and rest, once,
-        so a saved row always holds its whole bucket. Later data for a ranked bucket
-        extends the rows it kept and its rest. Stopping the run saves the held buckets;
-        a crash loses only their process and program rows, never readings or host rows."""
-        first,last=records[0],records[-1]
-        lowers={};kept={}
-        for resolution,arrived in buckets.items():
-            current=held.get(resolution)
-            if not arrived:
-                if current:kept[resolution]=current
-                continue
-            found=set(arrived)|({current["bucket"]} if current else set())
-            newest=max(found)
-            for bucket in sorted(found):
-                if bucket==newest:
-                    if bucket in arrived:current=extended(current,bucket,arrived[bucket],first.run_id,first.sequence,last.sequence)
-                    continue
-                rows=arrived.get(bucket,[]);lower=first.sequence
-                if current and current["bucket"]==bucket:
-                    rows=held_rows(current)+rows;lower=current["lower"]
-                for row in self._ranked(first.run_id,resolution,bucket,rows):
-                    key=(resolution,bucket,row["source"],row["component"],row["entity"])
-                    summaries[key].append(row);lowers[key]=lower
-            if current and current["bucket"]==newest:kept[resolution]=current
-        return kept,lowers
 
     @staticmethod
     def _bound(records,raw,summaries,catalog):
@@ -512,13 +626,14 @@ class Store:
         old=self.db.execute("SELECT sequence_min,payload FROM summaries WHERE run_id=? AND resolution=? AND bucket_ns=? AND source=? AND component=? AND entity=?",(run_id,*key)).fetchone()
         return summary_values(run_id,min(lower,old[0]) if old else lower,upper,*key,merged_bundle(old and old[1],rows)),len(old[1]) if old else 0
 
-    def _prepare(self,records,raw,summaries,lowers,catalog):
+    def _prepare(self,run_id,records,raw,summaries,catalog):
         """Merge each summary row with its saved row and count the write's bound."""
-        first,last=records[0],records[-1]
+        if records:lower,upper=records[0].sequence,records[-1].sequence
+        else:lower=upper=self.db.execute("SELECT last_sequence FROM runs WHERE run_id=?",(run_id,)).fetchone()[0]
         count,payload=self._bound(records,raw,summaries,catalog)
         prepared=[];replaced_payload=0
         for key,rows in summaries.items():
-            values,old=self._merged(first.run_id,key,rows,lowers.get(key,first.sequence),last.sequence)
+            values,old=self._merged(run_id,key,rows,lower,upper)
             prepared.append(values);replaced_payload+=old
         for source in {r.reading.source for r in records}:
             old=self.db.execute('SELECT length(payload) FROM baselines WHERE source=?',(source,)).fetchone()
@@ -528,15 +643,16 @@ class Store:
 
     def _write(self,records,raw,batch,commit_lock,on_commit,run_id,stop=None):
         prepared,catalog,count,payload=batch
-        if stop is not None:
-            count+=1+len(stop[1]);payload+=stop[2]+sum(len(row[-1]) for row in stop[1])
+        if stop is not None:count+=1
         with self.budget.sqlite_write(self.db,self.path,rows=count,payload_bytes=payload):
             self.db.execute("BEGIN IMMEDIATE")
             try:
                 if records:self._save_records(records,raw,prepared,catalog)
+                else:
+                    self.db.executemany(UPSERT_SUMMARY,prepared)
+                    self.db.executemany("INSERT OR REPLACE INTO signal_catalog VALUES(?,?,?,?,?,?,?)",sorted(catalog))
                 if stop is not None:
-                    self.db.executemany(UPSERT_SUMMARY,stop[1])
-                    if self.db.execute("UPDATE runs SET stopped_ns=? WHERE run_id=?",(stop[0],run_id)).rowcount!=1:
+                    if self.db.execute("UPDATE runs SET stopped_ns=? WHERE run_id=?",(stop,run_id)).rowcount!=1:
                         raise ValueError("unknown run")
                 with commit_lock if commit_lock is not None else nullcontext():
                     self.db.execute("COMMIT")

@@ -86,8 +86,10 @@ readings a minute, its map 9 MB) stays far below the cap for years.
 ### Upgrade is one way
 
 A store this release has written is version 3 once converted, its bundles use the
-[preset dictionary](#main-contributors), and its stop checkpoints are format 2. A
-release before it can read none of these, so going back means starting a new store.
+[preset dictionary](#main-contributors), and its stop checkpoints are format 3 (the
+process passes of the unfinished minute). It still recovers formats 1 and 2 from the
+releases before it. A release before it can read none of these, so going back means
+starting a new store.
 
 Counted writes reserve their transaction's growth and journal pages, rather
 than another copy of the entire database. Emergency pruning starts at 90% of the
@@ -190,9 +192,9 @@ exposes; matching cadence does not make different signals equivalent.
 | --- | --- | --- |
 | CPU usage and runnable demand | 1 s | macOS host CPU ticks and processor-set load; Ubuntu `/proc/stat` and supported host contention counters |
 | Machine memory, swap and pressure | 1 s | macOS VM page classes/counters, swap usage, pressure level and swap-housekeeping counters; Ubuntu `meminfo`, `vmstat`, host memory PSI |
-| User-process CPU, memory, writes and wake-ups | 10 s | macOS `proc_pid_rusage` plus `TASK_VM_INFO` memory effects, graphics footprint and limit headroom; Ubuntu process CPU and `status` memory fields, other counters where available |
+| User-process CPU, memory, writes and wake-ups | 30 s ([cost](#collector-cost)) | macOS `proc_pid_rusage` plus `TASK_VM_INFO` memory effects, graphics footprint and limit headroom; Ubuntu process CPU and `status` memory fields, other counters where available |
 | System-process CPU and memory via Mac helper | About 60 s (planned) | Helper not shipped yet; separate privileged source, not an idle setting |
-| Ubuntu workload-group memory | 10 s | cgroup usage, movement, PSI and event counters; use one non-overlapping level for totals |
+| Ubuntu workload-group memory | 30 s, in the same pass as its processes | cgroup usage, movement, PSI and event counters; use one non-overlapping level for totals |
 | GPU device activity and memory | 5 s | Per GPU; IORegistry on macOS, supported driver interfaces on Ubuntu; include exposed engines, memory classes, clocks and limits |
 | GPU client/process attribution | 10 s | macOS client time; Ubuntu driver client/engine time and memory where available |
 | Disk operations, bytes and busy time; Ubuntu I/O pressure | 5 s | Per physical disk where exposed; Ubuntu `/proc/pressure/io` and group `io.pressure` |
@@ -314,15 +316,29 @@ and thousands of small ones the rest, so the memory rest row holds 54–69% of p
 footprint. Programs have no memory rows (footprints overlap and are not added), so
 that tail is a quantity, not a list.
 
-**Held buckets.** A bucket is ranked once it is complete. Saves are not aligned with
-buckets, so the collector holds the run's newest minute, quarter hour and hour of
-process and program rows in memory, packed, until a later save completes each one,
-then saves its main contributors and rest, once. A saved row always holds its whole
-bucket. Data arriving after the ranking extends the rows it kept and adds the others
-to its rest. Stopping the run saves the held buckets; a stop that only checkpoints
-carries them in the checkpoint. A crash loses only the held process and program
-rows: an open minute's, quarter hour's and hour's. Its readings and host rows are
-already saved.
+**One summary per minute, and only of what is kept.** Saves are not aligned with
+minutes, so the collector keeps the process passes of the unfinished minute in memory
+(their readings are already saved) and summarizes a minute once, when a later pass
+completes it. It ranks the minute's processes and programs by their use, summarizes
+only those kept, and builds each rest row straight from the others' points, so the
+long tail costs one pass over its points and no summary per process. Fields of a pass
+that never rank (failed process reads, Linux units) are summarized at once with the
+host readings. Data arriving after the ranking extends the rows it kept and adds the
+others to its rest.
+
+A quarter hour or hour is ranked when the next one begins, or at a stop, from the
+minute rows saved for it: each minute's main contributors and rest. An entity is a
+main contributor of a quarter or hour only if it was one in at least one of its
+minutes (under 1% of every minute is under 1% of the sum), and its row sums the
+minutes it mattered in; its other minutes are in the rest, so totals still add up.
+Replayed on a recorded quarter hour of Big Mac, this kept the same main contributors
+as ranking every process over the whole quarter, except one marginal entity in three
+of five lists; kept rows held 1–2 points less of the use and the worst kept row 78–84%
+of its own. A rest row's entity count over a quarter or hour is the most it held in
+one minute, a floor. Stopping the run summarizes the unfinished minute and ranks the
+open quarter and hour; a stop that only checkpoints carries the unfinished minute's
+passes. A crash loses only that minute's process and program rows: the next start
+ranks the run's open quarter and hour from its saved minute rows.
 
 Each save reserves room in proportion to the rows it writes. A save that does
 not fit prunes the oldest history and tries again; it merges its rows once,
@@ -373,6 +389,46 @@ were pruned earlier, which left pages 45% empty, and rewriting about 16,000
 Replayed over three recorded hours, the share rule kept 274–315 host rows, 54–65
 process and program rows and 5 rest rows: 0.15–0.17 MB with the dictionary, against
 7,515–8,804 rows and 6.8–8.0 MB before.
+
+## Collector cost
+
+A monitor must cost so little that nobody notices it. The job gives the bar: the
+collector must never be one of the main contributors it reports, so its own CPU must
+stay under the 1% share of the machine's process CPU in every hour. Big Mac's process
+CPU over the measured hours was 4.6–19 CPUs, which sets the bar at about 165 s of CPU
+an hour, 4.6% of one core, in its quietest hour. The target leaves margin: 2% of one
+core (72 s an hour), under the bar until the machine's load falls to 2 CPUs.
+
+Before this release the collector used 1,350–1,500 s an hour on Big Mac (38–42% of a
+core), about 5% of all process CPU: by its own rule, a main contributor. Replayed on 31
+minutes of Big Mac's recorded readings (about 1,450 processes):
+
+| | 0c633ad | This release, passes every 10 s | This release, passes every 30 s |
+| --- | ---: | ---: | ---: |
+| CPU a save (one a minute) | 19.5 s | 4.5 s | 1.6 s |
+| Peak memory a save adds | 778 MiB | 307 MiB | 132–150 MiB |
+| CPU a process pass | 0.76 s | 0.48 s | 0.48 s |
+
+Most of the old save cost was re-merging and re-packing every process at minute,
+quarter and hour on every save; most of the pass cost was Python copying and
+re-validating 30,000 fields, not the OS reads (about 10%). At 30 s the estimate for Big
+Mac is about 95 s an hour for saves, 60 s for the process pass and 45 s for every other
+source: about 200 s an hour, 5.5% of one core. That meets the bar whenever Big Mac's
+processes use 5.5 CPUs or more, most of its measured hours, but not its quietest, and
+misses the margin target. What remains is mostly the generic derivation of each pass's
+points (40% of a save) and the per-source overhead; the next steps are fewer
+per-process fields and a leaner derivation for process passes.
+
+**Process passes every 30 s.** Minute rows keep each minute's main contributors from two
+passes, and the host's own readings stay at 1 s, so a constraint's timing and shape
+come from the host series while the pass names who was responsible. A new process is
+counted from its start: a process missing from the previous pass and younger than the
+time since it (its `process.age`, read by the source) began at zero inside the
+interval. On the recorded readings 30 s alone kept 96.6% of the CPU the 10 s passes
+attributed, and with that counting 99.0%; at 10 s the counting adds 1.5%, including 782
+processes in 31 minutes that lived a single pass and had none counted. What is lost: a
+process's own peak is a 30-second average, and a process that starts and exits between
+two passes is not seen.
 
 ## Saving, cost and retention
 

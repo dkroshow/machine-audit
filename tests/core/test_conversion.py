@@ -15,16 +15,8 @@ from machine_audit.store import CONVERTED,Store,unpack_summaries
 
 @contextmanager
 def saved_as_before():
-    """The previous release: every process and program saved its 15-minute and hour rows
-    at each save; only minutes were ranked."""
-    original=Store._top_buckets
-    def previous(self,records,buckets,summaries,held):
-        for resolution in ('15-minute','hour'):
-            for bucket,rows in buckets[resolution].items():
-                for row in rows:summaries[(resolution,bucket,row['source'],row['component'],row['entity'])].append(row)
-            buckets[resolution].clear()
-        return original(self,records,buckets,summaries,held)
-    with patch.object(Store,'_top_buckets',previous):yield
+    """An earlier release: every process and program saved its rows at each save, unranked."""
+    with patch('machine_audit.store.ranked',lambda component,entity:False),patch('machine_audit.store.ranks',lambda field,default:False):yield
 
 
 S=10**9

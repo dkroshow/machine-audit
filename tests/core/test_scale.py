@@ -19,6 +19,7 @@ from machine_audit.budget import Budget
 from machine_audit.collector import Collector
 from machine_audit.model import Clock,Field,Reading,Record
 from machine_audit.query import Query
+from machine_audit.derive import summarize
 from machine_audit.store import Store, unpack_summaries
 from test_conversion import saved_as_before
 
@@ -218,7 +219,7 @@ class ScaleTests(unittest.TestCase):
         def minute_rows(store):
             result={}
             for bucket,component,entity,payload in store.db.execute("SELECT bucket_ns,component,entity,payload FROM summaries WHERE resolution='minute' AND bucket_ns<180*? AND component!='self'",(S,)):
-                for row in unpack_summaries(payload):result[(bucket//(60*S),component,entity,row['signal'])]=(row['total'],row['sample_count'])
+                for row in unpack_summaries(payload):result[(bucket//(60*S),component,entity,row['signal'])]=(row['total'] and round(row['total'],6),row['sample_count'])
             return result
         saved=minute_rows(self.store)
         self.assertEqual(saved,minute_rows(whole))
@@ -231,6 +232,20 @@ class ScaleTests(unittest.TestCase):
         self.assertEqual({e for e in entities('cpu','program')},{f'program:program{p}' for p in range(25)}|{'rest:program'})
         # Six passes after the baseline, every process's bytes in the rest.
         self.assertEqual(saved[(0,'storage','rest:process','process.diskio_byteswritten')],(6.0*sum((pid+1000)%2000 for pid in range(2000)),6))
+
+    def test_a_save_summarizes_only_the_entities_it_keeps(self):
+        # Big Mac spent 36% of every save re-merging every process at three resolutions and
+        # 15% summarizing every process each minute: about 18 s of CPU a save for 1,450
+        # processes. A complete minute now summarizes only its main contributors; the other
+        # 1,975 processes reach their rest row without a summary each.
+        records=passes(2000,130,lambda pid,t:2.0 if pid<25 else 0.01,written=lambda pid:0)
+        calls=[];real=summarize
+        def counted(items):calls.append(items[0]['entity']);return real(items)
+        with patch('machine_audit.derive.summarize',counted):
+            for lo in range(0,len(records),6):self.store.append(records[lo:lo+6])
+        summarized={e for e in calls if e.startswith('process:')}
+        self.assertEqual(summarized,{f'process:{pid}' for pid in range(25)})
+        self.assertLess(len(calls),2*25*4+200)  # kept entities' signals over two minutes, and host rows
 
     def test_each_quarter_and_hour_keep_the_processes_and_programs_that_mattered(self):
         # Hour rows for every process were 87% of Big Mac's hour payload. A bucket keeps what
@@ -278,6 +293,7 @@ class ScaleTests(unittest.TestCase):
         records.sort(key=lambda r:(r.reading.end.wall_ns,r.sequence))
         records=[replace(r,sequence=n+1) for n,r in enumerate(records)]
         for lo in range(0,len(records),40):self.store.append(records[lo:lo+40])
+        self.store.stop_run('run',3600*S)  # closes the hour
         cpu=Query(self.store).who(0,3600*S,signal='process.cpu',component='cpu',limit=2000)
         self.assertEqual(cpu['total_rows'],41)
         self.assertEqual({r['entity']:r['total'] for r in cpu['rows']},{**{f'program:p{p}':360.0*(1+(p<20)) for p in range(40)},'rest:program':10800.0})
@@ -288,10 +304,11 @@ class ScaleTests(unittest.TestCase):
         self.assertEqual({r['entity']:r['total'] for r in disk['rows']},{**{f'program:p{p}':360.0*(p+(p+40 if p<20 else 0)) for p in range(40)},'rest:program':0.0})
 
     def test_who_answers_an_entity_from_the_resolution_where_it_mattered(self):
-        # Program 0 is under 1% of every minute and quarter except where it bursts, in minutes
-        # 32 and 33: only that quarter keeps it. Over an unaligned 30 minutes its end edge has
-        # minute rows for only some minutes, so it answers from that 15-minute row and says
-        # so; before, it is in the rest. Program 26, always kept, has exact minute edges.
+        # Program 0 is under 1% of every minute except where it bursts, in minutes 32 and 33,
+        # so only those minutes and their quarter keep it, and its quarter row holds just
+        # those minutes; its other use is in the rest. Over an unaligned 30 minutes its end
+        # edge lacks a minute row for most minutes, so it answers from that 15-minute row.
+        # Program 26, always kept, has exact minute edges.
         def cpu(pid,t):
             if pid==0:return 9.0 if 1920<t<=2040 else 0.1
             return 2.0
@@ -300,8 +317,8 @@ class ScaleTests(unittest.TestCase):
         self.store.stop_run('run',2400*S)  # saves the quarter it bursts in
         rows={r['entity']:r for r in Query(self.store).who(450*S,2250*S,signal='process.cpu',component='cpu')['rows']}
         light,heavy=rows['program:p0'],rows['program:p26']
-        self.assertEqual((light['summary_resolution'],light['partial_boundary']),('15-minute',True))
-        self.assertAlmostEqual(light['total'],9.0*12+0.1*48)  # its 15-minute row, 1,800-2,400 s
+        self.assertEqual(light['summary_resolution'],'15-minute')
+        self.assertAlmostEqual(light['total'],9.0*12)  # the two minutes it mattered in
         self.assertEqual(heavy['summary_resolution'],'minute')
         self.assertEqual(heavy['total'],2.0*6*31)  # minute buckets 7 to 37 whole
         self.assertIn('rest:program',rows)
@@ -316,8 +333,10 @@ class ScaleTests(unittest.TestCase):
         self.store.stop_run('run',420*S)
         self.store.db.execute("DELETE FROM summaries WHERE resolution='15-minute'")
         new=[replace(r,run_id='run2',sequence=n+1) for n,r in enumerate(records[len(old):])]
-        # The previous release's 15-minute rows, and minutes that kept nothing of it.
-        with saved_as_before(),patch('machine_audit.store.SHARE',2.0):self.store.append(new)
+        # As an earlier release saved it: 15-minute rows, and no minute rows for a process
+        # outside that minute's top.
+        with saved_as_before():self.store.append(new)
+        self.store.db.execute("DELETE FROM summaries WHERE run_id='run2' AND resolution='minute'")
         row=Query(self.store).who(30*S,810*S,signal='process.cpu',component='cpu')['rows'][0]
         self.assertEqual((row['summary_resolution'],row['total']),('15-minute',42.0+41.0))  # 10-420 s, 440-840 s
 
@@ -414,7 +433,8 @@ class ScaleTests(unittest.TestCase):
             fields.extend(Field('process.phys_footprint',100_000_000+i,'bytes',entity=f'process:{i}',label=f'program{i%600}',scope='footprint',component='memory') for i in range(2000))
             records.append(Record(Reading('macos.process','cpu',c,c,tuple(fields)),'boot','run',len(records)+1,c.wall_ns,c))
         # Every entity mattered: 600 programs and 2,000 instances each keep their rows.
-        with patch('machine_audit.store.SHARE',0):self.store.append(records)
+        with patch('machine_audit.store.SHARE',0):
+            self.store.append(records);self.store.stop_run('run',records[-1].reading.end.wall_ns)
         code="import json,sys;sys.path.insert(0,sys.argv[1]);from test_scale import measure_queries;print(json.dumps(measure_queries(sys.argv[2])))"
         result=subprocess.run([sys.executable,'-c',code,str(Path(__file__).parent.resolve()),str(self.store.path.resolve())],capture_output=True,text=True,timeout=60)
         self.assertEqual(result.returncode,0,result.stderr)

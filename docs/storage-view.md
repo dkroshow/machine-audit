@@ -116,7 +116,7 @@ from each other. Lifecycle rules, so growth answers are honest:
 | Question | macOS | Ubuntu |
 | --- | --- | --- |
 | Which folder holds it | The map | The map |
-| Which program is writing | `proc_pid_rusage` bytes written, own processes, 10 s process pass | `/proc/<pid>/io` `write_bytes`, own processes; other users' denied without privilege |
+| Which program is writing | `proc_pid_rusage` bytes written, own processes, 30 s process pass | `/proc/<pid>/io` `write_bytes`, own processes; other users' denied without privilege |
 | Which program has a folder open or as its working folder | Per-process vnode info, own processes, on request | `/proc/<pid>/cwd` and `fd`, own processes, on request |
 
 **What the map cannot see,** recorded per run by name, never by guessed

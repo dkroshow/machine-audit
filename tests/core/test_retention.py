@@ -41,6 +41,7 @@ class RetentionTests(unittest.TestCase):
         sequence=1
         for t in range(0,hours*3600,STEP):
             batch=step(t,first=sequence);sequence+=len(batch);self.store.append(batch)
+        self.store.stop_run('run',(hours*3600-STEP)*S)
         return (hours*3600-STEP)*S  # the newest save
 
     def oldest(self,sql,*args):

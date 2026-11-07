@@ -226,9 +226,10 @@ class BudgetRecoveryTests(unittest.TestCase):
         return {(resolution,entity):[(row['sample_count'],row['total']) for row in unpack_summaries(payload)] for resolution,entity,payload in store.db.execute(
             "SELECT resolution,entity,payload FROM summaries WHERE run_id=? AND resolution IN ('15-minute','hour') AND entity LIKE 'process:%'",(run,))}
 
-    def test_the_held_quarter_and_hour_survive_a_stop_checkpoint(self):
-        # A process row of an open quarter or hour exists only in memory: a stop must carry
-        # it across the restart, or every stop would lose up to an hour of process history.
+    def test_the_unfinished_minutes_process_passes_survive_a_stop_checkpoint(self):
+        # Process passes are summarized once their minute is complete, so a stop's minute
+        # exists only as passes in memory: the checkpoint must carry them, or every stop would
+        # lose its last minute, and the quarter and hour it closes, of process history.
         scratch=Path(__file__).parent/'.tmp';scratch.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=scratch) as root:
             store=Store(Path(root)/'readings.sqlite',Budget(root,free_margin_bytes=0))
@@ -238,38 +239,73 @@ class BudgetRecoveryTests(unittest.TestCase):
                 self.assertTrue(run.close())
                 self.assertEqual(self.coarse_process_rows(store,'run'),{})
                 checkpoint,=Path(root).glob('unsaved-run-*.json')
-                self.assertEqual(set(json.loads(checkpoint.read_bytes())['held']),{'minute','15-minute','hour'})
+                data=json.loads(checkpoint.read_bytes())
+                # 60-69 s, saved but not summarized: the pass at 60 s holds points of minute 1.
+                self.assertEqual((data['format'],len(data['pending'])),('machine-audit-unsaved-v3',10))
                 after=Collector(store,(),run_id='after',boot_id='boot');after.start()
                 self.assertIsNone(after.recovery_error);self.assertTrue(after.close())
                 # 100 readings, 99 s of (1 and 2 CPU s)/s, split by the save at 70.
                 self.assertEqual(self.coarse_process_rows(store,'run'),{(resolution,entity):[(100,total)] for resolution in ('15-minute','hour')
                                                                         for entity,total in (('process:1',99.0),('process:2',198.0))})
+                self.assertEqual({e:[n for n,_ in rows] for e,rows in self.held_minute(store,'run').items()},{'process:1':[39],'process:2':[39]})
             finally:store.close()
 
-    def test_a_checkpoint_from_the_previous_release_recovers_and_extends_its_saved_rows(self):
-        # An upgrade restarts from the previous release's stop. Its file holds a minute only,
-        # and it had saved every process's quarter and hour rows at each save. Recovery must
-        # read that file and add the unsaved tail to those rows, not replace them with it.
+    def test_a_crash_loses_only_its_unfinished_minute_and_the_next_start_closes_its_hour(self):
+        # A run killed without a stop or checkpoint never closes its quarter and hour. Its
+        # minute rows are saved, so the next start ranks them; only the minute whose passes
+        # were waiting in memory is lost, and the run stays marked unstopped.
         scratch=Path(__file__).parent/'.tmp';scratch.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=scratch) as root:
             store=Store(Path(root)/'readings.sqlite',Budget(root,free_margin_bytes=0))
             try:
-                with saved_as_before():
-                    run=Collector(store,(),run_id='run',boot_id='boot');run.start()
-                    self.reads(run,0,70);self.assertTrue(run.flush());self.reads(run,70,100)
-                    self.assertTrue(run.close())
-                checkpoint,=Path(root).glob('unsaved-run-*.json')
-                data=json.loads(checkpoint.read_bytes())
-                data.update(format='machine-audit-unsaved-v1',held=data['held']['minute'])
-                checkpoint.write_text(json.dumps(data))
-                self.assertEqual(self.coarse_process_rows(store,'run')[('hour','process:1')],[(70,69.0)])
-                after=Collector(store,(),run_id='after',boot_id='boot');after.start()
-                self.assertIsNone(after.recovery_error);self.assertTrue(after.close())
-                self.assertEqual(list(Path(root).glob('unsaved-run-*')),[])
-                self.assertEqual(self.coarse_process_rows(store,'run'),{(resolution,entity):[(100,total)] for resolution in ('15-minute','hour')
-                                                                        for entity,total in (('process:1',99.0),('process:2',198.0))})
-                self.assertEqual({e:[n for n,_ in rows] for e,rows in self.held_minute(store,'run').items()},{'process:1':[39],'process:2':[39]})
+                run=Collector(store,(),run_id='crashed',boot_id='boot');run.start()
+                self.reads(run,0,130);self.assertTrue(run.flush())  # minutes 0 and 1 complete
+                store.close()  # killed: no stop, no checkpoint
+                store=Store(Path(root)/'readings.sqlite',Budget(root,free_margin_bytes=0))
+                self.assertEqual(self.coarse_process_rows(store,'crashed'),{})
+                store.start_run('next','boot',BASE+3600*10**9)
+                # 0-119 s, the first pass a baseline: 119 s of 1 and 2 CPU s a second.
+                self.assertEqual(self.coarse_process_rows(store,'crashed'),{(resolution,entity):[(120,total)] for resolution in ('15-minute','hour')
+                                                                            for entity,total in (('process:1',119.0),('process:2',238.0))})
+                self.assertIsNone(store.db.execute("SELECT stopped_ns FROM runs WHERE run_id='crashed'").fetchone()[0])
+                before=self.coarse_process_rows(store,'crashed');store.start_run('again','boot',BASE+7200*10**9)
+                self.assertEqual(self.coarse_process_rows(store,'crashed'),before)  # closed once
             finally:store.close()
+
+    def test_checkpoints_from_earlier_releases_recover_without_losing_or_doubling(self):
+        # The upgrade restarts from the installed release's stop. Format 1 held a minute's rows
+        # and had saved every process's quarter and hour rows; format 2 held the minute,
+        # quarter and hour rows of every process. Recovery ranks what each held and adds the
+        # unsaved tail to it once: nothing lost, nothing counted twice.
+        scratch=Path(__file__).parent/'.tmp';scratch.mkdir(exist_ok=True)
+        for version,held in ((1,('minute',)),(2,('minute','15-minute','hour'))):
+            with self.subTest(version=version),tempfile.TemporaryDirectory(dir=scratch) as root:
+                store=Store(Path(root)/'readings.sqlite',Budget(root,free_margin_bytes=0))
+                try:
+                    with saved_as_before():
+                        run=Collector(store,(),run_id='run',boot_id='boot');run.start()
+                        self.reads(run,0,70);self.assertTrue(run.flush());self.reads(run,70,100)
+                        self.assertTrue(run.close())
+                    checkpoint,=Path(root).glob('unsaved-run-*.json')
+                    data=json.loads(checkpoint.read_bytes())
+                    # What that release held rather than saved: these buckets' rows.
+                    buckets={'minute':BASE+60*10**9,'15-minute':BASE,'hour':BASE}
+                    rows={resolution:[[source,component,entity,base64.b64encode(payload).decode()] for source,component,entity,payload in store.db.execute(
+                        "SELECT source,component,entity,payload FROM summaries WHERE run_id='run' AND resolution=? AND bucket_ns=? AND entity LIKE 'process:%'",(resolution,buckets[resolution]))]
+                        for resolution in held}
+                    for resolution in held:
+                        store.db.execute("DELETE FROM summaries WHERE run_id='run' AND resolution=? AND bucket_ns=? AND entity LIKE 'process:%'",(resolution,buckets[resolution]))
+                    blocks={r:dict(bucket=buckets[r],lower=1,upper=70,own=[],rows=rows[r]) for r in held}
+                    data.update(format=f'machine-audit-unsaved-v{version}',held=blocks['minute'] if version==1 else blocks)
+                    data.pop('pending')
+                    checkpoint.write_text(json.dumps(data))
+                    after=Collector(store,(),run_id='after',boot_id='boot');after.start()
+                    self.assertIsNone(after.recovery_error);self.assertTrue(after.close())
+                    self.assertEqual(list(Path(root).glob('unsaved-run-*')),[])
+                    self.assertEqual(self.coarse_process_rows(store,'run'),{(resolution,entity):[(100,total)] for resolution in ('15-minute','hour')
+                                                                            for entity,total in (('process:1',99.0),('process:2',198.0))})
+                    self.assertEqual({e:[n for n,_ in rows] for e,rows in self.held_minute(store,'run').items()},{'process:1':[39],'process:2':[39]})
+                finally:store.close()
 
     def test_a_checkpoint_is_saved_once_with_its_stop_whatever_point_recovery_reaches(self):
         # Recovery saves a checkpoint's readings, held minute and stop marker in one

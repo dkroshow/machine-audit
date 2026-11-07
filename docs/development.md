@@ -87,8 +87,8 @@ queries or the writer.
 Shutdown sets one cutoff under the collector lock. Every reading admitted before
 it is kept; a read still running is recorded as a fieldless `unobserved` reading
 with reason `stop_read_in_flight`, from its own start to the cutoff, and its result
-is not admitted when it returns. The stop then writes the unsaved readings, the held
-minute and the saved sequence to a checkpoint and merges nothing. `close()` waits
+is not admitted when it returns. The stop then writes the unsaved readings, the process
+passes of the unfinished minute and the saved sequence to a checkpoint and merges nothing. `close()` waits
 up to its deadline (10 s) for that checkpoint and returns whether it is durable.
 The daemon finalizer keeps the instance lock until every read returns, preventing
 an overlapping collector while that process remains alive; process exit abandons
@@ -106,13 +106,14 @@ running, and admission behind another writer's reservation. Either can still los
 the unsaved readings, explicitly.
 
 The next start saves each checkpoint under its original run in one transaction:
-its readings, the held buckets and the run's stop marker, set to the cutoff. A run
-already carrying that stop marker has saved it, so the file is only removed;
+its readings, the unfinished minute's summary, the open quarter and hour and the run's
+stop marker, set to the cutoff. A run already carrying that stop marker has saved it, so the file is only removed;
 readings are never saved twice and the marker never moves. A checkpoint that does
 not match its run (for example one an older release half-recovered: readings saved,
-stop not) is kept, not saved with stale held buckets. A checkpoint from the release
-before held quarter hours and hours holds a minute only; recovery adds its unsaved
-tail to the rows that release saved. Such a file, or one that fails
+stop not) is kept, not saved stale. Checkpoints from earlier releases (formats 1 and
+2) held summary rows instead: recovery ranks each bucket they held as it stood and adds
+the unsaved tail to it. A run with no stop and no checkpoint (a crash) has its open
+quarter and hour ranked by the next start from its saved minute rows. Such a file, or one that fails
 to save, stays for a later start, collection still begins, and status reports
 `recovery_error` until a start saves it. Recovery decodes and merges a checkpoint's
 whole tail at once, so its memory and reservation grow with that tail; this has not
@@ -129,8 +130,8 @@ the stop's last minutes as `after_last_save` gaps.
 | save fails before commit | Keep the pending batch and watermark; retry at the next flush |
 | buffer high-water reached | Suspend new reads, preserve completed ones, expose skipped coverage and the suspension span |
 | stop requested with a read in flight | At the cutoff, record that read as `unobserved`; never admit its result; keep the instance lock until it returns |
-| stop | Checkpoint admitted readings and the held buckets (`stop_checkpointed`); release the instance lock once reads return |
-| next start finds a checkpoint | Save readings, held buckets and stop marker in one transaction, then remove the file; keep a mismatched one and report `recovery_error` |
+| stop | Checkpoint admitted readings and the unfinished minute's passes (`stop_checkpointed`); release the instance lock once reads return |
+| next start finds a checkpoint | Save readings, the summaries they complete and the stop marker in one transaction, then remove the file; keep a mismatched one and report `recovery_error` |
 | checkpoint not durable by the deadline | `close()` fails (`shutdown_incomplete` or `stop_unsaved_lost`); the run stays unstopped and queries show the gap |
 
 A query opens its SQLite read transaction under the same short lock that

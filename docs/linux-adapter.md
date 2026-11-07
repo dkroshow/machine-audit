@@ -37,7 +37,7 @@ prove parsing only.
 
 ## Workloads
 
-One 10 s pass, `linux.workloads`, reads units and their processes together.
+One 30 s pass, `linux.workloads`, reads units and their processes together.
 
 - A unit is the first non-slice cgroup below the slices: one non-overlapping
   level. Host minus units is the remainder (root cgroup, kernel work).
@@ -120,7 +120,7 @@ first user's 24 h growth figure, with the operator if the contract moves.
   Core format work; its gain needs real data.
 
 The Mac's bundled `macos.process` record carries every own-user process, about
-20 fields each, every 10 s, with no split. Linux per-process fields match it.
+22 fields each, every 30 s, with no split. Linux per-process fields match it.
 
 ## Devices and network
 
