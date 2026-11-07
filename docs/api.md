@@ -67,6 +67,10 @@ The server runs at most 4 API queries at once. When no slot is free, a request
 waits up to 2 seconds. At most 4 requests may wait; further requests receive
 HTTP 503 immediately. A wait that expires also returns HTTP 503. The body is
 `{"error":"query_capacity"}`. Clients should retry this error with backoff.
+A `component` or signal the store has not recorded returns HTTP 400 with
+`{"error":"unknown_component"}` or `{"error":"unknown_signal"}` and `valid`, the
+components or that component's signals it has recorded; the command line prints
+the code and the names. Other invalid parameters return `{"error":"invalid_query"}`.
 The dashboard waits 0.5, 1, then 2 seconds, making at most 4 attempts in total;
 it does not retry other HTTP errors.
 

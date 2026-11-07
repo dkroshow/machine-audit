@@ -1,8 +1,7 @@
 # Storage approach
 
 The MVP preserves useful observations so humans and agents can investigate
-incidents and improve the analysis later. SQLite is the proposed local store;
-implementation has not started.
+incidents and improve the analysis later, in one local SQLite store.
 
 ## Requirements
 

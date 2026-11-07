@@ -1,6 +1,7 @@
 """Authenticated local client shared by CLI and onboarding diagnostics."""
 from __future__ import annotations
 import json
+import re
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, build_opener, ProxyHandler, HTTPRedirectHandler
@@ -10,9 +11,21 @@ SHAPES=frozenset({"now","catalog","status","series","who","coverage","around","s
 
 
 class ClientError(RuntimeError):
-    def __init__(self,code: str):
-        self.code=code
+    def __init__(self,code: str,valid=()):
+        self.code,self.valid=code,valid
         super().__init__(code)
+
+
+def _refused(response):
+    """A refused name's code and the names the store has; any other body is not trusted."""
+    try:
+        body=json.loads(response.read(MAX_RESPONSE_BYTES))
+        code,valid=body["error"],body["valid"]
+        if code in {"unknown_component","unknown_signal"} and isinstance(valid,list) and all(re.fullmatch(r"[\w.:-]{1,160}",v) for v in valid):
+            return code,tuple(valid)
+    except (ValueError,TypeError,KeyError,OSError):
+        pass
+    return None
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -45,6 +58,8 @@ def request(config,shape: str,params=None) -> dict:
             if len(body)>MAX_RESPONSE_BYTES:
                 raise ClientError("response_too_large")
     except HTTPError as exc:
+        refused=_refused(exc) if exc.code==400 else None
+        if refused:raise ClientError(*refused) from None
         raise ClientError({401:"authentication_failed",403:"access_denied",400:"invalid_query",503:"query_capacity"}.get(exc.code,"server_error")) from None
     except (URLError,TimeoutError,OSError):
         raise ClientError("not_running") from None

@@ -8,6 +8,7 @@ import secrets
 import threading
 import time
 from urllib.parse import parse_qs, unquote, urlsplit
+from .query import QueryRefused
 
 
 def make_server(query, token: str, port=8765, dashboard=None, allowed_hosts=()):
@@ -96,6 +97,8 @@ def make_server(query, token: str, port=8765, dashboard=None, allowed_hosts=()):
                     # The answer's own elapsed and CPU milliseconds; nothing else.
                     timing=f"query;dur={(time.monotonic()-began)*1000:.1f}, cpu;dur={(time.thread_time()-cpu)*1000:.1f}"
                     return self._send(200,result,timing=timing)
+                except QueryRefused as exc:
+                    return self._send(400,{"error":exc.code,"valid":exc.valid})
                 except (ValueError,KeyError,TypeError,OverflowError):
                     return self._send(400,{"error":"invalid_query"})
                 except Exception:

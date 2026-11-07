@@ -553,6 +553,36 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(raised.exception.code,"redirect_refused")
         finally:server.shutdown();server.server_close();thread.join()
 
+    def test_an_unknown_component_or_signal_is_refused_with_the_names_the_store_has(self):
+        # The installed command line answered `series --component host` (host is an entity)
+        # as unobserved with no rows, which reads as missing data, not as a wrong name.
+        from machine_audit.client import request,ClientError
+        from machine_audit.config import Config
+        self.store.append([record(0,0,1),record(10,10,2)])
+        server=make_server(Query(self.store),"a"*32,port=0)
+        thread=threading.Thread(target=server.serve_forever);thread.start()
+        config=Config(data_dir=self.tmp.name,port=server.server_port)
+        config.token_path.write_text("a"*32);config.token_path.chmod(0o600)
+        try:
+            for params,refused in (({"component":"host"},("unknown_component",("cpu",))),
+                                   ({"component":"cpu","signals":"cpu.missing"},("unknown_signal",("cpu.counter",)))):
+                with self.assertRaises(ClientError) as raised:request(config,"series",dict(params,start=0,end=10))
+                self.assertEqual((raised.exception.code,raised.exception.valid),refused)
+            self.assertEqual(request(config,"series",{"component":"cpu","start":0,"end":10})["shape"],"series")
+        finally:server.shutdown();server.server_close();thread.join()
+
+    def test_a_run_stopped_before_the_window_leaves_no_gap_in_it(self):
+        # The same answer listed an after_last_save gap per earlier run, each ending at that
+        # run's stop, before the window it was reported in.
+        self.store.start_run("old","boot",0)
+        old=reading(10,10)
+        self.store.append([Record(old,"boot","old",1,old.end.wall_ns,old.end)])
+        self.store.stop_run("old",20*S)
+        self.store.start_run("run","boot",100*S)
+        self.store.append([record(t,t,i) for i,t in enumerate(range(100,131,10),1)])
+        gaps=Query(self.store).coverage(110*S,130*S)["gaps"]
+        self.assertEqual([g for g in gaps if g["end_ns"]<=g["start_ns"]],[])
+
     def test_cumulative_hour_summary_stays_one_row_and_keeps_total(self):
         self.store.append([record(0,0,1),record(10,10,2)])
         self.store.append([record(20,30,3)])
@@ -667,6 +697,8 @@ class CoreTests(unittest.TestCase):
             seq+=1
             fields=tuple(Field("process.cpu",t,"seconds","counter",entity=f"process:{pid}",label="Editor",additive=True) for pid in (1,2))
             records.append(Record(Reading("pass","cpu",c,c,fields),"boot","run",seq,c.wall_ns,c))
+        # A query names only a component the store has recorded.
+        records.append(Record(Reading("host","memory",c,c,(Field("memory.used",1,"bytes"),)),"boot","run",seq+1,c.wall_ns,c))
         self.store.append(records)
         result=Query(self.store).who(0,10*S,signal="process.cpu")
         self.assertEqual(result["accounting"]["attributed"],20)

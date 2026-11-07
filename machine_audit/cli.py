@@ -158,12 +158,15 @@ def main(argv=None):
     if args.command=="around":params.update(at=timestamp(args.at),span=args.span)
     if args.command=="storage":params.update(action=args.action,volume_id=args.volume_id,parent_id=args.parent_id,cursor=args.cursor)
     params={k:v for k,v in params.items() if v is not None}
+    def failed(code,valid=()):
+        print(f"Query failed: {code}"+(f"; valid: {', '.join(valid)}" if valid else ""),file=sys.stderr)
+        return 1
     try:
         result=request(config,args.command,params)
     except ClientError as exc:
-        if exc.code!="not_running":
-            print(f"Query failed: {exc.code}",file=sys.stderr);return 1
+        if exc.code!="not_running":return failed(exc.code,exc.valid)
         from .store import Store
+        from .query import QueryRefused
         try:store=Store(config.store_path,read_only=True)
         except (FileNotFoundError,PermissionError):
             print("No readable saved history; run setup and start collection.",file=sys.stderr);return 2
@@ -175,6 +178,7 @@ def main(argv=None):
             elif args.command=="coverage":result=query.coverage(int(params["start"]*1e9),int(params["end"]*1e9),args.component,args.limit)
             elif args.command=="around":result=query.around(int(timestamp(args.at)*1e9),int(float(args.span)*1e9),args.component,limit=args.limit)
             else:result=query.storage_query(**params)
+        except QueryRefused as exc:return failed(exc.code,exc.valid)
         finally:store.close()
     print(json.dumps(result,indent=2,allow_nan=False))
     return 0

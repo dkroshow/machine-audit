@@ -111,10 +111,18 @@ class QueryTailTests(unittest.TestCase):
                 (Field('cpu.busy', t, 'seconds', 'counter'),
                  Field('process.phys_footprint', None, 'bytes', status='denied',
                        entity='process:1', label='Editor', scope='process'))))
+        # The memory series the query names, recorded after its window.
+        far = Clock(1000*S, 1000*S, 1000*S)
+        self.collector.ingest(Reading('synthetic.memory', 'memory', far, far, (Field('memory.available', 1, 'bytes'),)))
+        unpack = Record.unpack
+        def unselected(payload, names=None):
+            record = unpack(payload, names)
+            self.assertNotEqual(record.reading.source, 'mixed', 'unselected mixed reading')
+            return record
         for saved in (False, True):
             if saved:
                 self.assertTrue(self.collector.flush())
-            with patch.object(Record, 'unpack', side_effect=AssertionError('unselected mixed reading')):
+            with patch.object(Record, 'unpack', side_effect=unselected):
                 answer = self.query.series(0, 20*S, ['memory.available'], 'memory', limit=75)
             self.assertFalse(answer['truncated'])
             self.assertFalse(any(g.get('signal')=='process.phys_footprint' for g in answer['gaps']))
@@ -228,6 +236,7 @@ class QueryTailTests(unittest.TestCase):
         reading = process_pass(10)
         self.collector.ingest(Reading(reading.source, reading.component, reading.start, reading.end,
             reading.fields+(Field('memory.event', 'changed', 'state', 'event', component='memory'),)))
+        self.collector.ingest(host(1000))  # the signal the query names, after its window
         with patch('machine_audit.query.MAX_QUERY_BYTES', 10_000), \
              patch.object(Record, 'unpack', side_effect=AssertionError('oversized event decoded')):
             answer = self.query.around(10*S, 10*S, component='cpu', signals=['cpu.busy'], limit=75)

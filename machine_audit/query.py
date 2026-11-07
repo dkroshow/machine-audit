@@ -11,7 +11,7 @@ import heapq
 from operator import itemgetter
 from dataclasses import replace
 from itertools import chain, groupby, takewhile
-from .derive import points, rollups, summarize, merge_summaries, GOOD, BUSY
+from .derive import points, rollups, summarize, merge_summaries, source_fields, GOOD, BUSY
 from .store import CONVERTED, MINUTE, QUARTER, HOUR, WIDTHS, unpack_summaries
 from .model import (PROCESS_ENTITIES, WHO_TOTALS, Record, field_component, is_process_evidence, is_series,
                     who_ranks, who_row, who_value)
@@ -49,6 +49,15 @@ def bounded_payloads(cursor):
     return result,False
 
 
+class QueryRefused(ValueError):
+    """A query naming a component or signal this store has not recorded: a stable code and
+    the names it has, since an unknown name would otherwise answer an empty interval that
+    reads as missing data."""
+    def __init__(self, code, valid):
+        super().__init__(code)
+        self.code, self.valid = code, valid
+
+
 def measured(function):
     def call(self,*args,**kwargs):
         depth=getattr(self._local,"measure_depth",0)
@@ -82,6 +91,27 @@ class Query:
     @staticmethod
     def _base(shape, status="observed"):
         return {"schema_version":1,"shape":shape,"status":status,"coverage":{}}
+
+    def _known(self, db, component=None, signals=()):
+        """Refuse a component or signal the store has not recorded, naming those it has. The
+        saved catalog answers a usual query; a component whose readings carry no fields (a
+        machine without graphics) is known by its saved readings, and only a miss reads what
+        the collector holds and has not saved yet."""
+        if component is None and not signals:return
+        known=defaultdict(set)
+        for c,s in db.execute("SELECT component,signal FROM signal_catalog"):known[c].add(s)
+        recorded=component is None or component in known or db.execute(
+            "SELECT 1 FROM reading_components WHERE component=? LIMIT 1",(component,)).fetchone() is not None
+        names=lambda:known[component] if component is not None else set().union(*known.values())
+        if recorded and all(s in names() for s in signals):return
+        if self.collector:
+            for _,_,records in self.collector.recent_records():
+                latest=records[-1].reading
+                for f in source_fields(latest):known[field_component(f,latest.component)].add(f.name)
+        if not recorded and component not in known:
+            raise QueryRefused("unknown_component",sorted(known))
+        if any(s not in names() for s in signals):
+            raise QueryRefused("unknown_signal",sorted(names()))
 
     @staticmethod
     def _bounds(start_ns,end_ns,limit):
@@ -372,6 +402,8 @@ class Query:
     @measured
     def now(self,component=None,limit=600,brief=False):
         if not 1<=limit<=MAX_ROWS:raise ValueError("limit must be 1..2000")
+        if component:
+            with self.store.read() as db:self._known(db,component)
         groups=self.collector.recent_records(component) if self.collector else []
         latest=[];trail=[];sources=[];raw_remaining=limit;truncated=False;stale_sources=set()
         statuses=defaultdict(lambda:defaultdict(int))
@@ -529,7 +561,8 @@ class Query:
             next_start=runs[index+1]["started_ns"] if index+1<len(runs) else end_ns
             active=captured and captured["run_id"]==run["run_id"]
             effective_stop=min(end_ns,stopped or next_start)
-            if not active and effective_stop>last:
+            # A run that stopped before the window leaves no gap in it.
+            if not active and effective_stop>max(start_ns,last):
                 gaps.append(dict(status="unobserved",reason="after_last_save",start_ns=max(start_ns,last),end_ns=effective_stop,run_id=run["run_id"]))
             cursor=max(cursor,effective_stop if not stopped else min(stopped,end_ns))
         if cursor<end_ns:gaps.append(dict(status="unobserved",reason="no_collector",start_ns=cursor,end_ns=end_ns))
@@ -596,6 +629,7 @@ class Query:
             raise ValueError("at most 32 signals")
         resolution="raw" if end_ns-start_ns<=10*MINUTE else self._resolution(start_ns,end_ns,limit)
         with self._snapshot(start_ns,end_ns) as (db,captured):
+            self._known(db,component,signals)
             records=[];rows=[]
             # Without a component or signals, choose a bounded set before reading any row.
             chosen=None if component or signals else self._host_signals(db)
@@ -665,6 +699,7 @@ class Query:
         if brief:limit=BRIEF_TOP
         if end_ns-start_ns>31*24*HOUR:raise ValueError("who interval must not exceed 31 days")
         with self._snapshot(start_ns,end_ns) as (db,captured):
+            self._known(db,component,[signal] if signal else [])
             records,overflow=self._raw(db,captured,start_ns,end_ns,component,names=self._who_names(signal)) if end_ns-start_ns<=10*MINUTE else ([],False)
             records=self._who_records(records,signal)
             all_points=points(records)
@@ -808,6 +843,7 @@ class Query:
     def coverage(self,start_ns,end_ns,component=None,limit=600):
         self._bounds(start_ns,end_ns,limit)
         with self._snapshot(start_ns,end_ns) as (db,captured):
+            self._known(db,component)
             if end_ns-start_ns>10*MINUTE and self._saved(db,start_ns,end_ns):
                 # Longer windows take gap rows from host-series summaries and decode no
                 # pass; the unsaved tail still adds its status counts.
