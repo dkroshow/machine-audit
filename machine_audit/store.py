@@ -104,6 +104,17 @@ def signal_key(row):
     return tuple(row[k] for k in ("signal", "unit", "kind", "scope", "scale"))
 
 
+def record_components(record):
+    """Each component a reading's fields go to, and whether any of its fields there is a
+    host series: worked out once per reading, not once per field per use."""
+    default = record.reading.component
+    series = {default: not record.reading.fields}
+    for f in record.reading.fields:
+        component = field_component(f, default)
+        series[component] = series.get(component, False) or is_series(component, f.entity, f.scope)
+    return series
+
+
 def ranked(component, entity):
     """Whether this row is a process or program that a bucket keeps only when it mattered."""
     return component != "self" and entity.startswith(PROCESS_ENTITIES)
@@ -422,7 +433,7 @@ class Store:
                 raise ValueError("records belong to another run")
             run_id=records[0].run_id if records else run_id
             if run_id is None:raise ValueError("a stop requires its run")
-            raw = [(r, r.packed) for r in records]
+            raw = [(r, r.packed, record_components(r)) for r in records]
             summaries = defaultdict(list)
             held={resolution:h for resolution,h in self._held.items() if h["run_id"]==run_id}
             lowers={};catalog=set()
@@ -492,9 +503,9 @@ class Store:
     @staticmethod
     def _bound(records,raw,summaries,catalog):
         """The write's counted rows and the payload known before merging."""
-        components=sum(len({r.reading.component,*(field_component(f,r.reading.component) for f in r.reading.fields)}) for r in records)
+        components=sum(len(parts) for _,_,parts in raw)
         count=2+len(records)+3*components+len(summaries)+len(catalog)+len({r.reading.source for r in records})+sum(any(f.kind=='event' for f in r.reading.fields) for r in records)
-        return count,3*sum(len(p) for _,p in raw)
+        return count,3*sum(len(p) for _,p,_ in raw)
 
     def _merged(self,run_id,key,rows,lower,upper):
         """One summary row merged with its saved row, and that row's payload size."""
@@ -541,16 +552,16 @@ class Store:
         if boot!=first.boot_id:raise ValueError("run boot identity changed")
         if first.sequence <= saved:
             raise ValueError("sequence already committed")
-        self.db.executemany("INSERT INTO readings VALUES(?,?,?,?,?,?)",[(r.run_id,r.sequence,r.reading.end.wall_ns,r.reading.source,r.reading.component,p) for r,p in raw])
-        self.db.executemany("INSERT INTO reading_components VALUES(?,?,?,?)",[(r.run_id,r.sequence,c,int(not r.reading.fields or any(field_component(f,r.reading.component)==c and is_series(c,f.entity,f.scope) for f in r.reading.fields))) for r,_ in raw for c in {r.reading.component,*(field_component(f,r.reading.component) for f in r.reading.fields)}])
+        self.db.executemany("INSERT INTO readings VALUES(?,?,?,?,?,?)",[(r.run_id,r.sequence,r.reading.end.wall_ns,r.reading.source,r.reading.component,p) for r,p,_ in raw])
+        self.db.executemany("INSERT INTO reading_components VALUES(?,?,?,?)",[(r.run_id,r.sequence,c,int(series)) for r,_,parts in raw for c,series in parts.items()])
         self.db.executemany(UPSERT_SUMMARY,prepared)
         self.db.executemany("INSERT OR REPLACE INTO signal_catalog VALUES(?,?,?,?,?,?,?)",sorted(catalog))
         latest = {}
         coverage = defaultdict(list)
-        for r,p in raw:
+        for r,p,parts in raw:
             latest[r.reading.source]=(r,p)
             for resolution,width in (("minute",MINUTE),("hour",HOUR)):
-                for component in {r.reading.component,*(field_component(f,r.reading.component) for f in r.reading.fields)}:
+                for component in parts:
                     coverage[(resolution,r.reading.source,component,r.reading.end.wall_ns//width)].append(r)
             if any(f.kind=="event" for f in r.reading.fields):
                 self.db.execute("INSERT INTO incidents VALUES(?,?,?,?)",(r.run_id,r.sequence,r.reading.end.wall_ns,p))
