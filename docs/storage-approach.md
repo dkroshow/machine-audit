@@ -469,11 +469,12 @@ process to 8:
 | Peak memory a save adds | 243 MiB | 64 MiB |
 | Store after 28 saves | 38 MB | 27 MB |
 
-The replay keeps, in each recorded pass, only the fields this release reads. For Big Mac's
-measured hours that estimates the collector's saves at about 95 s an hour, the process
-pass about 55 s, other sources 37 s: about 195 s. With the scanner's 28–182 s,
-Machine-audit would be about 225–380 s, under the bar in each of those hours, and about
-three to five times the margin. What
+The replay keeps, in each recorded pass, only the fields this release reads. Building each
+point from its field's template, with the same points, then took such a save from 1.32 s
+to 1.20 s. For Big Mac's measured hours that estimates the collector's saves at about 85
+s an hour, the process pass about 55 s, other sources 37 s: about 185 s. With the
+scanner's 28–182 s, Machine-audit would be about 215–370 s, under the bar in each of those
+hours, and three to five times the margin. What
 remains is mostly building a full point for every field of every pass, and the per-read
 cost of the 1-second sources.
 
