@@ -1,7 +1,7 @@
 """One derivation path for retained readings, rollups, and interval queries."""
 from __future__ import annotations
 from collections import defaultdict
-from .model import Record, Field, field_component
+from .model import PROCESS_AGE, Record, Field, field_component
 
 METHOD = "observed-windows-v1"
 LEVELS = (0.5, 1.0, 2.0, 4.0, 8.0)
@@ -71,6 +71,10 @@ def points(records: list[Record], previous: dict[str, Record] | None = None) -> 
         prior_inputs = {(f.name, f.entity): f for f in prior.reading.fields} if compatible else {}
         inputs_by_entity = defaultdict(list)
         busy_inputs = []
+        # A process missing from the prior pass and younger than the time since it started
+        # there: its counters began at zero inside this interval.
+        prior_entities = {f.entity for f in prior.reading.fields} if compatible and prior.reading.status in GOOD else None
+        ages = {f.entity: f.value for f in reading.fields if f.name == PROCESS_AGE and f.status in GOOD}
         for f in reading.fields:
             if f.name in {"process.user_time", "process.system_time", "self.user_time", "self.system_time"}:
                 inputs_by_entity[(f.name.split(".")[0], f.entity)].append(f)
@@ -78,6 +82,7 @@ def points(records: list[Record], previous: dict[str, Record] | None = None) -> 
                 busy_inputs.append(f)
         pass_points = []
         for field in source_fields(reading):
+            if field.name == PROCESS_AGE:continue
             end_clock = field.end or reading.end
             start_clock = field.start or reading.start
             p = dict(source=reading.source, component=field_component(field,reading.component), signal=field.name,
@@ -90,7 +95,12 @@ def points(records: list[Record], previous: dict[str, Record] | None = None) -> 
                      run_id=record.run_id, sequence=record.sequence, method=METHOD,
                      awake_start_ns=end_clock.awake_ns, awake_end_ns=end_clock.awake_ns)
             old = prior_fields.get((field.name, field.entity))
-            if field.kind == "counter" and p["status"] in GOOD:
+            age = ages.get(field.entity) if not old and prior_entities is not None and field.entity not in prior_entities else None
+            if field.kind == "counter" and p["status"] in GOOD and age and 0 < age <= (end_clock.awake_ns-prior.reading.end.awake_ns)/1e9:
+                span = int(age*1e9)
+                p.update(total=field.value, covered_s=age, value=field.value*field.scale/age, start_ns=end_clock.wall_ns-span,
+                         awake_start_ns=end_clock.awake_ns-span, status="measured_zero" if field.value == 0 else "observed")
+            elif field.kind == "counter" and p["status"] in GOOD:
                 if not old or old.status not in GOOD or prior.reading.status not in GOOD:
                     p.update(status="unobserved", reason="baseline")
                 elif (old.unit, old.kind, old.scale) != (field.unit, field.kind, field.scale):
@@ -238,10 +248,14 @@ def merge_summaries(rows: list[dict]) -> dict:
     return result
 
 
+def bucket_of(p: dict, width_ns: int) -> int:
+    """The bucket a point belongs to: the one holding its last instant."""
+    return max(p["end_ns"]-1, p["start_ns"]) // width_ns * width_ns
+
+
 def rollups(points_: list[dict], width_ns: int) -> list[tuple[int, dict]]:
     groups = defaultdict(list)
     for p in points_:
-        bucket = max(p["end_ns"]-1, p["start_ns"]) // width_ns * width_ns
-        key = (bucket, p["source"], p["signal"], p["entity"], p["scope"], p["unit"], p["kind"],p["scale"])
+        key = (bucket_of(p, width_ns), p["source"], p["signal"], p["entity"], p["scope"], p["unit"], p["kind"],p["scale"])
         groups[key].append(p)
     return [(key[0], summarize(items)) for key, items in groups.items()]

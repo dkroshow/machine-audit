@@ -382,6 +382,28 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(query.catalog()["signals"][0]["component"],"memory")
         self.assertIn("process",query.coverage(0,20*S,component="memory")["coverage"]["sources"])
 
+    def test_a_process_born_since_the_prior_pass_is_counted_from_its_start(self):
+        # On Big Mac 782 processes in 31 minutes lived a single pass and none of their CPU was
+        # counted: a first sighting was only a baseline. One that started after the prior pass
+        # began at zero, so all of it belongs to this interval. One that is older but was
+        # missed, and every process in a run's first pass, stay baselines.
+        def passed(t,seq,processes):
+            c=Clock(t*S,t*S,t*S)
+            fields=[f for pid,cpu,age in processes for f in (
+                Field("process.cpu",cpu,"seconds","counter",entity=f"process:{pid}",label="p",scope="process",additive=True),
+                Field("process.age",age,"seconds",entity=f"process:{pid}",label="p",scope="process"))]
+            return Record(Reading("pass","cpu",c,c,tuple(fields)),"boot","run",seq,c.wall_ns,c)
+        first=passed(0,1,[(1,10.0,100.0)])
+        second=passed(30,2,[(1,40.0,130.0),(2,6.0,12.0),(3,50.0,1000.0)])
+        cpu={(p["sequence"],p["entity"]):p for p in points([first,second]) if p["signal"]=="process.cpu"}
+        self.assertEqual(cpu[(1,"process:1")]["reason"],"baseline")
+        self.assertEqual((cpu[(2,"process:1")]["total"],cpu[(2,"process:1")]["covered_s"]),(30.0,30.0))
+        born=cpu[(2,"process:2")]
+        self.assertEqual((born["status"],born["total"],born["covered_s"],born["start_ns"]),("observed",6.0,12.0,18*S))
+        self.assertEqual(cpu[(2,"process:3")]["reason"],"baseline")
+        self.assertEqual(cpu[(2,"program:p")]["total"],36.0)
+        self.assertFalse(any(p["signal"]=="process.age" for p in points([first,second])))
+
     def test_program_peaks_are_four_when_member_peaks_do_not_overlap(self):
         records=[]
         for seq,(t,a,b) in enumerate(((0,0,0),(10,40,0),(20,40,40)),1):

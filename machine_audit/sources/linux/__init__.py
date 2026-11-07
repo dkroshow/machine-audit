@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from machine_audit.model import Clock
 from .. import GapSource, capacity_test, config_identity
-from ..macos import ReadSource
+from ..macos import PROCESS_CADENCE_S, ReadSource
 from ..self_cost import ManagedProcesses, SelfCost
 from .devices import Devices
 from .host import LinuxHost, read_boot_id
@@ -32,8 +32,8 @@ def sources(config, budget, operations=None, scanner=None, root='/'):
         ReadSource('linux.cpu', 'cpu', 1, host.cpu),
         ReadSource('linux.per_cpu', 'cpu', 10, host.per_cpu),
         ReadSource('linux.memory', 'memory', 1, host.memory),
-        ReadSource('linux.workloads', 'cpu', 10, host.workloads) if cgroup_v2 else
-        GapSource('linux.workloads', 'cpu', 10, 'cgroup_v2_required', 'unavailable'),
+        ReadSource('linux.workloads', 'cpu', PROCESS_CADENCE_S, host.workloads) if cgroup_v2 else
+        GapSource('linux.workloads', 'cpu', PROCESS_CADENCE_S, 'cgroup_v2_required', 'unavailable'),
         ReadSource('linux.unit_limits', 'memory', 60, host.unit_limits) if cgroup_v2 else
         GapSource('linux.unit_limits', 'memory', 60, 'cgroup_v2_required', 'unavailable'),
         ReadSource('linux.disk', 'storage', 5, devices.disks),
@@ -55,7 +55,7 @@ def sources(config, budget, operations=None, scanner=None, root='/'):
         GapSource('linux.package_power', 'power', 30, 'no_devices', 'unavailable'),
         ReadSource('linux.gpu', 'gpu', 5, devices.gpu),
         GapSource('linux.gpu_clients', 'gpu', 10, 'drm_fdinfo_not_implemented'),
-        ReadSource('self.process', 'self', 10, own.processes),
+        ReadSource('self.process', 'self', PROCESS_CADENCE_S, own.processes),
         ReadSource('self.storage', 'self', 60, own.storage),
         ReadSource('self.scanner', 'self', 60, own.scanner_runs),
         ReadSource('linux.watcher', 'self', 10, Watcher(host.root, config.root, budget).read),

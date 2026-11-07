@@ -4,7 +4,7 @@ import hashlib
 import json
 import sys
 from machine_audit.model import Clock, Reading
-from .macos import MacOS, ReadSource, field
+from .macos import PROCESS_CADENCE_S, MacOS, ReadSource, field
 
 
 class GapSource:
@@ -92,7 +92,7 @@ def _macos(config,budget,operations,scanner):
         ReadSource('macos.dns_connect','network',60,network.dns_connect,mac.clock),
         ReadSource('macos.wifi','network',10,network.wifi,mac.clock),
         ReadSource('macos.portal','network',5,network.portal,mac.clock),
-        ReadSource('self.process','self',10,own.processes,mac.clock),
+        ReadSource('self.process','self',PROCESS_CADENCE_S,own.processes,mac.clock),
         ReadSource('self.storage','self',60,own.storage,mac.clock),
         ReadSource('self.scanner','self',60,own.scanner_runs,mac.clock),
         GapSource('macos.system_process','cpu',60,'shipped_helper_required'),

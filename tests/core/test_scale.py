@@ -86,7 +86,7 @@ class ScaleTests(unittest.TestCase):
         with self.store.read() as db:
             saved=[Record.unpack(row[0]) for row in db.execute('SELECT payload FROM readings ORDER BY sequence')]
         self.assertEqual([r.to_dict() for r in saved],[r.to_dict() for r in records])
-        self.assertEqual(len(saved[-1].reading.fields),10500)
+        self.assertEqual(len(saved[-1].reading.fields),11000)  # 22 a process, its age among them
         self.assertLess(self.store.budget.usage()['bytes'],30_000_000)
         self.store.stop_run('run',records[-1].reading.end.wall_ns)  # saves the held process rows
         self.assertTrue(self.store.prune_oldest())
@@ -391,7 +391,7 @@ class ScaleTests(unittest.TestCase):
 
     def test_large_ordinary_record_exports_at_explicit_64_mib_bound(self):
         record=process_records(2000,1)[0]
-        self.assertEqual(len(record.reading.fields),42000)
+        self.assertEqual(len(record.reading.fields),44000)
         self.store.append([record])
         path=Path(self.tmp.name)/'transfer.sqlite'
         with self.assertRaisesRegex(ValueError,'increase max_bytes'):

@@ -252,6 +252,9 @@ def field_component(field: Field, default: str) -> str:
 
 
 PROCESS_ENTITIES = ("process:", "program:")
+# Seconds a process has run when read, on the clock its source reads elapsed time on. Derive
+# uses it to count a process that started since the previous pass from zero; it is no measure.
+PROCESS_AGE = "process.age"
 
 
 def is_process_evidence(entity: str, scope: str) -> bool:

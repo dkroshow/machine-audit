@@ -12,7 +12,7 @@ import re
 import time
 from collections.abc import Callable
 
-from machine_audit.model import Clock, Field, Reading, process_identity
+from machine_audit.model import PROCESS_AGE, Clock, Field, Reading, process_identity
 from .native import Darwin, I32, U32, U64, VMStats, SwapUsage, bind
 
 
@@ -41,6 +41,13 @@ def field(name, value, unit, kind='gauge', **kw):
     elif value == 0 and kw.get('status', 'observed') == 'observed':
         kw['status'] = 'measured_zero'
     return Field(name, value, unit, kind, **kw)
+
+
+# Seconds between process passes (and the self-cost reading built from each pass). Minute rows
+# keep each minute's main contributors from two passes; with new processes counted from their
+# start, 30 s keeps 99% of the CPU 10 s attributed on Big Mac at a third of the work
+# (storage-approach.md#collector-cost).
+PROCESS_CADENCE_S = 30
 
 
 class ReadSource:
@@ -162,6 +169,8 @@ class MacOS:
                 # copying 30,000 fields a second time to set them.
                 kw = dict(entity=entity, label=label, scope='process', start=observed, end=self.clock())
                 fields.append(field('process.exec_uuid', bytes(r.uuid).hex(), 'uuid', 'state', **kw))
+                # Start and read times are both mach absolute time, the awake clock.
+                fields.append(field(PROCESS_AGE, (kw['end'].awake_ns - r.proc_start_abstime * n.numer // n.denom) / 1e9, 'seconds', **kw))
                 for k, unit in [('user_time', 'mach_ticks'), ('system_time', 'mach_ticks'), ('runnable_time', 'mach_ticks'),
                     ('child_user_time', 'mach_ticks'), ('child_system_time', 'mach_ticks'), ('phys_footprint', 'bytes'),
                     ('resident_size', 'bytes'), ('lifetime_max_phys_footprint', 'bytes'), ('diskio_bytesread', 'bytes'),
@@ -194,4 +203,4 @@ class MacOS:
     def sources(self):
         return [ReadSource('macos.cpu', 'cpu', 1, self.cpu, self.clock),
                 ReadSource('macos.memory', 'memory', 1, self.memory, self.clock),
-                ReadSource('macos.process', 'cpu', 10, self.processes, self.clock)]
+                ReadSource('macos.process', 'cpu', PROCESS_CADENCE_S, self.processes, self.clock)]

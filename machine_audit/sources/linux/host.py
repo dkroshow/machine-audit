@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from machine_audit.model import Clock, Reading, process_identity
+from machine_audit.model import PROCESS_AGE, Clock, Reading, process_identity
 from ..macos import field, private_token
 from . import cgroups
 from .devices import physical_disks
@@ -214,6 +214,8 @@ class LinuxHost:
         except (FileNotFoundError, ProcessLookupError):
             return []  # exited during the pass
         ended = Clock.now()
+        # starttime counts clock ticks since boot, suspend included, as CLOCK_BOOTTIME does.
+        fields.append(field(PROCESS_AGE, ended.continuous_ns / 1e9 - p.start / self.hz, 'seconds', **kw))
         return [replace(f, start=observed, end=ended) for f in fields]
 
     def workloads(self):
