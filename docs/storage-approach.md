@@ -326,7 +326,8 @@ host readings. Data arriving after the ranking extends the rows it kept and adds
 others to its rest.
 
 A quarter hour or hour is ranked when the next one begins, or at a stop, from the
-minute rows saved for it: each minute's main contributors and rest. An entity is a
+minute rows saved for it: each minute's main contributors and rest. Their rows are
+sorted first, so the same readings give the same rows, to the last digit, in any run. An entity is a
 main contributor of a quarter or hour only if it was one in at least one of its
 minutes (under 1% of every minute is under 1% of the sum), and its row sums the
 minutes it mattered in; its other minutes are in the rest, so totals still add up.
@@ -391,12 +392,14 @@ process and program rows and 5 rest rows: 0.15–0.17 MB with the dictionary, ag
 
 ## Collector cost
 
-A monitor must cost so little that nobody notices it. The job gives the bar: the
-collector must never be one of the main contributors it reports, so its own CPU must
-stay under the 1% share of the machine's process CPU in every hour. Big Mac's process
-CPU over the measured hours was 4.6–19 CPUs, which sets the bar at about 165 s of CPU
-an hour, 4.6% of one core, in its quietest hour. The target leaves margin: 2% of one
-core (72 s an hour), under the bar until the machine's load falls to 2 CPUs.
+A monitor must cost so little that nobody notices it. The job gives the bar: the monitor
+must never be one of the main contributors it reports, so Machine-audit's own CPU, the
+collector and the scanner together, must stay under the 1% share of the machine's
+process CPU in every hour. That is what the user pays, so the bar counts both, though
+each is ranked as its own process. Big Mac's process CPU over the measured hours was
+4.6–19 CPUs, which sets the bar at about 165 s of CPU an hour, 4.6% of one core, in its
+quietest hour. The target leaves margin: 2% of one core (72 s an hour), under the bar
+until the machine's load falls to 2 CPUs.
 
 Before this release the collector used 1,350–1,500 s an hour on Big Mac (38–42% of a
 core), about 5% of all process CPU: by its own rule, a main contributor. Replayed on 31
@@ -414,10 +417,12 @@ re-validating 30,000 fields, not the OS reads (about 10%).
 
 **Measured live.** With passes every 30 s, over four full hours on Big Mac (about 1,830
 processes, whose CPU was 8.9–12.5 CPUs), the collector used 300–389 s an hour against a
-bar of 321–449 s. It stayed under the bar every hour, narrowly, and was never kept as a
-main contributor. It would not stay under in an hour as quiet as Big Mac's quietest (165
-s), and it is far from the margin. Saves took 177–233 s an hour, the process pass 83–110
-s, every other source 36–41 s.
+bar of 321–449 s, and the scanner 28–182 s. The collector alone stayed under the bar
+every hour, narrowly, and was never kept as a main contributor; with the scanner,
+Machine-audit was over it in one hour (562 s against 449 s, in an hour with a long scan).
+Neither would stay under in an hour as quiet as Big Mac's quietest (165 s), and both are
+far from the margin. The collector's saves took 177–233 s an hour, the process pass
+83–110 s, every other source 36–41 s.
 
 **Reading the collector's cost.** `self.user_time` and `self.system_time` labelled
 `collector` are the whole process. Its parts are `self.flush_cpu_s` (saves),
@@ -425,8 +430,8 @@ s, every other source 36–41 s.
 `self.query_cpu_s` (queries). On Big Mac the parts came within 2–9 s an hour of the
 whole; the rest is startup, the minute's status and health readings, the HTTP listener
 and encoding answers. The scanner is another process, labelled `scanner`, with
-`self.scanner_cpu_total` per scan: 28–182 s an hour in those hours. The two labels
-together are Machine-audit's cost, not the collector's.
+`self.scanner_cpu_total` per scan: 28–182 s an hour in those hours. The two labels stay
+apart in the self rows; together they are Machine-audit's cost, the one the bar judges.
 
 **Since then, with the same output.** Replayed on 31 minutes of Big Mac's readings at 30
 s (about 1,900 processes), a save fell from 3.1 s to 1.9 s of CPU:
@@ -465,8 +470,10 @@ process to 8:
 | Store after 28 saves | 38 MB | 27 MB |
 
 The replay keeps, in each recorded pass, only the fields this release reads. For Big Mac's
-measured hours that estimates saves at about 95 s an hour, the process pass about 55 s,
-other sources 37 s: about 195 s in all, twice what it would need for the margin. What
+measured hours that estimates the collector's saves at about 95 s an hour, the process
+pass about 55 s, other sources 37 s: about 195 s. With the scanner's 28–182 s,
+Machine-audit would be about 225–380 s, under the bar in each of those hours, and about
+three to five times the margin. What
 remains is mostly building a full point for every field of every pass, and the per-read
 cost of the 1-second sources.
 
