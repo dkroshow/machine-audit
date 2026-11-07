@@ -360,6 +360,8 @@ class Store:
         """A bucket's rows to save: its main contributors as they are, and rest rows for the
         others. `saved`, the entities it kept when first ranked, fixes who is kept, so later
         data extends them and adds to the rest."""
+        # Sorted, so the cut and every sum come out the same however the rows arrived.
+        rows=sorted(rows,key=lambda r:(r["source"],r["component"],r["entity"],signal_key(r),r["start_ns"],r["end_ns"]))
         groups=defaultdict(list)
         for row in rows:groups[(row["source"],row["component"],row["entity"])].append(row)
         rows=[row for group in groups.values() for row in merged_bundle(None,group)]  # fragments of one bucket

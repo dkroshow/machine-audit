@@ -17,7 +17,9 @@ SLEEP_TOLERANCE_S = 0.001
 def source_fields(reading):
     fields = list(reading.fields)
     indexed = {(f.name, f.entity): f for f in fields}
-    entities = {f.entity for f in fields}
+    # In field order: a set's order changes with each process's hash seed, and so would the
+    # order in which every later sum adds these totals.
+    entities = dict.fromkeys(f.entity for f in fields)
     host_busy = []
     for entity in entities:
         for prefix in ("process","self"):
@@ -245,7 +247,7 @@ def merge_summaries(rows: list[dict]) -> dict:
     result["value"] = max(rows,key=lambda r:r["end_ns"]).get("value")
     result["start_ns"] = min(r["start_ns"] for r in rows)
     result["end_ns"] = max(r["end_ns"] for r in rows)
-    result["statuses"] = {s:sum(r["statuses"].get(s, 0) for r in rows) for s in {s for r in rows for s in r["statuses"]}}
+    result["statuses"] = {s:sum(r["statuses"].get(s, 0) for r in rows) for s in sorted({s for r in rows for s in r["statuses"]})}
     result["status"] = ("measured_zero" if result["max"] == result["min"] == 0 else "observed") if valid else first["status"]
     result["above_s"] = {key:sum(r["above_s"].get(key,0) for r in rows) for key in first["above_s"]}
     result["histogram_s"] = [sum(r["histogram_s"][i] for r in rows) for i in range(len(first["histogram_s"]))]

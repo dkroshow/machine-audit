@@ -4,7 +4,10 @@ from dataclasses import replace
 from contextlib import nullcontext
 from pathlib import Path
 import ctypes
+import hashlib
 import json
+import os
+import random
 import resource
 import struct
 import sqlite3
@@ -80,6 +83,19 @@ class ScaleTests(unittest.TestCase):
 
     def tearDown(self):
         self.store.close();self.tmp.cleanup()
+
+    def test_a_run_saves_the_same_summaries_whatever_the_hash_seed(self):
+        # Two replays of one recorded Big Mac run differed in 57 of 10,266 summary rows: totals
+        # were added in set order, which changes with each process's hash seed, and a program
+        # right at the 1% cut was kept in one replay and not the other.
+        code="import sys;sys.path.insert(0,sys.argv[1]);from test_scale import saved_digest;print(saved_digest(sys.argv[2]))"
+        digests=set()
+        for seed in ('1','2'):
+            with tempfile.TemporaryDirectory(dir=self.tmp.name) as root:
+                result=subprocess.run([sys.executable,'-c',code,str(Path(__file__).parent.resolve()),root],
+                                      capture_output=True,text=True,timeout=120,env=dict(os.environ,PYTHONHASHSEED=seed))
+                self.assertEqual(result.returncode,0,result.stderr);digests.add(result.stdout)
+        self.assertEqual(len(digests),1)
 
     def test_real_process_adapter_500_entities_saves_all_raw_fields(self):
         records=process_records(500,2)
@@ -444,6 +460,26 @@ class ScaleTests(unittest.TestCase):
         result=subprocess.run([sys.executable,'-c',code,str(Path(__file__).parent.resolve()),str(self.store.path.resolve())],capture_output=True,text=True,timeout=60)
         self.assertEqual(result.returncode,0,result.stderr)
         print(result.stdout.strip())
+
+
+def saved_digest(root):
+    """Save 20 minutes of passes of 120 processes, a minute at a time, then stop; a digest of
+    every stored summary row in stored order."""
+    rng=random.Random(7);user=[0]*120;records=[]
+    for seq,t in enumerate(range(0,20*60+1,30),1):
+        c=Clock(t*S,t*S,t*S);fields=[]
+        for pid in range(120):
+            user[pid]+=rng.randint(1,10**7)*(50 if pid<3 else 1)
+            kw=dict(entity=f'process:boot:{pid}:{pid}',label=f'app{pid%40}',scope='process')
+            fields+=[Field('process.user_time',user[pid],'ns','counter',additive=True,scale=1e-9,rate_unit='CPUs',**kw),
+                     Field('process.system_time',user[pid]//3,'ns','counter',additive=True,scale=1e-9,rate_unit='CPUs',**kw)]
+        records.append(Record(Reading('synthetic.process','cpu',c,c,tuple(fields)),'boot','run',seq,c.wall_ns,c))
+    store=Store(Path(root)/'readings.sqlite',Budget(root,limit_bytes=10**9,free_margin_bytes=0))
+    for i in range(0,len(records),2):store.append(records[i:i+2])
+    store.stop_run('run',records[-1].reading.end.wall_ns)
+    rows=store.db.execute('SELECT resolution,bucket_ns,source,component,entity,payload FROM summaries ORDER BY rowid').fetchall()
+    store.close()
+    return hashlib.sha256(repr(rows).encode()).hexdigest()
 
 
 def measure_queries(path):
