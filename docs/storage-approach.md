@@ -411,13 +411,41 @@ minutes of Big Mac's recorded readings (about 1,450 processes):
 
 Most of the old save cost was re-merging and re-packing every process at minute,
 quarter and hour on every save; most of the pass cost was Python copying and
-re-validating 30,000 fields, not the OS reads (about 10%). At 30 s the estimate for Big
-Mac is about 95 s an hour for saves, 60 s for the process pass and 45 s for every other
-source: about 200 s an hour, 5.5% of one core. That meets the bar whenever Big Mac's
-processes use 5.5 CPUs or more, most of its measured hours, but not its quietest, and
-misses the margin target. What remains is mostly the generic derivation of each pass's
-points (40% of a save) and the per-source overhead; the next steps are fewer
-per-process fields and a leaner derivation for process passes.
+re-validating 30,000 fields, not the OS reads (about 10%).
+
+**Measured live.** With passes every 30 s, over four full hours on Big Mac (about 1,830
+processes, whose CPU was 8.9–12.5 CPUs), the collector used 300–389 s an hour against a
+bar of 321–449 s. It stayed under the bar every hour, narrowly, and was never kept as a
+main contributor. It would not stay under in an hour as quiet as Big Mac's quietest (165
+s), and it is far from the margin. Saves took 177–233 s an hour, the process pass 83–110
+s, every other source 36–41 s.
+
+**Reading the collector's cost.** `self.user_time` and `self.system_time` labelled
+`collector` are the whole process. Its parts are `self.flush_cpu_s` (saves),
+`self.source_read_thread_cpu_s` per source (each read and its admission) and
+`self.query_cpu_s` (queries). On Big Mac the parts came within 2–9 s an hour of the
+whole; the rest is startup, the minute's status and health readings, the HTTP listener
+and encoding answers. The scanner is another process, labelled `scanner`, with
+`self.scanner_cpu_total` per scan: 28–182 s an hour in those hours. The two labels
+together are Machine-audit's cost, not the collector's.
+
+**Since then, with the same output.** Replayed on 31 minutes of Big Mac's readings at 30
+s (about 1,900 processes), a save fell from 3.1 s to 1.9 s of CPU:
+
+- A save takes the readings it admitted from the live cache instead of unpacking them
+  again, which was a fifth of a save.
+- The cycle collector's threshold is 100,000 objects, not Python's 700. It had run 3.5
+  full collections a save, 15% of the save; now 0.04 s.
+- Derivation looks each field's component up once, and each pass's prior fields once.
+
+The threshold took a process pass from 0.58 s to 0.49 s. A `who` answer over 10 minutes
+or less derives every pass in it; building only the fields it needs took 10 minutes
+from 11.0 s and 369 MiB to 5.4 s and 261 MiB. For Big Mac's measured hours that
+estimates saves at about 145 s an hour, the process pass about 90 s and other sources 37
+s: about 280 s in all. That is under the bar in those hours but not in a quiet one, and
+four times the margin. What remains is mostly building a full point for every field of
+every pass (half of a save), the number of fields per process, and the per-read cost of
+the 1-second sources.
 
 **Process passes every 30 s.** Minute rows keep each minute's main contributors from two
 passes, and the host's own readings stay at 1 s, so a constraint's timing and shape

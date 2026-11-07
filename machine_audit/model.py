@@ -204,7 +204,9 @@ class Record:
         return int.from_bytes(payload[3:7],"big")
 
     @classmethod
-    def unpack(cls, payload: bytes) -> Record:
+    def unpack(cls, payload: bytes, names=None) -> Record:
+        """The stored record; with `names`, only its fields of those names, so a query that
+        derives one signal of a process pass does not build its other fields."""
         size=cls.decoded_size(payload)
         if size>256*1024**2:raise ValueError("record_size_limit")
         decoder=zlib.decompressobj()
@@ -219,13 +221,15 @@ class Record:
         def clock(i):
             return clocks[i] if i is not None else None
         fields = []
+        wanted = [names is None or d[0] in names for d in descriptors]
         for d,e,value,start,end in rows:
+            if not wanted[d]:continue
             name,unit,kind,status,scope,additive,scale,rate_unit,component = descriptors[d]
             entity,label = entities[e]
             fields.append(Field(name,value,unit,kind,status,entity,label,scope,additive,scale,clock(start),clock(end),rate_unit,component))
         source,component,start,end,status,reason,version,boot,run,sequence,due,received = h
         record = cls(Reading(source,component,clock(start),clock(end),tuple(fields),status,reason,version),boot,run,sequence,due,clock(received))
-        record.__dict__["packed"] = payload
+        if names is None:record.__dict__["packed"] = payload
         return record
 
     @classmethod
@@ -239,9 +243,12 @@ class Record:
 
 def field_component(field: Field, default: str) -> str:
     """A bundled process read supplies several components without extra OS reads."""
-    if field.component:
-        return field.component
-    name=field.name
+    return field.component or _component(field.name, default)
+
+
+@lru_cache(maxsize=1 << 12)
+def _component(name: str, default: str) -> str:
+    # A save asks this of every field several times; a pass repeats the same few names.
     if name.startswith("self."):
         return "self"
     if name.startswith(("process.diskio", "process.logical_writes")):

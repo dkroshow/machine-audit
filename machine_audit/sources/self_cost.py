@@ -39,12 +39,15 @@ class SelfCost:
             return [field('self.cpu', None, 'mach_ticks', 'counter', status='unobserved')]
         roles = self.registry.snapshot()
         fields = []
+        # A pass holds about 22 fields per process: each entity is looked up once.
+        role_of = {}
         for f in reading.fields:
-            parts = f.entity.split(':')
-            if len(parts)<4 or not parts[2].isdigit() or (int(parts[2]),parts[3]) not in roles:
+            if f.entity not in role_of:
+                parts = f.entity.split(':')
+                role_of[f.entity] = roles.get((int(parts[2]),parts[3])) if len(parts)>=4 and parts[2].isdigit() else None
+            role = role_of[f.entity]
+            if role is None:
                 continue
-            pid = int(parts[2])
-            role = roles[(pid,parts[3])]
             names = {'process.user_time':'self.user_time','process.system_time':'self.system_time',
                      self.memory:'self.memory','process.diskio_bytesread':'self.read',
                      'process.diskio_byteswritten':'self.write','process.pkg_idle_wkups':'self.idle_wakeups',

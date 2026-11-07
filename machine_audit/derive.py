@@ -62,13 +62,22 @@ def union_ns(intervals):
 def points(records: list[Record], previous: dict[str, Record] | None = None) -> list[dict]:
     previous = dict(previous or {})
     result = []
+    # Each source's latest pass and its fields with derived totals, by name and entity: the
+    # next pass of the source derives from them without deriving them again.
+    indexed = {}
     for record in records:
         reading = record.reading
         prior = previous.get(reading.source)
         compatible = prior and (prior.run_id, prior.boot_id) == (record.run_id, record.boot_id)
-        prior_fields = {(f.name, f.entity): f for f in source_fields(prior.reading)} if compatible else {}
-        # Index original constituents once per pass, not once per process.
-        prior_inputs = {(f.name, f.entity): f for f in prior.reading.fields} if compatible else {}
+        if not compatible:
+            prior_fields = {}
+        elif reading.source in indexed and indexed[reading.source][0] is prior:
+            prior_fields = indexed[reading.source][1]
+        else:
+            prior_fields = {(f.name, f.entity): f for f in source_fields(prior.reading)}
+        # Constituents are never derived (a total is added only where a pass has none), so
+        # the same index gives them as read.
+        prior_inputs = prior_fields
         inputs_by_entity = defaultdict(list)
         busy_inputs = []
         # A process missing from the prior pass and younger than the time since it started
@@ -81,7 +90,9 @@ def points(records: list[Record], previous: dict[str, Record] | None = None) -> 
             elif f.name in BUSY:
                 busy_inputs.append(f)
         pass_points = []
-        for field in source_fields(reading):
+        fields = source_fields(reading)
+        indexed[reading.source] = (record, {(f.name, f.entity): f for f in fields})
+        for field in fields:
             if field.name == PROCESS_AGE:continue
             end_clock = field.end or reading.end
             start_clock = field.start or reading.start

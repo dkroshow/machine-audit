@@ -143,12 +143,14 @@ class Query:
             clause+="))"
         return clause
 
-    def _raw(self,db,captured,start_ns,end_ns,component=None,series_only=False):
+    def _raw(self,db,captured,start_ns,end_ns,component=None,series_only=False,names=None):
+        """Saved and unsaved readings of the window, each source's preceding one, within the
+        byte budget; with `names`, saved readings keep only fields of those names."""
         args = [start_ns,end_ns]
         clause = self._watermark("r",captured,args)
         clause += self._raw_selection(component,series_only,args)
         rows,overflow = bounded_payloads(db.execute("SELECT r.payload FROM readings r WHERE r.wall_ns>=? AND r.wall_ns<=?"+clause+" ORDER BY r.wall_ns,r.sequence LIMIT ?",args+[MAX_SCAN+1]))
-        records = [Record.unpack(r) for r in rows]
+        records = [Record.unpack(r,names) for r in rows]
         used=sum(Record.decoded_size(r) for r in rows)
         seen={(r.run_id,r.sequence) for r in records}
         def admit(payload=None,pending=None):
@@ -158,7 +160,7 @@ class Query:
             size=Record.decoded_size(payload)
             if used+size>MAX_QUERY_BYTES:
                 overflow=True;return
-            record=self._decode_pending(captured,pending) if pending is not None else Record.unpack(payload)
+            record=self._decode_pending(captured,pending) if pending is not None else Record.unpack(payload,names)
             if (record.run_id,record.sequence) not in seen:
                 seen.add((record.run_id,record.sequence));records.append(record);used+=size
         # One baseline per source, restricted to the same coherent watermark.
@@ -663,7 +665,7 @@ class Query:
         if brief:limit=BRIEF_TOP
         if end_ns-start_ns>31*24*HOUR:raise ValueError("who interval must not exceed 31 days")
         with self._snapshot(start_ns,end_ns) as (db,captured):
-            records,overflow=self._raw(db,captured,start_ns,end_ns,component) if end_ns-start_ns<=10*MINUTE else ([],False)
+            records,overflow=self._raw(db,captured,start_ns,end_ns,component,names=self._who_names(signal)) if end_ns-start_ns<=10*MINUTE else ([],False)
             records=self._who_records(records,signal)
             all_points=points(records)
             host_rows=[p for p in all_points if p["signal"]=="cpu.busy" and p["status"] in GOOD and p["start_ns"]>=start_ns and p["end_ns"]<=end_ns]
@@ -787,11 +789,18 @@ class Query:
         return totals
 
     @staticmethod
-    def _who_records(records,signal):
-        if not signal:return records
+    def _who_names(signal):
+        """The fields a who answer for `signal` derives from; None for all."""
+        if not signal:return None
         wanted={signal}
         if signal in {"process.cpu","self.cpu"}:
             prefix=signal.split(".")[0];wanted.update((prefix+".user_time",prefix+".system_time","cpu.busy")+BUSY)
+        return wanted
+
+    @classmethod
+    def _who_records(cls,records,signal):
+        wanted=cls._who_names(signal)
+        if wanted is None:return records
         return [replace(r,reading=replace(r.reading,fields=tuple(f for f in r.reading.fields if f.name in wanted))) for r in records]
 
 

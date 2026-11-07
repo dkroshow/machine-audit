@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
+import gc
 import importlib
 import json
 import signal
@@ -78,6 +79,10 @@ def _run(config,ready):
     from .store import Store
     from .sources import create_sources,boot_id
     from .model import Clock
+    # A save builds and drops millions of short-lived objects with few reference cycles; at
+    # the default threshold (700) the cycle collector ran several full passes a save, about a
+    # fifth of the collector's CPU (storage-approach.md#collector-cost).
+    gc.set_threshold(100_000)
     budget=Budget(config.root)
     store=Store(config.store_path,budget)
     collector=server=server_thread=None

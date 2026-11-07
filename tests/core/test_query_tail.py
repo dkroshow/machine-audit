@@ -182,8 +182,8 @@ class QueryTailTests(unittest.TestCase):
         with self.store.budget.sqlite_write(self.store.db, self.store.path):
             self.store.db.execute("UPDATE reading_components SET is_series=1 WHERE (run_id,sequence) IN (SELECT run_id,sequence FROM readings WHERE source='synthetic.process')")
         unpack = Record.unpack
-        def observe(payload):
-            record = unpack(payload)
+        def observe(payload, names=None):
+            record = unpack(payload, names)
             self.assertNotEqual(record.reading.source, 'synthetic.process')
             return record
         with patch.object(Record, 'unpack', side_effect=observe):
