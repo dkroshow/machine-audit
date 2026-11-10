@@ -171,7 +171,7 @@ class Walker:
                             child_stat=os.stat(child_path,follow_symlinks=False)
                             child_id=str(child_stat.st_ino)
                             present.add(child_id)
-                            decision=self.policy.decide(child_path,private)
+                            decision=self.policy.decide(shown_path(self.volume,child_path),private)
                             known=self.sink.relocate(child_id,child_parent,os.path.basename(child_path),child_path,
                                                       private or not decision.names)
                             if not known:stack.append((child_path,child_parent,private,True))

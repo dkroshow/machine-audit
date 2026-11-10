@@ -11,7 +11,7 @@ from machine_audit.budget import Budget
 from machine_audit.scanner.native import Volume
 from machine_audit.scanner.policy import Policy
 from machine_audit.scanner.runner import relist
-from machine_audit.scanner.store import MapStore
+from machine_audit.scanner.store import MapStore, MapQuery
 from machine_audit.scanner.walker import Walker
 
 
@@ -251,5 +251,31 @@ class RelistTests(unittest.TestCase):
         self.store.finish_volume(self.volume, None,walker.gaps,full=False,lean=True)
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM files WHERE generation=?',(self.store.generation,)).fetchone()[0],150)
 
+
+@unittest.skipUnless(os.path.isdir('/System/Volumes/Data/Users'), 'needs the macOS Data volume and its firmlinked paths')
+class DataVolumeRelistTests(unittest.TestCase):
+    def test_relisted_folder_keeps_an_excluded_child_excluded_and_unnamed(self):
+        # The re-list judged children by their /System/Volumes/Data path while the
+        # policy holds shown paths, so a known excluded child was taken as ordinary
+        # and its name stored.
+        scratch=Path(__file__).parent/'.tmp';scratch.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as temp:
+            tree=Path(temp).resolve()/'tree';(tree/'withheld-name'/'inner').mkdir(parents=True);(tree/'kept').mkdir()
+            data=Path(temp)/'data';data.mkdir()
+            store=MapStore(data/'scanner.sqlite',Budget(data,free_margin_bytes=0));self.addCleanup(store.close)
+            mount='/System/Volumes/Data'
+            volume=Volume('v','Startup data',mount,'apfs',os.stat(mount).st_dev,10**12,1,1,10**9)
+            policy=Policy(home=temp,homes=[],exclusions=[str(tree/'withheld-name')])
+            root=mount+str(tree)
+            store.prepare(volume);walker=Walker(volume,policy,store);walker.walk(root)
+            store.finish_volume(volume,None,walker.gaps,full=True,lean=True)
+            store.prepare(volume,full=False)
+            walker=Walker(volume,policy,store);walker.walk(root,recursive=False)
+            store.finish_volume(volume,None,walker.gaps,full=False,lean=True)
+            labels=[r[0] for r in store.db.execute('SELECT label FROM nodes')]
+            self.assertIn('kept',labels)
+            self.assertNotIn('withheld-name',labels)
+            children=MapQuery(store.path).query('children',volume_id='v')['rows']
+            self.assertEqual({(r['label'],r['status']) for r in children},{(None,'excluded'),('kept','observed')})
 
 if __name__=='__main__':unittest.main()
