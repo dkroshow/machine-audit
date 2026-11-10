@@ -12,101 +12,110 @@ GB = 10**9
 MAX_ANCESTRY = 1024
 
 
-def pieces(extents, allocated, *, max_ranges=16_000_000):
-    """Split the bytes held by `allocated` streams into pieces, each held by one set of streams.
+def pieces(streams, *, max_ranges=16_000_000):
+    """Split the bytes that streams hold into pieces, each held by one set of streams.
 
-    `extents` maps some streams to their (start, length) byte ranges. A stream
-    without ranges, or with fewer range bytes than its allocation (a resource
-    fork, say), holds the rest privately. Returns ({frozenset(streams): bytes},
-    {stream: group}); streams that share any byte form one group, keyed by its
-    least stream key."""
-    order = list(allocated)
-    ordinal = {s: i for i, s in enumerate(order)}
+    `streams` yields (stream, allocated bytes, (start, length) ranges or None).
+    A stream without ranges, or with fewer range bytes than its allocation (a
+    resource fork, say), holds the rest privately. Past `max_ranges` ranges a
+    stream counts by its allocation and `overflowed` is set: shared blocks may
+    then count twice. Returns (order, private, shared, group, overflowed):
+    streams by ordinal; each one's private bytes by ordinal; {frozenset of
+    streams: bytes} for bytes several hold; and, for streams that share, their
+    group, keyed by its least stream key (any other stream is its own group)."""
+    order = []
     ranges = array('q')
-    covered = [0] * len(order)
-    for stream, found in extents.items():
-        i = ordinal[stream]
-        merged = []
-        for start, length in sorted(found):
-            if start < 0 or length <= 0:
-                raise ValueError('invalid_extent')
-            end = start + length
-            if merged and start <= merged[-1][1]:
-                merged[-1][1] = max(merged[-1][1], end)
+    rest = array('q')
+    overflowed = False
+    for stream, allocated, found in streams:
+        i = len(order)
+        order.append(stream)
+        covered = 0
+        if found and not overflowed:
+            merged = []
+            for start, length in sorted(found):
+                if start < 0 or length <= 0:
+                    raise ValueError('invalid_extent')
+                end = start + length
+                if merged and start <= merged[-1][1]:
+                    merged[-1][1] = max(merged[-1][1], end)
+                else:
+                    merged.append([start, end])
+            if len(ranges) // 3 + len(merged) > max_ranges:
+                overflowed = True
             else:
-                merged.append([start, end])
-        if len(ranges) // 3 + len(merged) > max_ranges:
-            raise OverflowError('block_map_budget')
-        for start, end in merged:
-            ranges.extend((start, end, i))
-            covered[i] += end - start
-    events = []
-    for k in range(0, len(ranges), 3):
-        start, end, i = ranges[k:k + 3]
-        events.append(((start << 1 | 1) << 32) | i)
-        events.append(((end << 1) << 32) | i)
+                for start, end in merged:
+                    ranges.extend((start, end, i))
+                    covered += end - start
+        rest.append(max(0, allocated - covered))
+    # Two sorted event lists, packed as position and ordinal: an end and a start
+    # at one position bound no bytes between them.
+    starts = sorted(ranges[k] << 32 | ranges[k + 2] for k in range(0, len(ranges), 3))
+    ends = sorted(ranges[k + 1] << 32 | ranges[k + 2] for k in range(0, len(ranges), 3))
     del ranges
-    events.sort()
-    found = defaultdict(int)
+    private = rest
+    shared = defaultdict(int)
     active = set()
+    s = e = 0
     last = None
-    for event in events:
-        position = event >> 33
+    while e < len(ends):
+        position = ends[e] >> 32
+        if s < len(starts):
+            position = min(position, starts[s] >> 32)
         if active and position > last:
-            key = frozenset(active)
-            found[key] += position - last
-        if event >> 32 & 1:
-            active.add(event & 0xFFFFFFFF)
-        else:
-            active.discard(event & 0xFFFFFFFF)
+            if len(active) == 1:
+                private[next(iter(active))] += position - last
+            else:
+                shared[frozenset(active)] += position - last
+        while e < len(ends) and ends[e] >> 32 == position:
+            active.discard(ends[e] & 0xFFFFFFFF)
+            e += 1
+        while s < len(starts) and starts[s] >> 32 == position:
+            active.add(starts[s] & 0xFFFFFFFF)
+            s += 1
         last = position
-    del events
-    parent = list(range(len(order)))
+    del starts, ends
+    parent = {}
 
     def root(i):
-        while parent[i] != i:
+        while parent.setdefault(i, i) != i:
             parent[i] = parent[parent[i]]
             i = parent[i]
         return i
-    result = defaultdict(int)
-    for members, size in found.items():
-        first, *rest = members
-        for other in rest:
+    for members in shared:
+        first, *others = members
+        for other in others:
             a, b = root(first), root(other)
             if a != b:
                 parent[b] = a
-        result[frozenset(order[i] for i in members)] += size
-    for i, stream in enumerate(order):
-        rest = allocated[stream] - covered[i]
-        if rest > 0:
-            result[frozenset((stream,))] += rest
     groups = defaultdict(list)
-    for i, stream in enumerate(order):
-        groups[root(i)].append(stream)
+    for i in parent:
+        groups[root(i)].append(order[i])
     group = {}
     for members in groups.values():
         key = min(members, key=_order)
         for stream in members:
             group[stream] = key
-    return dict(result), group
+    return order, private, {frozenset(order[i] for i in members): size for members, size in shared.items()}, group, overflowed
 
 
 def _order(key):
     return (isinstance(key, str), key)
 
 
-def terms(found, holders, parent_of):
-    """Per-folder (physical, frees) terms. Summed over a folder's subtree they give
+def terms(found, holders, parent_of, shapes):
+    """Per-folder (physical, frees) terms of (streams, bytes) pieces. Summed over a folder's subtree they give
     its physical bytes, each piece once if any copy is below it, and what deleting
     it frees, each piece once if every copy is below it.
 
     `holders` maps a stream to the folders holding it; `parent_of` gives a folder's
     parent, None at the root. A piece held in one folder is a plain term there;
     otherwise it is +size at each holding folder and -size per extra branch where
-    copies meet, so the ordinary bottom-up sum counts it once per folder."""
+    copies meet, so the ordinary bottom-up sum counts it once per folder.
+    `shapes` caches each set of holding folders' shape across calls: the files
+    of one folder, copied many times, share one."""
     out = defaultdict(lambda: [0, 0])
-    shapes = {}
-    for streams, size in found.items():
+    for streams, size in found:
         dirs = frozenset(d for s in streams for d in holders.get(s, ()))
         if not dirs:
             continue

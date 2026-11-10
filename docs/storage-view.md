@@ -110,6 +110,18 @@ own folder then shows less than its physical space until the next full walk,
 the volume total stays exact, and the run reports
 `shared_copy_placed_at_full_walk` with the bytes (`unplaced_shared`).
 
+**Measured cost** (Big Mac, Nov 10 2026, a scratch map of a tree where half
+of the 372 k entries are shared copies: a browser's application, its 104
+code-signing clones and a 33 GB database). A full walk took 69–77 s of CPU
+against 73–78 s for the previous release on the same tree, with the same 4,411
+extent reads and a lower peak memory (150 MiB against 169–174 MiB): extents are
+read once per clone id, as before, and the folder tree is loaded only after the
+sharing pass. An hourly update that re-walks one clone of that family, and so
+re-reads the whole family's 1,957 streams, took 7.3 s against 107.6 s; an
+update that touches no shared file reads no extents. The startup volume's full
+walk (14.9 M entries, 2,135 s of CPU before this change) reads extents for
+about 0.5 M streams, about 35 s, as it did before.
+
 **Unsupported on Ubuntu by default:** ext4 shares nothing beyond hard links,
 which count once per folder by inode; btrfs and XFS reflinks would need the
 `FIEMAP` shared-extent flag, unverified. Ubuntu folders report physical as

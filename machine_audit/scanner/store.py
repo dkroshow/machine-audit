@@ -521,19 +521,20 @@ class MapStore:
         if self.base_gen is None:return None
         return self.db.execute('SELECT * FROM nodes WHERE generation=? AND volume=? AND id=?',(self.base_gen,self.vid,key)).fetchone()
 
-    def _sharing(self,reader,full,parent_of):
+    def _sharing(self,reader,full):
         """Stage the sharing groups and per-folder terms of the streams this run touched.
 
         A full walk takes every stream. An update takes the streams of re-listed or
-        removed folders, plus every stream in their groups, so a changed copy is
-        measured against the unchanged copies it shares blocks with. `reader` gives a
-        file's extents by inode, or is None where none can be read (each stream then
-        counts once, by its allocation). Returns (folders whose terms changed,
-        {folder: [physical, frees]} for a full walk, gap codes)."""
+        removed folders, plus every stream
+        in their groups, so a changed copy is measured against the unchanged copies
+        it shares blocks with. `reader` gives a file's extents by inode, or is None
+        where none can be read (each stream then counts once, by its allocation).
+        Returns (folders whose totals an update changes, gap codes)."""
         gaps=set();known={};old_groups=set()
         if full:
             rows=self.db.execute('''SELECT stream,dir,file_id,allocated,private FROM holders INDEXED BY holder_stream
                 WHERE generation=? AND volume=? ORDER BY stream''',(self.generation,self.vid))
+            by_stream=((stream,list(found)) for stream,found in groupby(rows,key=lambda row:row[0]))
         else:
             touched={r[0] for r in self.db.execute('''SELECT stream FROM holders WHERE generation=? AND volume=? AND dir IN
                  (SELECT id FROM reset_dirs WHERE generation=? AND volume=? UNION SELECT id FROM removed WHERE generation=? AND volume=?)''',
@@ -546,68 +547,117 @@ class MapStore:
             for group in old_groups:
                 for row in self._rows('streams','grp=?',(group,)):
                     known[row['stream']]=row;touched.add(row['stream'])
-            rows=((stream,h['dir'],h['file_id'],h['allocated'],h['private'])
-                  for stream in touched for h in self._rows('holders','stream=?',(stream,)))
-        # stream -> [holding folders, holding files, allocated, APFS private bytes]
+            if reader and len(touched)>SHARING_REREADS:
+                # Counted by stream until the next full walk: shared blocks between
+                # different streams may count twice, and the run says so.
+                reader=None;gaps.add('sharing_reread_capped')
+            by_stream=((stream,[(stream,h['dir'],h['file_id'],h['allocated'],h['private'])
+                                for h in self._rows('holders','stream=?',(stream,))]) for stream in touched)
+        # stream -> (holding folders, APFS private bytes, held by one file)
         streams={}
-        for stream,folder,file_id,allocated,private in rows:
-            entry=streams.get(stream)
-            if entry is None:streams[stream]=entry=[[],[],allocated,private]
-            entry[0].append(folder)
-            if file_id not in entry[1]:entry[1].append(file_id)
-        if reader and not full and len(streams)>SHARING_REREADS:
-            # Counted by stream until the next full walk: shared blocks between
-            # different streams may count twice, and the run says so.
-            reader=None;gaps.add('sharing_reread_capped')
-        extents={}
-        if reader:
-            for count,(stream,(_,files,_,_)) in enumerate(streams.items()):
-                for file_id in files:
-                    try:extents[stream]=reader(source_id(file_id));break
-                    except OSError:continue
-                else:gaps.add('extents_unreadable')
+        def read():
+            for count,(stream,found) in enumerate(by_stream):
+                if not found:continue
+                files=tuple(dict.fromkeys(row[2] for row in found))
+                streams[stream]=(tuple(dict.fromkeys(row[1] for row in found)),found[0][4],len(files)==1)
+                ranges=None
+                if reader:
+                    for file_id in files:
+                        try:ranges=reader(source_id(file_id));break
+                        except OSError:continue
+                    else:gaps.add('extents_unreadable')
                 if count%1000==0:self.progress()
-        allocated={stream:entry[2] for stream,entry in streams.items()}
-        try:found,group=accounting.pieces(extents,allocated)
-        except OverflowError:
-            gaps.add('block_map_budget');found,group=accounting.pieces({},allocated)
-        del extents
+                yield stream,max(row[3] for row in found),ranges
+        order,private,shared,group,overflowed=accounting.pieces(read())
+        if overflowed:gaps.add('block_map_budget')
         unplaced={}
         if reader and not full:
             # A copy made since the last full walk can share blocks with a file the
             # update did not read. APFS says how much of a single file is private;
             # the rest is held, and counted, where its partner is.
-            for stream,(_,files,_,private) in streams.items():
-                previous=known.get(stream)
-                if private is None or len(files)!=1 or (previous is not None and not previous['unplaced']):continue
-                alone=frozenset((stream,))
-                unknown=min(found.get(alone,0)-private,found.get(alone,0))
-                if unknown>0:found[alone]-=unknown;unplaced[stream]=unknown
-        by_group=defaultdict(dict)
-        for members,size in found.items():
-            by_group[group[next(iter(members))]][members]=size
+            for i,stream in enumerate(order):
+                _,apfs_private,single=streams[stream];previous=known.get(stream)
+                if apfs_private is None or not single or (previous is not None and not previous['unplaced']):continue
+                unknown=min(private[i]-apfs_private,private[i])
+                if unknown>0:private[i]-=unknown;unplaced[stream]=unknown
         holding={stream:entry[0] for stream,entry in streams.items()}
-        affected=set();own={}
-        for key,members in by_group.items():
-            for folder,(physical,frees) in accounting.terms(members,holding,parent_of).items():
+        parents=self._parents({folder for folders in holding.values() for folder in folders})
+        def parent_of(folder):
+            if folder not in parents:raise ScanError('missing_directory_ancestor')
+            return parents[folder]
+        shapes={}
+        grouped=defaultdict(list)
+        for members,size in shared.items():
+            grouped[group[next(iter(members))]].append((members,size))
+        def groups():
+            for i,stream in enumerate(order):
+                key=group.get(stream)
+                if key is None:yield stream,((stream,),private[i])
+                elif private[i]:grouped[key].append(((stream,),private[i]))
+            for key,found in grouped.items():yield key,found
+        def staged(key,terms):
+            for folder,(physical,frees) in terms.items():
                 self._queue('INSERT OR REPLACE INTO terms VALUES(?,?,?,?,?,?)',(self.generation,self.vid,key,folder,physical,frees))
-                affected.add(folder)
-                if full:
-                    term=own.setdefault(folder,[0,0]);term[0]+=physical;term[1]+=frees
-            self.progress()
-        for stream in streams:
-            self._queue('INSERT OR REPLACE INTO streams VALUES(?,?,?,?,?)',
-                        (self.generation,self.vid,stream,group[stream],unplaced.get(stream,0)))
-        if not full:
+        affected=set()
+        if full:
+            # The folder totals read these terms back, summed by folder.
+            for count,(key,found) in enumerate(groups()):
+                staged(key,accounting.terms(found if isinstance(found,list) else (found,),holding,parent_of,shapes))
+                if count%1000==0:self.progress()
+        else:
+            # Restage only groups whose terms changed, and total again only the
+            # folders whose sum over the touched groups changed: a new copy in a
+            # large family moves terms at its own folder and the branches above it.
+            computed={key:accounting.terms(found if isinstance(found,list) else (found,),holding,parent_of,shapes)
+                      for key,found in groups()}
+            before=defaultdict(dict)
+            for key in old_groups:
+                for row in self.db.execute('SELECT dir,physical,frees FROM terms WHERE generation=? AND volume=? AND grp=?',
+                                           (self.base_gen,self.vid,key)):
+                    before[key][row[0]]=(row[1],row[2])
+            totals=defaultdict(lambda:[0,0])
+            for sign,side in ((-1,before),(1,computed)):
+                for terms in side.values():
+                    for folder,(physical,frees) in terms.items():
+                        total=totals[folder];total[0]+=sign*physical;total[1]+=sign*frees
+            affected={folder for folder,total in totals.items() if total!=[0,0]}
+            changed={key for key,terms in computed.items() if before.get(key)!=terms}
+            for key in old_groups-computed.keys()|changed:
+                self._queue('INSERT OR IGNORE INTO reset_groups VALUES(?,?,?)',(self.generation,self.vid,key))
+            for key in changed:staged(key,computed[key])
             for stream in touched-streams.keys():
                 self._queue('INSERT OR IGNORE INTO removed_streams VALUES(?,?,?)',(self.generation,self.vid,stream))
-            for key in old_groups|by_group.keys():
-                self._queue('INSERT OR IGNORE INTO reset_groups VALUES(?,?,?)',(self.generation,self.vid,key))
-            for key in old_groups:
-                affected.update(r[0] for r in self.db.execute('SELECT dir FROM terms WHERE generation=? AND volume=? AND grp=?',
-                                                              (self.base_gen,self.vid,key)))
+        for stream in order:
+            previous=known.get(stream);key=group.get(stream,stream)
+            if previous is None or (previous['grp'],previous['unplaced'])!=(key,unplaced.get(stream,0)):
+                self._queue('INSERT OR REPLACE INTO streams VALUES(?,?,?,?,?)',
+                            (self.generation,self.vid,stream,key,unplaced.get(stream,0)))
         self.flush()
-        return affected,own,gaps
+        return affected,gaps
+
+    def _parents(self,folders):
+        """Each folder's parent, and its ancestors' parents, in the map being built.
+        A family of copies can span many thousands of folders, so they are read a
+        level at a time in batches, not one lookup each."""
+        found={};pending=set(folders)
+        for _ in range(MAX_ANCESTRY+1):
+            if not pending:return found
+            batch=list(pending);pending=set()
+            for first in range(0,len(batch),500):
+                part=batch[first:first+500];marks=','.join('?'*len(part))
+                rows={}
+                for generation in (self.base_gen,self.generation):  # A staged row replaces its base row.
+                    if generation is None:continue
+                    rows.update(self.db.execute(f'SELECT id,parent FROM nodes WHERE generation=? AND volume=? AND id IN ({marks})',
+                                                (generation,self.vid,*part)).fetchall())
+                removed={r[0] for r in self.db.execute(f'SELECT id FROM removed WHERE generation=? AND volume=? AND id IN ({marks})',
+                                                       (self.generation,self.vid,*part))}
+                for folder in part:
+                    if folder not in rows or folder in removed:raise ScanError('missing_directory_ancestor')
+                    found[folder]=parent=rows[folder]
+                    if parent is not None and parent not in found:pending.add(parent)
+            pending-=found.keys()
+        raise ScanError('directory_ancestry_limit')
 
     def _own(self,node):
         listed=node['own_listed'];physical=frees=node['own_physical']
@@ -615,21 +665,19 @@ class MapStore:
             physical+=term['physical'];frees+=term['frees']
         return listed,physical,frees
 
-    def _tree(self):
-        """The staged folders as index arrays: keys, parents and own totals."""
+    def _aggregate_full(self):
+        # Files remain on disk. Only directory IDs and integer totals form the
+        # temporary bottom-up working set; no recursive SQL or ancestor scans.
         keys=[];parents=[];listed=array('q');physical=array('q')
         for row in self.db.execute('SELECT id,parent,own_listed,own_physical FROM nodes WHERE generation=? AND volume=?',
                                    (self.generation,self.vid)):
             keys.append(row['id']);parents.append(row['parent'])
             listed.append(row['own_listed']);physical.append(row['own_physical'])
-        return keys,parents,listed,physical,{key:i for i,key in enumerate(keys)}
-
-    def _aggregate_full(self,tree,own):
-        # Files remain on disk. Only directory IDs and integer totals form the
-        # temporary bottom-up working set; no recursive SQL or ancestor scans.
-        keys,parents,listed,physical,index=tree
+        index={key:i for i,key in enumerate(keys)}
         frees=array('q',physical)
-        for folder,(extra,freed) in own.items():
+        for folder,extra,freed in self.db.execute('''SELECT dir,sum(physical),sum(frees) FROM terms INDEXED BY term_dir
+                WHERE generation=? AND volume=? GROUP BY dir''',(self.generation,self.vid)):
+            if folder not in index:raise ScanError('missing_directory_ancestor')
             i=index[folder];physical[i]+=extra;frees[i]+=freed
         parent_index=array('q');remaining=array('I',[0])*len(keys)
         for parent in parents:
@@ -709,22 +757,9 @@ class MapStore:
         walk; `used_before` is its used space before it, for the reconciliation's tolerance."""
         self.flush();old=self.db.execute('SELECT * FROM volumes WHERE id=?',(self.volume,)).fetchone()
         self.phase('sharing')
-        if full:
-            tree=self._tree();keys,parents,_,_,index=tree
-            def parent_of(folder):
-                if folder not in index:raise ScanError('missing_directory_ancestor')
-                return parents[index[folder]]
-        else:
-            parents={}
-            def parent_of(folder):
-                if folder not in parents:
-                    node=self._node(folder)
-                    if node is None:raise ScanError('missing_directory_ancestor')
-                    parents[folder]=node['parent']
-                return parents[folder]
-        affected,own,sharing_gaps=self._sharing(reader,full,parent_of)
+        affected,sharing_gaps=self._sharing(reader,full)
         self.phase('aggregate')
-        if full:self._aggregate_full(tree,own);del tree
+        if full:self._aggregate_full()
         else:self._aggregate(affected|self.changed)
         gaps=set(gaps)|sharing_gaps
         complete=complete and not sharing_gaps

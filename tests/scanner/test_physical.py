@@ -16,6 +16,7 @@ from machine_audit.scanner.native import Volume
 from machine_audit.scanner.policy import Policy
 from machine_audit.scanner.runner import relist
 from machine_audit.scanner.store import MapStore, MapQuery
+from machine_audit.scanner.encoding import source_id
 from machine_audit.scanner.walker import Node, Walker
 
 SCRATCH = Path(__file__).parent / '.tmp'
@@ -200,6 +201,36 @@ class SharedCopiesQueryTests(unittest.TestCase):
         shared = answer['folder']['shared_between_rows']
         self.assertEqual(shared, 2_300_000_000)
         self.assertEqual(sum(r['physical'] for r in answer['rows']) - shared + volume['not_placed'], volume['volume_used'])
+
+
+class SharingUpdateCostTests(unittest.TestCase):
+    def test_relisting_one_copy_of_a_large_family_totals_only_it_and_its_ancestors(self):
+        # Re-walking one of a browser's 104 code-signing clones re-totalled all
+        # 170 k folders of the family (203 s on Big Mac's map): every folder of a
+        # touched group was treated as changed, though its terms were not.
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
+            store = MapStore(Path(temp) / 'scanner.sqlite', Budget(temp, free_margin_bytes=0))
+            self.addCleanup(store.close)
+            volume = Volume('v', 'Synthetic', '/synthetic', 'apfs', 1, 100 * GB, 50 * GB, 50 * GB, 50 * GB)
+            extents = {f'f{k}': [(0, GB), (10 * GB + k * GB, MB)] for k in range(50)}
+            def copy(k):
+                store.directory(Node(f'c{k}', 'family', f'c{k}', 'directory', GB + MB, 0, 'observed', None, 0))
+                store.holder(f'f{k}', f'c{k}', f'f{k}', GB + MB, MB, True)
+            store.prepare(volume)
+            store.directory(Node('root', None, 'root', 'directory', 0, 0, 'observed', None, 0))
+            store.directory(Node('family', 'root', 'family', 'directory', 0, 0, 'observed', None, 0))
+            for k in range(50):
+                copy(k)
+            store.finish_volume(volume, extents.__getitem__, [], full=True, lean=True)
+            before = MapQuery(store.path).query('volumes')['rows'][0]['physical']
+            store.prepare(volume, full=False)
+            staged = store.generation
+            store.begin_directory('c7')
+            copy(7)
+            store.finish_volume(volume, extents.__getitem__, [], full=False, lean=True)
+            written = {r[0] for r in store.db.execute('SELECT id FROM nodes WHERE generation=?', (staged,))}
+            self.assertEqual({str(source) for source in map(source_id, written)}, {'c7', 'family', 'root'})
+            self.assertEqual(MapQuery(store.path).query('volumes')['rows'][0]['physical'], before)
 
 
 class FormatConversionTests(unittest.TestCase):
