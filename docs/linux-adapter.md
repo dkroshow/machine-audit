@@ -170,7 +170,7 @@ equivalents: CPU times, resident set, swap and disk bytes.
 - `scanner/linux.py` walks each local disk filesystem from mountinfo (volume
   id: the capacity source's salted `f_fsid`) with the shared walker:
   `os.scandir`, `st_blocks` bytes, hard links charged once. ext4 shares no
-  blocks: a complete map is `observed` with uses (hard links once) and the
+  blocks: a complete map is `observed` with physical space (hard links once per folder) and the
   gap `physical_residual_not_computed`; no residual is claimed. A volume
   root the service user cannot read (an EFI partition) is a `denied` gap on
   that volume; the run still completes. It is retried on the full-walk

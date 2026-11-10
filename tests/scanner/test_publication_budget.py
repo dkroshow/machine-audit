@@ -9,7 +9,6 @@ import unittest
 from unittest.mock import patch
 
 from machine_audit.budget import Budget, BudgetExceeded
-from machine_audit.scanner.accounting import Blocks
 from machine_audit.scanner.events import next_action
 from machine_audit.scanner.native import Volume
 from machine_audit.scanner.policy import Policy
@@ -40,7 +39,7 @@ class PublicationBudgetTests(unittest.TestCase):
         """Everything a reader can see: pointer, published map rows and history."""
         generation = store.db.execute("SELECT generation FROM volumes WHERE id='v'").fetchone()[0]
         evidence = [tuple(store.db.execute("SELECT * FROM volumes WHERE id='v'").fetchone())]
-        for table in ('nodes', 'files', 'holders', 'charges', 'listings'):
+        for table in ('nodes', 'files', 'holders', 'streams', 'terms', 'listings'):
             evidence.append([tuple(r) for r in store.db.execute(
                 f'SELECT * FROM {table} WHERE generation=? ORDER BY 2,3,4', (generation,))])
         for table in ('points', 'tracked', 'hierarchy_epochs', 'hierarchy_nodes', 'dirty'):
@@ -77,10 +76,11 @@ class PublicationBudgetTests(unittest.TestCase):
         row = tuple(store.db.execute("SELECT * FROM runs WHERE id='old'").fetchone())
         self.assertEqual(row[:12],original)
         self.assertEqual(row[12:],(None,None,None,None,None))
-        self.assertEqual(tuple(store.db.execute('SELECT full_ns,full_attempt_ns,budget_retry_bytes,delta_generation FROM volumes').fetchone()),
-                         (17,None,None,None))
-        # Format 3 fences readers of format 2 only away from a partly merged base.
-        self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 3)
+        # Format 4 retires every map for one full walk: its old folder figures meant
+        # something else. Run evidence and deferred folders stay.
+        self.assertEqual(tuple(store.db.execute('SELECT full_ns,full_attempt_ns,budget_retry_bytes,delta_generation,status FROM volumes').fetchone()),
+                         (None,None,None,None,'awaiting_physical_walk'))
+        self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 4)
         self.assertEqual(tuple(store.db.execute('SELECT * FROM dirty').fetchone()),('v','9',5,None))
         store.start('scheduled')
         store.phase('walk',volume_id='v',action='full',trigger='event_kernel_drop')
@@ -101,7 +101,7 @@ class PublicationBudgetTests(unittest.TestCase):
         kept = [(str(i), '2', 'Kept '+str(i), 4096, i) for i in range(10, 3010)]
         for row in kept:store.file(*row)
         store.holder('0', '2', 10, 100, None, False)
-        store.finish_volume(self.volume, Blocks(), [], full=True, lean=True, bookmark=10)
+        store.finish_volume(self.volume, None, [], full=True, lean=True, bookmark=10)
         # The inert payload models retained history. It must not reserve a
         # second copy when one folder changes or existing schema is reopened.
         with store.write(rows=2, payload_bytes=8*1024**2):
@@ -142,14 +142,14 @@ class PublicationBudgetTests(unittest.TestCase):
         store.clear_subtree('3')
         limit, budget.limit_bytes = budget.limit_bytes, budget.usage()['bytes']+1_000_000
         with self.assertRaisesRegex(BudgetExceeded, 'sqlite_checkpoint_headroom'):
-            store.finish_volume(self.volume, Blocks(), [], full=False, lean=True, bookmark=11)
+            store.finish_volume(self.volume, None, [], full=False, lean=True, bookmark=11)
         self.assertEqual(store.run_context['stage'], 'publication')
         self.assertEqual(self.published(store), old, 'a refused publication changed published evidence')
         budget.limit_bytes = limit
-        result = store.finish_volume(self.volume, Blocks(), [], full=False, lean=True, bookmark=11)
+        result = store.finish_volume(self.volume, None, [], full=False, lean=True, bookmark=11)
         store.progress(status='complete')
-        self.assertEqual(result['uses'], 3*GB)
-        self.assertEqual(MapQuery(self.path).query()['rows'][0]['uses'], 3*GB)
+        self.assertEqual(result['physical'], 3*GB)
+        self.assertEqual(MapQuery(self.path).query()['rows'][0]['physical'], 3*GB)
         published = store.generation
         self.assertEqual(store.db.execute('SELECT count(*) FROM files WHERE generation=?', (published,)).fetchone()[0], 3001)
         self.assertEqual(store.db.execute("SELECT count(*) FROM files WHERE generation=? AND label LIKE 'Kept%'",
@@ -182,8 +182,8 @@ class PublicationBudgetTests(unittest.TestCase):
         volume = Volume('v', 'Synthetic', str(tree), 'hfs', tree.stat().st_dev, 10**12, 1, 1, 10**9)
         policy = Policy(home=str(tree.parent), homes=[])
         store = MapStore(data/'scanner.sqlite', Budget(data, free_margin_bytes=0))
-        store.prepare(volume);walker = Walker(volume, policy, store, Blocks());walker.walk()
-        store.finish_volume(volume, walker.blocks, walker.gaps, full=True, lean=True, bookmark=1)
+        store.prepare(volume);walker = Walker(volume, policy, store);walker.walk()
+        store.finish_volume(volume, None, walker.gaps, full=True, lean=True, bookmark=1)
         with store.write(rows=2, payload_bytes=padding):  # Retained history the bound must copy.
             store.db.execute('CREATE TABLE padding(value BLOB)')
             store.db.execute('INSERT INTO padding VALUES(zeroblob(?))', (padding,))
@@ -218,7 +218,7 @@ class PublicationBudgetTests(unittest.TestCase):
                 queue(query, args)
                 if len(store.buffer) >= batch:store.flush()
             store._queue = batched
-        walker = Walker(volume, policy, store, Blocks())
+        walker = Walker(volume, policy, store)
         self.assertTrue(relist(store, walker, policy, volume, 1, []))
         return walker
 
@@ -237,7 +237,7 @@ class PublicationBudgetTests(unittest.TestCase):
         store = MapStore(data/'scanner.sqlite', budget);self.addCleanup(store.close)
         seen = self.counted(store)
         walker = self.update(store, volume, policy, batch=64)
-        store.finish_volume(volume, walker.blocks, walker.gaps, full=False, lean=True, bookmark=2)
+        store.finish_volume(volume, None, walker.gaps, full=False, lean=True, bookmark=2)
         for stage, declared, changes, pages, frames in seen:
             self.assertGreaterEqual(declared, changes);self.assertLessEqual(frames, pages)
         (_, declared, changes, pages, frames), = [entry for entry in seen if entry[0]=='publication']
@@ -261,7 +261,7 @@ class PublicationBudgetTests(unittest.TestCase):
             for d in (3,4,5,20,21):
                 ino = str((big/f'd{d}').stat().st_ino)
                 store.db.execute("INSERT INTO tracked VALUES('v',?,?)", (ino, str(big.stat().st_ino)))
-                store.db.execute("INSERT INTO points VALUES('v',?,1,?,'uses',2000000000,'observed')", (ino, f'd{d}'))
+                store.db.execute("INSERT INTO points VALUES('v',?,1,?,'physical',2000000000,'observed')", (ino, f'd{d}'))
         tracked = {d:str((big/f'd{d}').stat().st_ino) for d in (3,4,5,20,21)}
         for d in (10,11):(big/f'd{d}'/'f').write_bytes(b'y'*20000)            # resized
         (big/'d12'/'f').unlink()                                               # deleted
@@ -271,28 +271,28 @@ class PublicationBudgetTests(unittest.TestCase):
         os.link(big/'d1'/'f', big/'d24'/'linked')                              # another shared holder
         def published():
             return [store.db.execute(f'SELECT * FROM {t} WHERE generation=(SELECT generation FROM volumes) ORDER BY 3,4').fetchall()
-                    for t in ('nodes','files','holders','charges','listings')]
+                    for t in ('nodes','files','holders','streams','terms','listings')]
         before = published()
         walker = self.update(store, volume, policy)
         with patch('machine_audit.scanner.store.save_hierarchy', side_effect=RuntimeError('synthetic publication failure')):
             with self.assertRaisesRegex(RuntimeError, 'synthetic publication failure'):
-                store.finish_volume(volume, walker.blocks, walker.gaps, full=False, lean=True, bookmark=2)
+                store.finish_volume(volume, None, walker.gaps, full=False, lean=True, bookmark=2)
         self.assertEqual(published(), before, 'a failed publication changed the published map')
         seen = self.counted(store)
-        store.finish_volume(volume, walker.blocks, walker.gaps, full=False, lean=True, bookmark=2)
+        store.finish_volume(volume, None, walker.gaps, full=False, lean=True, bookmark=2)
         for stage, declared, changes, pages, frames in seen:
             self.assertGreaterEqual(declared, changes);self.assertLessEqual(frames, pages)
         (_, declared, changes, pages, frames), = [entry for entry in seen if entry[0]=='publication']
         self.assertGreaterEqual(declared, changes);self.assertLessEqual(frames, pages)
         reference = MapStore(self.root/'reference'/'scanner.sqlite', Budget(self.root/'reference', free_margin_bytes=0))
         self.addCleanup(reference.close)
-        reference.prepare(volume);walker = Walker(volume, policy, reference, Blocks());walker.walk()
-        reference.finish_volume(volume, walker.blocks, walker.gaps, full=True, lean=True, bookmark=2)
+        reference.prepare(volume);walker = Walker(volume, policy, reference);walker.walk()
+        reference.finish_volume(volume, None, walker.gaps, full=True, lean=True, bookmark=2)
         def mapped(map_store):
             # Rows by identity; the generation and listing times differ by design.
             g, = map_store.db.execute('SELECT generation FROM volumes').fetchone()
             rows = [sorted(tuple(r)[1:] for r in map_store.db.execute(f'SELECT * FROM {t} WHERE generation=?', (g,)))
-                    for t in ('nodes','files','holders','charges')]
+                    for t in ('nodes','files','holders','streams','terms')]
             return rows+[sorted((r[2],r[4]) for r in map_store.db.execute('SELECT * FROM listings WHERE generation=?', (g,)))]
         self.assertEqual(mapped(store), mapped(reference))
         self.assertGreater(len(mapped(store)[2]), 2, 'the fixture lost its shared holders')
@@ -306,7 +306,7 @@ class PublicationBudgetTests(unittest.TestCase):
         """What the public readers return for one volume: totals, every page of the
         children of each folder of interest, and the hot set."""
         query = MapQuery(path)
-        totals = [{k:row[k] for k in ('id','listed','uses','valid','mounted')} for row in query.query()['rows'] if row['id']==volume_id]
+        totals = [{k:row[k] for k in ('id','listed','physical','valid','mounted')} for row in query.query()['rows'] if row['id']==volume_id]
         pages = {}
         frontier = [None]
         while frontier:
@@ -314,7 +314,7 @@ class PublicationBudgetTests(unittest.TestCase):
             listed, cursor = [], None
             while True:
                 page = query.query('children', volume_id=volume_id, parent_id=parent, limit=7, **({'cursor':cursor} if cursor else {}))
-                listed += [(r['id'],r['label'],r['kind'],r['listed'],r['uses'],r['status']) for r in page['rows']]
+                listed += [(r['id'],r['label'],r['kind'],r['listed'],r['physical'],r['status']) for r in page['rows']]
                 cursor = page['next_cursor']
                 if not cursor:break
             pages[parent] = sorted(listed)
@@ -342,11 +342,11 @@ class PublicationBudgetTests(unittest.TestCase):
             for d in (5,6,7):
                 ino = str((big/f'd{d}').stat().st_ino)
                 store.db.execute("INSERT INTO tracked VALUES('v',?,?)", (ino, str(big.stat().st_ino)))
-                store.db.execute("INSERT INTO points VALUES('v',?,1,?,'uses',2000000000,'observed')", (ino, f'd{d}'))
+                store.db.execute("INSERT INTO points VALUES('v',?,1,?,'physical',2000000000,'observed')", (ino, f'd{d}'))
         other = self.root/'other';(other/'o').mkdir(parents=True)
         second = Volume('w', 'Other', str(other), 'hfs', other.stat().st_dev, 10**12, 1, 1, 10**9)
-        store.prepare(second);walker = Walker(second, policy, store, Blocks());walker.walk()
-        store.finish_volume(second, walker.blocks, walker.gaps, full=True, lean=True, bookmark=1)
+        store.prepare(second);walker = Walker(second, policy, store);walker.walk()
+        store.finish_volume(second, None, walker.gaps, full=True, lean=True, bookmark=1)
         old = self.readers(store.path)
         for i in range(140):(big/'reset'/f'r{i}').unlink()                     # one marker, several batches
         (big/'reset'/'new').write_bytes(b'n')
@@ -358,8 +358,8 @@ class PublicationBudgetTests(unittest.TestCase):
         os.link(big/'d1'/'f', big/'d24'/'linked')                              # another shared holder
         reference = MapStore(self.root/'reference'/'scanner.sqlite', Budget(self.root/'reference', free_margin_bytes=0))
         self.addCleanup(reference.close)
-        reference.prepare(volume);walker = Walker(volume, policy, reference, Blocks());walker.walk()
-        reference.finish_volume(volume, walker.blocks, walker.gaps, full=True, lean=True, bookmark=2)
+        reference.prepare(volume);walker = Walker(volume, policy, reference);walker.walk()
+        reference.finish_volume(volume, None, walker.gaps, full=True, lean=True, bookmark=2)
         new = self.readers(reference.path)
         self.assertNotEqual(new, old)
         walker = self.update(store, volume, policy)
@@ -382,7 +382,7 @@ class PublicationBudgetTests(unittest.TestCase):
                     raise RuntimeError('synthetic crash inside one marker')
         with patch('machine_audit.scanner.store.MERGE_ROWS', 64), patch.object(MapStore, 'write', watched):
             with self.assertRaises(MergePending):
-                store.finish_volume(volume, walker.blocks, walker.gaps, full=False, lean=True, bookmark=2)
+                store.finish_volume(volume, None, walker.gaps, full=False, lean=True, bookmark=2)
             delta = store.db.execute("SELECT delta_generation FROM volumes WHERE id='v'").fetchone()[0]
             self.assertIsNotNone(delta)
             self.assertEqual(left, [store.db.execute(reset).fetchone()[0]])
@@ -409,7 +409,7 @@ class PublicationBudgetTests(unittest.TestCase):
         while cursor:  # A cursor taken mid-merge pages on after the merge.
             page = MapQuery(store.path).query('children', volume_id='v', parent_id=str((big/'reset').stat().st_ino), limit=3, cursor=cursor)
             rows += page['rows'];cursor = page['next_cursor']
-        self.assertEqual(sorted((r['id'],r['label'],r['kind'],r['listed'],r['uses'],r['status']) for r in rows),
+        self.assertEqual(sorted((r['id'],r['label'],r['kind'],r['listed'],r['physical'],r['status']) for r in rows),
                          new[1][str((big/'reset').stat().st_ino)])
         latest = {}
         for identity, status in store.db.execute('SELECT id,status FROM points ORDER BY observed_ns'):latest[identity] = status
@@ -436,7 +436,7 @@ class PublicationBudgetTests(unittest.TestCase):
         seen = self.counted(store)
         walker = self.update(store, volume, policy, batch=64)
         with patch('machine_audit.scanner.store.MERGE_ROWS', 64):
-            store.finish_volume(volume, walker.blocks, walker.gaps, full=False, lean=True, bookmark=2)
+            store.finish_volume(volume, None, walker.gaps, full=False, lean=True, bookmark=2)
         self.assertIsNone(store.db.execute("SELECT delta_generation FROM volumes WHERE id='v'").fetchone()[0])
         changed = store.db.execute("""SELECT count(*) FROM files f JOIN volumes v ON f.generation=v.generation AND f.volume=v.key
                                       WHERE f.allocated>=4096""").fetchone()[0]
@@ -453,7 +453,7 @@ class PublicationBudgetTests(unittest.TestCase):
         self.node(store, 0)
         for identity, label in (('2','A'), ('3','B')):
             store.directory(Node(identity, '1', label, 'directory', 2*GB, 2*GB, 'observed', None, 0))
-        store.finish_volume(self.volume, Blocks(), [], full=True, lean=True, bookmark=1)
+        store.finish_volume(self.volume, None, [], full=True, lean=True, bookmark=1)
         store.close()
         with sqlite3.connect(self.path) as db:  # Format 2, as the previous release left it.
             db.execute('ALTER TABLE volumes DROP COLUMN delta_generation');db.execute('PRAGMA user_version=2')
@@ -498,7 +498,7 @@ class PublicationBudgetTests(unittest.TestCase):
         self.node(store, 0)
         for identity, label in (('2','A'), ('3','B')):
             store.directory(Node(identity, '1', label, 'directory', 2*GB, 2*GB, 'observed', None, 0))
-        store.finish_volume(self.volume, Blocks(), [], full=True, lean=True, bookmark=1)
+        store.finish_volume(self.volume, None, [], full=True, lean=True, bookmark=1)
         store.start('scheduled')
         store.prepare(self.volume, full=False)
         for identity, label in (('2','New A'), ('3','New B')):
@@ -510,7 +510,7 @@ class PublicationBudgetTests(unittest.TestCase):
                store.db.execute("SELECT delta_generation FROM volumes WHERE id='v'").fetchone()[0] is not None:
                 failed.append(path);raise OSError('synthetic failure releasing the reservation')
         with patch.object(Path, 'unlink', releasing), self.assertRaises(OSError):
-            store.finish_volume(self.volume, Blocks(), [], full=False, lean=True, bookmark=2)
+            store.finish_volume(self.volume, None, [], full=False, lean=True, bookmark=2)
         store.mark_failed('os_error_OSError')  # what the run's failure handler does
         state = "SELECT status,bookmark,budget_retry_bytes,delta_generation FROM volumes WHERE id='v'"
         published = tuple(store.db.execute(state).fetchone())
@@ -545,7 +545,7 @@ class PublicationBudgetTests(unittest.TestCase):
             store = MapStore(folder/'scanner.sqlite', Budget(folder, free_margin_bytes=0))
             self.addCleanup(store.close)
             store.prepare(self.volume);self.node(store, 0)
-            store.finish_volume(self.volume, Blocks(), [], full=True, lean=True)
+            store.finish_volume(self.volume, None, [], full=True, lean=True)
             with store.write(rows=count+2):  # a published delta that re-lists `count` folders
                 store.db.executemany('INSERT INTO reset_dirs VALUES(99,1,?)', ((i,) for i in range(count)))
                 store.db.execute("INSERT INTO generations VALUES(99,1,'delta')")
@@ -578,10 +578,10 @@ class PublicationBudgetTests(unittest.TestCase):
         self.addCleanup(store.close)
         store.prepare(self.volume)
         self.node(store, 2*GB)
-        store.finish_volume(self.volume, Blocks(), [], full=True, lean=True, bookmark=10)
+        store.finish_volume(self.volume, None, [], full=True, lean=True, bookmark=10)
         for _ in range(3):
             store.prepare(self.volume, full=False)
-            store.finish_volume(self.volume, Blocks(), [], full=False, lean=True, bookmark=10)
+            store.finish_volume(self.volume, None, [], full=False, lean=True, bookmark=10)
         row = store.db.execute('SELECT * FROM volumes').fetchone()
         self.assertEqual(row['no_progress'], 0)
         self.assertEqual(next_action(now_ns=row['observed_ns']+3600*10**9,
@@ -589,14 +589,14 @@ class PublicationBudgetTests(unittest.TestCase):
                          bookmark=row['bookmark'], no_progress=row['no_progress']), 'update')
         for _ in range(2):
             store.prepare(self.volume, full=False)
-            store.finish_volume(self.volume, Blocks(), [], full=False, lean=True,
+            store.finish_volume(self.volume, None, [], full=False, lean=True,
                                 bookmark=10, event_progress=False)
         for _ in range(3):
             store.prepare(self.volume, full=False)
-            store.finish_volume(self.volume, Blocks(), [], full=False, lean=True, bookmark=10)
+            store.finish_volume(self.volume, None, [], full=False, lean=True, bookmark=10)
         self.assertEqual(store.db.execute('SELECT no_progress FROM volumes').fetchone()[0], 2)
         store.prepare(self.volume, full=False)
-        store.finish_volume(self.volume, Blocks(), [], full=False, lean=True,
+        store.finish_volume(self.volume, None, [], full=False, lean=True,
                             bookmark=10, event_progress=True)
         self.assertEqual(store.db.execute('SELECT no_progress FROM volumes').fetchone()[0], 0)
 
@@ -607,7 +607,7 @@ class PublicationBudgetTests(unittest.TestCase):
         self.node(store, 0)
         for identity, parent, size in (('2', '1', 0), ('3', '2', GB), ('4', '2', GB)):
             store.directory(Node(identity, parent, 'Folder '+identity, 'directory', size, size, 'observed', None, 0))
-        store.finish_volume(self.volume, Blocks(), [], full=True, lean=True)
+        store.finish_volume(self.volume, None, [], full=True, lean=True)
         self.assertEqual(store.db.execute('SELECT count(*) FROM tracked').fetchone()[0], 4)
         store.prepare(self.volume, full=False)
         store.clear_subtree('2')
@@ -621,7 +621,7 @@ class PublicationBudgetTests(unittest.TestCase):
             writes.append((kwargs['rows'], store.db.total_changes-before))
 
         store.write = record
-        store.finish_volume(self.volume, Blocks(), [], full=False, lean=True)
+        store.finish_volume(self.volume, None, [], full=False, lean=True)
         # The removed tracked identities' terminal points, the removed rows and the
         # hierarchy must all fit the publication's declared rows.
         declared, changes = writes[-1]

@@ -4,7 +4,6 @@ from dataclasses import dataclass
 import errno
 import os
 import stat
-from .accounting import Stream
 
 
 @dataclass(frozen=True)
@@ -14,7 +13,7 @@ class Node:
     label: str | None
     kind: str
     listed: int
-    uses: int
+    physical: int
     status: str
     path: str | None
     mtime_ns: int
@@ -26,8 +25,8 @@ def shown_path(volume, path):
 
 
 class Walker:
-    def __init__(self, volume, policy, sink, blocks, fs=None, grain='files', large_file_bytes=100_000_000):
-        self.volume, self.policy, self.sink, self.blocks, self.fs = volume, policy, sink, blocks, fs
+    def __init__(self, volume, policy, sink, fs=None, grain='files', large_file_bytes=100_000_000):
+        self.volume, self.policy, self.sink, self.fs = volume, policy, sink, fs
         self.grain, self.large_file_bytes = grain, large_file_bytes
         self.entries = 0
         self.listed=set()
@@ -104,7 +103,9 @@ class Walker:
                             private_marker = True
                     names &= not private_marker
                     self.sink.begin_directory(identity)
-                    own_listed = own_uses = st.st_blocks * 512
+                    # A folder's own physical bytes: itself and files that share no blocks.
+                    # Files that may share are holders, placed once the run knows their pieces.
+                    own_listed = own_physical = st.st_blocks * 512
                     children = []
                     outcome = 'observed'
                     seen_links = set()
@@ -127,7 +128,6 @@ class Walker:
                                     children.append((os.path.join(path, entry.name), identity, not names,True))
                                     continue
                                 alloc = child.st_blocks * 512
-                                # Use one global inode home for hard links, chosen deterministically.
                                 shared = None
                                 if stat.S_ISREG(child.st_mode) and self.fs:
                                     try:
@@ -135,21 +135,17 @@ class Walker:
                                     except OSError:
                                         self.sharing_complete = False
                                         self.gaps.add('sharing_unreadable')
-                                uses = alloc
                                 if child.st_nlink > 1 and child.st_ino in seen_links:
                                     continue
                                 if child.st_nlink > 1:
                                     seen_links.add(child.st_ino)
+                                # Listed counts every entry in full, as Finder does, hard links included.
+                                own_listed += alloc
                                 if shared is not None or child.st_nlink > 1:
                                     stream, private, partial = shared or (child.st_ino, None, False)
                                     self.sink.holder(child.st_ino, identity, stream, alloc, private, partial)
-                                    own_listed += alloc
-                                    uses = 0
-                                    if shared and self.fs:
-                                        self.blocks.add(Stream(stream, identity, alloc, private, partial), self.fs.extents(fd, entry.name, child))
                                 else:
-                                    own_listed += alloc
-                                own_uses += uses
+                                    own_physical += alloc
                                 if self.grain == 'files' or alloc >= self.large_file_bytes or shared or child.st_nlink > 1:
                                     self.sink.file(str(child.st_ino), identity, entry.name if names else None, alloc, child.st_mtime_ns)
                             except OSError:
@@ -159,7 +155,7 @@ class Walker:
                         self.gaps.add('directory_moved')
                         outcome = 'partial'
                     self.sink.directory(Node(identity, parent, label, 'private' if not names else 'directory',
-                                             own_listed, own_uses, outcome, path if names else None, st.st_mtime_ns))
+                                             own_listed, own_physical, outcome, path if names else None, st.st_mtime_ns))
                     self.sink.listed(identity,direct_count)
                     self.listed.add(identity)
                     if path==root:root_listed=True

@@ -59,33 +59,80 @@ rather than forcing them to.
 allocated size, link count, dates, whether the file may share blocks. The
 walk visits every file on every machine, because a folder's size is only
 known by visiting its contents; what is *stored* is a per-machine
-[grain](#grain-process-and-cost). Each folder keeps three figures:
+[grain](#grain-process-and-cost). Each folder keeps three figures, and the
+main view shows one of them:
 
-- **Listed:** each file at its allocated size, every copy in full, as `du`
-  and Finder count. Can exceed what the disk holds.
-- **Uses:** each shared block once, in the folder of its oldest copy. The
-  readouts lead with it, listed beside it when at least 10% and 1 GB larger.
-  APFS clones, partly changed copies and hard links are the cases;
-  the prototype's stream and block-map method carries, including its known
-  limit: copies made since the last full scan can count shared blocks twice
-  until the next one. **Unsupported on Ubuntu by default:** ext4 shares
-  nothing beyond hard links, counted once by inode; btrfs and XFS reflinks
-  would need the `FIEMAP` shared-extent flag, unverified. Ubuntu folders
-  report listed and say uses was not computed.
-- **Frees:** what deleting would give back. Never exact, never adds up.
+- **Physical:** the space the folder's files take on the disk, each block
+  counted once however many of its files hold it. A block shared with a copy
+  outside the folder counts here and in the copy's folder too: it is part of
+  what fills the disk wherever a copy is. This is the headline and the only
+  size in the main view. A file's row shows its allocated size, which is its
+  own physical space.
+- **Listed:** each entry at its allocated size, every copy and every hard link
+  in full, as Finder counts. It can exceed what the disk holds. Copying,
+  moving or backing the folder up to another disk would take about this much.
+- **Frees:** the blocks every copy of which is inside the folder: about what
+  deleting it would give back while snapshots are not holding the blocks.
 
-**Reconciling the map with the volume.** Attributed uses plus a separately
-labelled residual, **not attributed**, equal the volume's used space from the
-same run only when the run passes the validity check: if the folders' uses
-ever exceed what the volume holds, the folder figures are withheld until the
-next full scan, never rescaled. On Ubuntu, listed is not a physical measure,
-so used and listed are shown side by side and no residual is claimed.
+A folder is marked with an asterisk when Finder shows at least 10% and 1 GB
+more than its physical space, or when at least 10% and 1 GB of its physical
+space is shared with copies outside it. The asterisk opens one plain note:
+it shares data with copies elsewhere (APFS clones, hard links, snapshots);
+Finder and du show X, and copying, moving or backing up elsewhere would take
+about X; deleting it frees about Y (or "frees less") while the other copies
+remain. X is listed and Y is frees; the query returns both, and the rule
+lives in `accounting.asterisk`.
+
+**How physical is measured.** APFS flags every file that may share blocks.
+Only those files need their extents: on Big Mac 1.5 M of 13.5 M files, in
+477 k clone ids. Files that share a clone id share all their extents, so a run
+reads one file of each clone id and every changed clone, by inode through
+`/.vol/<device>/<inode>` with `F_LOG2PHYS_EXT`, about 70 µs of CPU each. Every
+other file's physical size is its allocation. A sweep over the extents splits
+the shared bytes into pieces, each held by one set of streams, and joins
+streams that share any piece into a sharing group. Each piece becomes byte
+terms on folders: plus its size at each folder holding a copy, minus its size
+for each extra branch where copies meet. Summed over a subtree, as every other
+total is, the terms count the piece once in every folder holding a copy. A
+second term at the copies' common ancestor gives frees. Extents exist only in
+memory during the run; the map keeps stream keys, groups and byte terms,
+never block addresses.
+
+An hourly update re-reads the extents of every stream in the groups it
+touches, so a changed copy is measured against the unchanged copies it shares
+blocks with. At most 20,000 streams are read in one update; above that the
+update counts each stream once by its allocation and reports
+`sharing_reread_capped` until the next full walk. A copy made since the last
+full walk and already changed when the update sees it has its own stream and
+a partner the update cannot know without saved addresses. APFS reports how
+many of its bytes are private; the rest is counted where the partner is. Its
+own folder then shows less than its physical space until the next full walk,
+the volume total stays exact, and the run reports
+`shared_copy_placed_at_full_walk` with the bytes (`unplaced_shared`).
+
+**Unsupported on Ubuntu by default:** ext4 shares nothing beyond hard links,
+which count once per folder by inode; btrfs and XFS reflinks would need the
+`FIEMAP` shared-extent flag, unverified. Ubuntu folders report physical as
+allocated space with hard links once, and no residual is claimed.
+
+**Reconciling the map with the volume.** The volume's root total, physical in
+folders, plus a separately labelled line, **not placed in a folder**, equal
+the volume's used space read after the walk. Not placed covers snapshots,
+file-system records and areas the scanner cannot read. Folders may exceed used
+space by up to max(1 GB, the change in used space during the walk), because
+files change while the walk runs; beyond that the folder figures are withheld
+until the next full scan, never rescaled. Rows on one page can add to more
+than their folder when they share blocks with each other; the page states that
+amount ("shared between the rows") when it is at least 1 GB, so rows, that
+line and not placed add up. On Ubuntu used and listed are shown side by side
+and no residual is claimed.
 
 **Change.** Every update saves a size point for each folder of 1 GB or more
-(10^9 bytes) whose size changed since its last point, uses beside listed. The
-1 GB test and the reported growth use uses where it was computed and listed
-otherwise, the metric named on every point; the two are never subtracted
-from each other. Lifecycle rules, so growth answers are honest:
+(10^9 bytes) whose size changed since its last point. The 1 GB test and the
+reported growth use physical where it was computed and listed otherwise, the
+metric named on every point; the two are never subtracted from each other.
+Points saved before physical space was measured carry the metric `uses`, so
+growth across that change is not claimed. Lifecycle rules, so growth answers are honest:
 
 - A folder is tracked by the identity its filesystem exposes (volume plus
   file id on APFS, device plus inode on Linux), not by path. A rename or move
@@ -153,7 +200,7 @@ makes the store smaller and keeps fewer names. *Every file* (Big Mac): file
 browsing, largest-file lists, "this file appeared Tuesday". *Folders, large
 files and shared-block files* (default elsewhere): every folder; files above
 a threshold, working figure 100 MB; every file that may share blocks or is
-hard-linked, because uses needs them. Both grains keep the same change
+hard-linked, because physical space needs them. Both grains keep the same change
 points; the first Big Mac run measures the difference.
 
 **Its own process.** `machine-audit scan` runs beside the collector at
@@ -227,7 +274,7 @@ the person's decision.
 
 Validate on Big Mac: full-scan and hourly-update time, CPU, bytes written and
 peak memory at both grains, and collector lateness while they run; listed and
-uses against the prototype's figures; the gaps list against its listing. On
+physical against measured clone folders; the gaps list against its listing. On
 Ubuntu: filesystem layout and whether parts add up; nightly walk cost;
 `/proc/<pid>/io` access for own and other users' processes; whether `FIEMAP`
-reports shared extents, before uses is offered.
+reports shared extents, before shared blocks are counted once.

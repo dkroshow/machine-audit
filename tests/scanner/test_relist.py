@@ -8,7 +8,6 @@ import unittest
 from unittest.mock import patch
 
 from machine_audit.budget import Budget
-from machine_audit.scanner.accounting import Blocks
 from machine_audit.scanner.native import Volume
 from machine_audit.scanner.policy import Policy
 from machine_audit.scanner.runner import relist
@@ -29,12 +28,12 @@ class RelistTests(unittest.TestCase):
 
     def baseline(self):
         self.store.prepare(self.volume)
-        walker=Walker(self.volume,self.policy,self.store,Blocks());walker.walk()
-        self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=True,lean=True)
+        walker=Walker(self.volume,self.policy,self.store);walker.walk()
+        self.store.finish_volume(self.volume, None,walker.gaps,full=True,lean=True)
         self.store.prepare(self.volume,full=False)
 
     def update(self,path,recursive=False):
-        walker=Walker(self.volume,self.policy,self.store,Blocks())
+        walker=Walker(self.volume,self.policy,self.store)
         relist(self.store,walker,self.policy,self.volume,0,[(str(path),recursive)])
         return walker
 
@@ -45,7 +44,7 @@ class RelistTests(unittest.TestCase):
         (parent/'new').mkdir();(parent/'new'/'added').write_bytes(b'new')
         walker=self.update(parent/'missing')
         self.assertEqual(walker.entries,3,'ordinary missing event walked an unchanged subtree')
-        self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=False,lean=True)
+        self.store.finish_volume(self.volume, None,walker.gaps,full=False,lean=True)
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM files WHERE generation=?',(self.store.generation,)).fetchone()[0],31)
 
     def test_vanished_recursive_directory_leaves_the_map_without_its_subtree(self):
@@ -57,9 +56,9 @@ class RelistTests(unittest.TestCase):
         self.baseline()
         for i in range(5):(gone/str(i)).unlink()
         gone.rmdir()  # Disposable test directory only.
-        walker=Walker(self.volume,self.policy,self.store,Blocks())
+        walker=Walker(self.volume,self.policy,self.store)
         self.assertTrue(relist(self.store,walker,self.policy,self.volume,0,[(str(gone),True)]))
-        self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=False,lean=True)
+        self.store.finish_volume(self.volume, None,walker.gaps,full=False,lean=True)
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM files WHERE generation=?',(self.store.generation,)).fetchone()[0],1)
 
     def test_vanished_directory_with_descendants_leaves_no_orphans(self):
@@ -71,9 +70,9 @@ class RelistTests(unittest.TestCase):
         self.baseline()
         for i in range(5):(gone/str(i)).unlink()
         gone.rmdir()  # Disposable test directory only.
-        walker=Walker(self.volume,self.policy,self.store,Blocks())
+        walker=Walker(self.volume,self.policy,self.store)
         self.assertTrue(relist(self.store,walker,self.policy,self.volume,0,[(str(gone),False)]))
-        self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=False,lean=True)
+        self.store.finish_volume(self.volume, None,walker.gaps,full=False,lean=True)
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM files WHERE generation=?',(self.store.generation,)).fetchone()[0],1)
 
     def test_unreadable_changed_directory_keeps_its_map_and_is_deferred(self):
@@ -87,12 +86,12 @@ class RelistTests(unittest.TestCase):
         for target,event in ((inner,inner),(locked,inner)):
             target.chmod(0)
             try:
-                walker=Walker(self.volume,self.policy,self.store,Blocks())
+                walker=Walker(self.volume,self.policy,self.store)
                 self.assertTrue(relist(self.store,walker,self.policy,self.volume,0,[(str(event),True)]))
             finally:target.chmod(0o700)
         self.assertIn('denied',walker.gaps)
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM dirty').fetchone()[0],1)
-        self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=False,lean=True)
+        self.store.finish_volume(self.volume, None,walker.gaps,full=False,lean=True)
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM files WHERE generation=?',(self.store.generation,)).fetchone()[0],3)
 
     def test_child_event_attaches_to_a_parent_replaced_during_the_run(self):
@@ -113,10 +112,10 @@ class RelistTests(unittest.TestCase):
         def stat_once(path,*args,**kwargs):
             if gone and path==gone[0]:gone.clear();raise FileNotFoundError(errno.ENOENT,'gone',path)
             return real_stat(path,*args,**kwargs)
-        walker=Walker(self.volume,self.policy,self.store,Blocks())
+        walker=Walker(self.volume,self.policy,self.store)
         with patch.object(Walker,'directory_identity',gone_once),patch('machine_audit.scanner.runner.os.stat',stat_once):
             self.assertTrue(relist(self.store,walker,self.policy,self.volume,0,[(str(parent),False),(str(child),False)]))
-        self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=False,lean=True)
+        self.store.finish_volume(self.volume, None,walker.gaps,full=False,lean=True)
         self.assertEqual([r[0] for r in self.store.db.execute('SELECT label FROM files WHERE generation=?',(self.store.generation,))],['new'])
 
     def test_must_scan_still_recurses(self):
@@ -135,7 +134,7 @@ class RelistTests(unittest.TestCase):
     def test_inode_lookup_uses_the_walk_root_device_not_the_event_device_id(self):
         # Native volume.device comes from statfs/FSEvents, while a walk compares st_dev.
         volume=replace(self.volume,device=self.volume.device+1)
-        walker=Walker(volume,self.policy,self.store,Blocks())
+        walker=Walker(volume,self.policy,self.store)
         self.assertEqual(walker.directory_identity(str(self.tree)),str(self.tree.stat().st_ino))
 
     def test_private_event_updates_only_its_known_private_directory(self):
@@ -146,7 +145,7 @@ class RelistTests(unittest.TestCase):
         (private/'inner'/'sensitive').write_bytes(bytes(8192))
         walker=self.update(private/'inner')
         self.assertEqual(walker.entries,1,'private event rewalked the visible ancestor')
-        self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=False,lean=True)
+        self.store.finish_volume(self.volume, None,walker.gaps,full=False,lean=True)
         labels={r[0] for r in self.store.db.execute('SELECT label FROM nodes UNION SELECT label FROM files')}
         self.assertTrue({'inner','sensitive','Local State'}.isdisjoint(labels))
 
@@ -157,7 +156,7 @@ class RelistTests(unittest.TestCase):
         self.update(self.tree)
         (self.tree/'temporary').unlink()
         walker=self.update(self.tree)
-        self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=False,lean=True)
+        self.store.finish_volume(self.volume, None,walker.gaps,full=False,lean=True)
         self.assertEqual([r[0] for r in self.store.db.execute('SELECT label FROM files WHERE generation=?',(self.store.generation,))],['kept'])
 
     def test_failed_publication_keeps_dirty_refresh_until_successful_retry(self):
@@ -172,9 +171,9 @@ class RelistTests(unittest.TestCase):
         self.assertEqual([r[0] for r in pending()],[identity], 'a relist is not a published refresh')
         with patch('machine_audit.scanner.store.save_hierarchy',side_effect=RuntimeError('synthetic publication failure')):
             with self.assertRaisesRegex(RuntimeError,'synthetic publication failure'):
-                self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=False,lean=True)
+                self.store.finish_volume(self.volume, None,walker.gaps,full=False,lean=True)
         self.assertEqual([r[0] for r in pending()],[identity], 'rollback lost the deferred refresh')
-        self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=False,lean=True)
+        self.store.finish_volume(self.volume, None,walker.gaps,full=False,lean=True)
         self.assertEqual(pending(),[])
         self.assertEqual(self.store.db.execute('SELECT id FROM dirty').fetchone()[0],'not-observed')
 
@@ -203,11 +202,11 @@ class RelistTests(unittest.TestCase):
             with self.subTest(recursive=recursive):
                 self.store.prepare(self.volume,full=False)
                 with self.store.write(rows=1):self.store.db.execute('UPDATE dirty SET recursive=?',(recursive,))
-                walker=Walker(self.volume,self.policy,self.store,Blocks())
+                walker=Walker(self.volume,self.policy,self.store)
                 self.assertTrue(relist(self.store,walker,self.policy,self.volume,due,[]))
                 # Shallow: the folder's two entries and the new folder's two files.
                 self.assertEqual(walker.entries,entries)
-                self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=False,lean=True)
+                self.store.finish_volume(self.volume, None,walker.gaps,full=False,lean=True)
                 self.assertEqual(self.store.db.execute('SELECT count(*) FROM files WHERE generation=?',
                                                        (self.store.generation,)).fetchone()[0],32)
                 self.assertEqual(self.store.db.execute('SELECT count(*) FROM dirty').fetchone()[0],0)
@@ -219,10 +218,10 @@ class RelistTests(unittest.TestCase):
         self.store.prepare(self.volume,full=False)
         with self.store.write(rows=1):
             self.store.db.execute('UPDATE listings SET count=30000 WHERE id=inode_key(?)',(identity,))
-        walker=Walker(self.volume,self.policy,self.store,Blocks())
+        walker=Walker(self.volume,self.policy,self.store)
         self.assertTrue(relist(self.store,walker,self.policy,self.volume,due,[(str(big),True)]))
         self.assertEqual(walker.entries,35)
-        self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=False,lean=True)
+        self.store.finish_volume(self.volume, None,walker.gaps,full=False,lean=True)
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM files WHERE generation=?',
                                                (self.store.generation,)).fetchone()[0],33)
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM dirty').fetchone()[0],0)
@@ -249,7 +248,7 @@ class RelistTests(unittest.TestCase):
         self.assertEqual(walker.entries,300)
         self.assertLessEqual(sum(q=='BEGIN IMMEDIATE' for q in statements),4)
         self.assertEqual(self.store.db.execute('SELECT generation FROM volumes').fetchone()[0],published)
-        self.store.finish_volume(self.volume,walker.blocks,walker.gaps,full=False,lean=True)
+        self.store.finish_volume(self.volume, None,walker.gaps,full=False,lean=True)
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM files WHERE generation=?',(self.store.generation,)).fetchone()[0],150)
 
 

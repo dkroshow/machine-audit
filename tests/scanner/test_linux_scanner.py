@@ -11,7 +11,6 @@ import unittest
 from unittest.mock import patch
 
 from machine_audit.budget import Budget, BudgetExceeded
-from machine_audit.scanner.accounting import Blocks
 from machine_audit.scanner.linux import run_scan
 from machine_audit.scanner.native import Volume
 from machine_audit.scanner.store import MapQuery, MapStore, MergePending, hot_set
@@ -75,7 +74,7 @@ class LinuxScannerTests(unittest.TestCase):
         row = MapQuery(self.data / 'scanner.sqlite').query('volumes')['rows'][0]
         # First Linux scan: a complete ext4 map read "unavailable". Without an extents provider
         # the map is observed, uses charge hard links once, and no residual is claimed.
-        self.assertEqual((row['status'], row['valid'], row['uses'], row['not_attributed']), ('observed', True, row['listed'], None))
+        self.assertEqual((row['status'], row['valid'], row['physical'], row['not_placed']), ('observed', True, row['listed'], None))
         self.assertIn('physical_residual_not_computed', row['gaps'])
         self.assertEqual(self.scan()['volumes'][0]['status'], 'current')  # the same night, nothing changed
 
@@ -171,7 +170,7 @@ class LinuxScannerTests(unittest.TestCase):
         store.directory(Node('3', '1', 'media', 'directory', 0, 0, 'observed', str(tree / 'media'), 0))
         store.file('4', '3', 'film', 2 * 10**8, 0)
         store.directory(Node('5', '1', None, 'private', 3 * 10**9, 0, 'observed', None, 0))
-        store.finish_volume(volume, Blocks(), [], full=True, lean=False)
+        store.finish_volume(volume, None, [], full=True, lean=False)
         store.close()
         rows = hot_set(self.data / 'scanner.sqlite', 10)
         self.assertEqual(rows, [('v', '1', None, str(tree)), ('v', '2', '1', str(tree / 'big')),

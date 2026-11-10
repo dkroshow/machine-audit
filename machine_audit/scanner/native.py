@@ -1,4 +1,4 @@
-"""macOS volume metadata and event-only shared-extent reads."""
+"""macOS volume metadata and event-only shared-extent reads by inode."""
 from __future__ import annotations
 import ctypes as C
 import os
@@ -109,17 +109,27 @@ class MacFilesystem:
         at += 8
         refs = struct.unpack_from('=I', buf.raw, at)[0] if attrs[4] & 0x1000 else None
         partial = refs is not None and refs < 2 and private is not None and private < st.st_blocks * 512
+        if getattr(st, 'st_flags', 0) & 0x20:
+            # A compressed file's private size describes its empty data fork.
+            private = None
         return clone if not partial else -st.st_ino, private, partial
 
-    def extents(self, parent_fd, name, st):
-        flags = os.O_RDONLY | 0x8000 | 0x20000000 | os.O_CLOEXEC
-        # Compressed files keep their physical data in the resource fork.
-        path = name + '/..namedfork/rsrc' if getattr(st, 'st_flags', 0) & 0x20 else name
-        fd = os.open(path, flags, dir_fd=parent_fd)
+    def extents(self, device, inode):
+        """A file's allocated byte ranges, opened by volume device and inode. No
+        name is needed, so a file in a name-withheld folder reads the same way."""
+        base = f'/.vol/{device}/{inode}'
+        flags = os.O_RDONLY | 0x8000 | os.O_CLOEXEC  # O_EVTONLY: never holds the volume busy
+        fd = os.open(base, flags)
         try:
             current = os.fstat(fd)
-            if (current.st_dev, current.st_ino) != (st.st_dev, st.st_ino) or not stat.S_ISREG(current.st_mode):
+            if current.st_ino != inode or not stat.S_ISREG(current.st_mode):
                 raise OSError('file_changed_during_read')
+            if getattr(current, 'st_flags', 0) & 0x20:
+                # Compressed files keep their physical data in the resource fork.
+                data, fd = fd, os.open(base + '/..namedfork/rsrc', flags)
+                os.close(data)
+                current = os.fstat(fd)
+            found = []
             position = 0
             while position < current.st_size:
                 info = Log2Phys(length=current.st_size-position, offset=position)
@@ -127,8 +137,9 @@ class MacFilesystem:
                 if not 0 < info.length <= current.st_size-position:
                     raise OSError('invalid_extent')
                 if info.offset >= 0:
-                    # Convert to allocated block boundaries, as the reference scanner does.
-                    yield info.offset // 4096 * 4096, (info.length + 4095) // 4096 * 4096
+                    # Holes report a negative offset. Count whole allocation blocks.
+                    found.append((info.offset // 4096 * 4096, (info.length + 4095) // 4096 * 4096))
                 position += info.length
+            return found
         finally:
             os.close(fd)

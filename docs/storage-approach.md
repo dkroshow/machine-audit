@@ -90,6 +90,12 @@ process passes of the unfinished minute). It still recovers formats 1 and 2 from
 releases before it. A release before it can read none of these, so going back means
 starting a new store.
 
+The scanner's map is format 4 once converted: folders measure physical space
+([storage view](storage-view.md#source-to-record-to-answer)). Conversion retires
+every map for one full walk and keeps points, tracked folders, hierarchy and run
+evidence. Releases before it refuse format 4, so going back means restoring a copy
+of the format 3 file taken before the upgrade, or starting a new map.
+
 Counted writes reserve their transaction's growth and journal pages, rather
 than another copy of the entire database. Emergency pruning starts at 90% of the
 combined cap; admission can prune earlier when the pending transaction needs more
@@ -108,9 +114,9 @@ headroom and sets SQLite `max_page_count` accordingly. Cache spilling remains
 off; each transaction checkpoints before the next admission.
 
 Collector flushes supply actual row and packed-payload counts. Scanner buffered
-inserts are bounded at 8,192 operations or 2 MiB of arguments, charge writes at
-4,096 rows, aggregate updates at 8,192 rows and obsolete-generation deletes at
-4,096 rows. Regressions measure their WAL frames against the declared allowance.
+inserts, sharing's stream and term rows among them, are bounded at 8,192
+operations or 2 MiB of arguments, aggregate updates at 8,192 rows and
+obsolete-generation deletes at 4,096 rows. Regressions measure their WAL frames against the declared allowance.
 This factor is a product transaction contract, not a general SQLite guarantee.
 Scanner sharing and ancestor totals are staged in counted batches. A full walk's
 publication counts upper bounds for its point, hierarchy and metadata writes and

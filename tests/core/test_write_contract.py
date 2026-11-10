@@ -6,7 +6,6 @@ import tempfile
 import unittest
 
 from machine_audit.budget import Budget
-from machine_audit.scanner.accounting import Blocks
 from machine_audit.scanner.native import Volume
 from machine_audit.scanner.store import MapStore
 from machine_audit.scanner.walker import Node
@@ -69,7 +68,7 @@ class WriteContractTests(unittest.TestCase):
             for n in range(8192):
                 store.directory(Node(str(n+1),None if n==0 else '1',str(n),'directory',1,1,'observed',None,0))
             for n in range(4096):store.holder(n+10000,'1',n+10000,1,None,False)
-            store.finish_volume(volume,Blocks(),[],full=True,lean=True)
+            store.finish_volume(volume, None,[],full=True,lean=True)
             self.assertIn(8192,[r[0] for r in self.budget.samples])
             self.assertIn(4096,[r[0] for r in self.budget.samples])
             self.assert_bounds()

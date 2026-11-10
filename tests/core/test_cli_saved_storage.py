@@ -14,7 +14,6 @@ import machine_audit
 from machine_audit.budget import Budget
 from machine_audit.config import Config
 from machine_audit.model import Clock, Field, Reading, Record
-from machine_audit.scanner.accounting import Blocks
 from machine_audit.scanner.native import Volume
 from machine_audit.scanner.store import MapStore
 from machine_audit.scanner.walker import Node
@@ -55,11 +54,11 @@ class SavedStorageCliTests(unittest.TestCase):
                         for node in (
                             Node(prefix + '-root', None, 'Root', 'directory', 0, 0, 'observed', None, 0),
                             Node(prefix + '-parent', prefix + '-root', 'Parent', 'directory', 0, 0, 'observed', None, 0),
-                            Node(prefix + '-child-1', prefix + '-parent', 'Child one', 'directory', 2 * GB + extra, 0, 'observed', None, 0),
-                            Node(prefix + '-child-2', prefix + '-parent', 'Child two', 'directory', 3 * GB + extra, 0, 'observed', None, 0),
+                            Node(prefix + '-child-1', prefix + '-parent', 'Child one', 'directory', 2 * GB + extra, 2 * GB + extra, 'observed', None, 0),
+                            Node(prefix + '-child-2', prefix + '-parent', 'Child two', 'directory', 3 * GB + extra, 3 * GB + extra, 'observed', None, 0),
                         ):
                             scanner.directory(node)
-                        scanner.finish_volume(volume, Blocks(), [], full=True, lean=True)
+                        scanner.finish_volume(volume, None, [], full=True, lean=True)
         finally:
             scanner.close()
         # No token file: the real client takes its not-running path without a

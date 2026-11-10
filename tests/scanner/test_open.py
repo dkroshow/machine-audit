@@ -12,7 +12,6 @@ import unittest
 from unittest.mock import Mock, patch
 
 from machine_audit.budget import Budget, BudgetExceeded
-from machine_audit.scanner.accounting import Blocks
 from machine_audit.scanner.events import Replay
 from machine_audit.scanner.errors import ScanError
 from machine_audit.scanner.native import Volume
@@ -39,7 +38,7 @@ class DarwinDirectoryOpenTests(unittest.TestCase):
         volume = Volume('synthetic', 'Synthetic', str(self.root), 'hfs', 0, 100, 50, 50, 50)
         # Empty directories need no sharing calls; the sentinel selects native
         # open flags while real os.open/fstat/scandir exercise the boundary.
-        return Walker(volume, Policy(home=str(self.base), homes=[]), Mock(), Blocks(), fs=object())
+        return Walker(volume, Policy(home=str(self.base), homes=[]), Mock(), fs=object())
 
     def test_native_flags_open_and_list_a_real_tiny_tree(self):
         walker = self.walker()
@@ -95,7 +94,7 @@ class RootPublicationTests(unittest.TestCase):
         store.directory(Node('1', None, 'Root', 'directory', 0, 0, 'observed', None, 0))
         store.directory(Node('2', '1', 'Big folder', 'directory', 2 * 10**9, 0, 'observed', None, 0))
         with patch('machine_audit.scanner.store.time.time_ns', return_value=100 * 10**9):
-            store.finish_volume(self.volume, Blocks(), [], full=True, lean=True,
+            store.finish_volume(self.volume, None, [], full=True, lean=True,
                                 bookmark=10, event_uuid='events')
         store.close()
 
@@ -150,7 +149,7 @@ class RootPublicationTests(unittest.TestCase):
                                                side_effect=deny_root if mode == 'denied' else original_open):
                 if mode == 'denied':
                     sink = Mock()
-                    walker = Walker(volume, Policy(home=str(self.base), homes=[]), sink, Blocks(), fs=object())
+                    walker = Walker(volume, Policy(home=str(self.base), homes=[]), sink, fs=object())
                     walker.walk()
                     self.assertEqual(walker.listed, set())
                     self.assertEqual(sink.directory.call_args.args[0].status, 'denied')
@@ -404,7 +403,7 @@ class RootPublicationTests(unittest.TestCase):
         filler.write_bytes(bytes(1024**2))
         limit = Budget(self.data).usage()['bytes']+3*1024**2
         walks = []
-        def overflow(store, affected):
+        def overflow(store, *args):
             walks.append(1)
             with store.write(rows=100_000):
                 store.db.execute('CREATE TABLE fill(value BLOB)')
@@ -449,7 +448,7 @@ class RootPublicationTests(unittest.TestCase):
         self.assertEqual(scan(failed+2*day+7*hour, events=events), ('hourly_update', 'complete', 'observed'))
 
     def test_specific_invariant_and_chosen_action_survive_a_failed_run(self):
-        def fail_aggregate(store, affected):
+        def fail_aggregate(store, *args):
             store.path_for('absent synthetic identity')
         with patch.object(MapStore, '_aggregate_full', fail_aggregate), \
              patch('machine_audit.scanner.runner.time.time_ns', return_value=86500*10**9):
@@ -625,7 +624,7 @@ class RootPublicationTests(unittest.TestCase):
         store = MapStore(self.data / 'scanner.sqlite', Budget(self.data, free_margin_bytes=0))
         store.prepare(self.volume)
         with patch('machine_audit.scanner.store.time.time_ns', return_value=at):
-            store.finish_volume(self.volume, Blocks(), ['directory_unreadable'],
+            store.finish_volume(self.volume, None, ['directory_unreadable'],
                                 full=True, lean=True, bookmark=10, event_uuid='events')
         store.close()
         self.assertEqual(self.published()[1], [])
@@ -684,12 +683,12 @@ class RootPublicationTests(unittest.TestCase):
                     self.volume = replace(self.volume, mount=str(directory))
                     store = MapStore(self.data / 'scanner.sqlite', Budget(self.data, free_margin_bytes=0))
                     store.prepare(self.volume)
-                    walker = Walker(self.volume, Policy(home=str(self.base), homes=[]), store, Blocks(), fs=object())
+                    walker = Walker(self.volume, Policy(home=str(self.base), homes=[]), store, fs=object())
                     walker.walk()
                     self.assertEqual(walker.entries, 0)
                     self.assertTrue(walker.listed)
                     with patch('machine_audit.scanner.store.time.time_ns', return_value=200_000 * 10**9):
-                        store.finish_volume(self.volume, Blocks(), [], full=True, lean=True,
+                        store.finish_volume(self.volume, None, [], full=True, lean=True,
                                             bookmark=10, event_uuid='events')
                     store.close()
                 with sqlite3.connect(self.data / 'scanner.sqlite') as db:

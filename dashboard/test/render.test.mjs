@@ -148,7 +148,13 @@ test('all dashboard views render real stored replay without leaked tokens or fak
       await run("document.querySelector('#close-around').click()");
     }
     if(view==='storage') {
-      assert.match(await run("document.querySelector('#view').innerText"),/Attributed 7 GB \+ not attributed 4 GB = used 11 GB/);
+      assert.match(await run("document.querySelector('#view').innerText"),/Physical space in folders 7 GB \+ not placed in a folder 4 GB = used 11 GB/);
+      // The two folders share 2 GB: each is marked, and the root page states the overlap.
+      assert.equal(await run("document.querySelectorAll('details.asterisk').length"),2);
+      await run("document.querySelector('details.asterisk').open=true");
+      assert.match(await run("document.querySelector('details.asterisk').innerText"),/Deleting it frees about \d GB while the other copies remain/);
+      assert.match(await run("document.querySelector('#view').innerText"),/These rows add to 2 GB more than their folder's 7 GB/);
+      assert.doesNotMatch(await run("document.querySelector('#view thead').innerText"),/Listed/);
       assert.match(await run("document.querySelector('#view').innerText"),/Example data/);
       await run("[...document.querySelectorAll('button')].find(button=>button.textContent==='Example projects').click()");
       await until(()=>run("[...document.querySelectorAll('button')].some(button=>button.textContent==='Example data')"),Boolean,'Folder drilldown did not render');
@@ -283,7 +289,7 @@ test('original folder growth stays visible through real HTTP and cursor pages',{
     const row=byName.get(name);assert.ok(row,`${name} was omitted`);
     assert.equal(row[2],growth,name);
     assert.equal(row[3].split('\n')[0],start,name);assert.equal(row[4].split('\n')[0],end,name);
-    assert.equal(row[3].split('\n')[1],'Uses',name);assert.equal(row[4].split('\n')[1],'Uses',name);
+    assert.equal(row[3].split('\n')[1],'Physical',name);assert.equal(row[4].split('\n')[1],'Physical',name);
     assert.equal(row[1].split('\n')[0],parent,`${name}: use historical, not current, parent`);
     assert.equal(row[5],'Observed',name);
   }
@@ -316,7 +322,7 @@ test('original folder growth stays visible through real HTTP and cursor pages',{
   await screenshot('original-growth.png');
   await run(`
     const select=document.querySelector('select[aria-label="Storage volume"]');
-    select.value=[...select.options].find(option=>option.textContent==='Uses to Listed').value;
+    select.value=[...select.options].find(option=>option.textContent==='Volume with changed measure').value;
     select.dispatchEvent(new Event('change'));`);
   await until(readRows,rows=>rows[0]?.[0]==='Accounting change','Accounting-change volume did not render');
   const mismatch=await run(`(() => {
@@ -324,7 +330,7 @@ test('original folder growth stays visible through real HTTP and cursor pages',{
     return Object.fromEntries([...table.tHead.rows[0].cells].map((header,i)=>[header.textContent,table.tBodies[0].rows[0].cells[i].innerText]));
   })()`);
   assert.equal(mismatch.Growth,'—','Different measures cannot be subtracted');
-  assert.match(mismatch['From observation'],/^4 GB\nUses\n/,'Earlier bytes must retain their own measure');
+  assert.match(mismatch['From observation'],/^4 GB\nPhysical\n/,'Earlier bytes must retain their own measure');
   assert.match(mismatch['To observation'],/^6 GB\nListed\n/,'Later bytes must retain their own measure');
   assert.equal(mismatch.Status,'Not observed');
   assert.equal(mismatch.Measure,undefined,'No shared measure can mislabel an endpoint');

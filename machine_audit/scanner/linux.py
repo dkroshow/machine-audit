@@ -15,7 +15,6 @@ from machine_audit.sources.linux.devices import mounts, volumes as local_filesys
 from machine_audit.sources.linux.files import keyed, salted
 from machine_audit.sources.linux.host import Stat
 from machine_audit.sources.linux.watcher import take_dirty
-from .accounting import Blocks
 from .native import Volume
 from .policy import Policy
 from .runner import relist, scan_lock
@@ -105,8 +104,7 @@ def run_scan(data_dir, *, full=False, grain='files', roots=None, exclusions=(), 
                                                              if m.device == entry.device and m.mount != entry.mount
                                                              and within(m.root, entry.root)])
                 store.prepare(volume, full=action == 'full', lean=False)
-                blocks = Blocks()
-                walker = Walker(volume, policy, store, blocks, None, grain)
+                walker = Walker(volume, policy, store, None, grain)
                 if action == 'full':
                     walker.walk()
                     if not walker.listed and 'denied' in walker.gaps:
@@ -140,7 +138,7 @@ def run_scan(data_dir, *, full=False, grain='files', roots=None, exclusions=(), 
                                         'entries':walker.entries,'gaps':sorted(walker.gaps)})
                         continue
                 try:
-                    store.finish_volume(volume, blocks, walker.gaps, full=action == 'full', lean=False,
+                    store.finish_volume(volume, None, walker.gaps, full=action == 'full', lean=False,
                                         complete=walker.sharing_complete, physical=False)
                 except MergePending as exc:
                     # Published; the next run merges the delta before scanning anything.

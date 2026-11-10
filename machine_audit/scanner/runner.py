@@ -17,7 +17,6 @@ from .native import MacFilesystem
 from .events import FSEvents, next_decision
 from .errors import ScanError
 from .policy import Policy
-from .accounting import Blocks
 from .store import MapStore, MergePending
 from .walker import Walker, shown_path
 
@@ -268,8 +267,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                 try:
                     store.phase('prepare',action=action,trigger=trigger)
                     store.prepare(volume,full=action=='full',lean=not full_disk_access)
-                    blocks=Blocks()
-                    walker=Walker(volume,policy,store,blocks,fs,grain)
+                    walker=Walker(volume,policy,store,fs,grain)
                     store.phase('walk')
                     if action=='full':
                         walker.walk()
@@ -294,7 +292,11 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                             results.append({'volume_id':volume.id,'status':'update_unreadable','action':action,
                                             'trigger':trigger,'entries':walker.entries,'gaps':sorted(walker.gaps)})
                             continue
-                    store.finish_volume(volume,blocks,walker.gaps,full=action=='full',lean=not full_disk_access,
+                    # Read used space again: the walk took time, and the reconciliation's
+                    # tolerance is how much it changed meanwhile.
+                    after=next((v for v in fs.volumes() if v.id==volume.id),volume)
+                    reader=(lambda inode,device=volume.device:fs.extents(device,int(inode))) if volume.fs=='apfs' else None
+                    store.finish_volume(after,reader,walker.gaps,full=action=='full',lean=not full_disk_access,used_before=volume.used,
                         bookmark=bookmark,event_uuid=event_uuid,complete=walker.sharing_complete and (action=='full' or not replay.interrupted),
                         event_progress=None if not replay or not replay.paths else bookmark!=old['bookmark'])
                 except BudgetExceeded as exc:

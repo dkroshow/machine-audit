@@ -44,10 +44,10 @@ overlap those measured counter windows.
 | Concurrent program instances | Two instances each use one CPU for the same minute | One compatible program group, 120 CPU-seconds over 60 elapsed seconds, two-CPU mean and peak |
 | Memory strain and recovery | Available memory falls to 500 MB and returns to 7 GB; 80 swap-in pages; 2,000,000 microseconds of stall time | Movement remains in pages, stalls in source microseconds, and recovery does not erase the earlier activity |
 | Overlapping memory | Two three-GB footprints with the same program name | Two instance rows; no invented six-GB physical total or host remainder |
-| Shared storage and growth | Two four-GB files share two GB; one nested folder gains one GB | Listed 8 → 9 GB, uses 6 → 7 GB, a 4 GB residual, and original growth retained for both parent and child, with nested overlap explicit |
+| Shared storage and growth | Two four-GB files share two GB; one nested folder gains one GB | Listed 8 → 9 GB, physical 6 → 7 GB, a 4 GB not-placed line, 2 GB shared between the rows, and original growth retained for both parent and child, with nested overlap explicit |
 | Original folder growth | A tracked folder gains 50 MB; parents gain 10 GB while children gain or lose 1 GB; another parent stays unchanged while its child loses 1 GB | All changes remain visible, including 50 MB, zero and negative values; original endpoint sizes and actual observation times remain visible |
 | Historical folder placement and missing evidence | A child moves after the selected interval; another tracked folder is absent at its end | The earlier interval shows the earlier parent. The absent folder's size and growth remain unknown, not zero |
-| Different endpoint measures | A separate volume records 4 GB of Uses, then 6 GB of Listed bytes | Each endpoint retains its own measure; growth stays unknown rather than subtracting incompatible sizes |
+| Different endpoint measures | A separate volume records 4 GB of Physical, then 6 GB of Listed bytes | Each endpoint retains its own measure; growth stays unknown rather than subtracting incompatible sizes |
 | Invalid storage accounting | Attributed use exceeds the measured volume total, or physical accounting is unsupported | Uses and residual withheld; listed bytes remain visible |
 
 Storage values are numeric fixture metadata; no gigabyte files are allocated.

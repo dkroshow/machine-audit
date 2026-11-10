@@ -26,19 +26,24 @@ class StorageReplay(unittest.TestCase):
         self.temp.cleanup()
 
     def test_shared_space_reconciles_and_drilldown_keeps_the_same_accounting(self):
-        """Folder uses plus the residual must equal the same snapshot's used space."""
+        """Folders' physical space plus the residual must equal the same snapshot's used
+        space; rows that share blocks state the shared amount, so they add up too."""
         volume = self.query.storage_query("volumes")["rows"][0]
         self.assertTrue(volume["valid"])
         self.assertEqual(volume["listed"], 9*GB)
-        self.assertEqual(volume["uses"], 7*GB)
-        self.assertEqual(volume["not_attributed"], 4*GB)
-        self.assertEqual(volume["uses"]+volume["not_attributed"], volume["volume_used"])
-        children = self.query.storage_query("children", volume_id=VOLUME_ID)["rows"]
-        self.assertEqual(sum(row["uses"] for row in children), 7*GB)
+        self.assertEqual(volume["physical"], 7*GB)
+        self.assertEqual(volume["not_placed"], 4*GB)
+        self.assertEqual(volume["physical"]+volume["not_placed"], volume["volume_used"])
+        answer = self.query.storage_query("children", volume_id=VOLUME_ID)
+        children = answer["rows"]
+        self.assertEqual({row["label"]: row["physical"] for row in children},
+                         {"Example projects": 5*GB, "Shared copy": 4*GB})
+        self.assertEqual(answer["folder"]["shared_between_rows"], 2*GB)
+        self.assertEqual(sum(row["physical"] for row in children)-answer["folder"]["shared_between_rows"], volume["physical"])
         projects = next(row for row in children if row["label"] == "Example projects")
         data = self.query.storage_query("children", volume_id=VOLUME_ID, parent_id=projects["id"])["rows"]
         self.assertEqual(data[0]["label"], "Example data")
-        self.assertEqual(data[0]["uses"], projects["uses"])
+        self.assertEqual(data[0]["physical"], projects["physical"])
 
     def test_growth_keeps_original_parent_and_child_points_with_overlap_explicit(self):
         """The shared query must preserve, not suppress, nested original growth."""
@@ -48,7 +53,7 @@ class StorageReplay(unittest.TestCase):
         self.assertEqual({row["label"]: row["change"] for row in changed},
                          {"Synthetic volume": GB, "Example projects": GB, "Example data": GB})
         for row in changed:
-            self.assertEqual(row["metric"], "uses")
+            self.assertEqual(row["metric"], "physical")
             self.assertEqual(row["start_ns"], BASE_NS)
             self.assertEqual(row["end_ns"], BASE_NS+40*SECOND)
         self.assertTrue(answer["coverage"]["nested_totals_overlap"])
@@ -74,7 +79,7 @@ class StorageReplay(unittest.TestCase):
         self.assertFalse(more["truncated"])
         self.assertIn("Example data", [row["label"] for row in more["rows"]])
 
-    def test_invalid_or_unsupported_physical_accounting_withholds_uses(self):
+    def test_invalid_or_unsupported_physical_accounting_withholds_physical(self):
         """Too-small totals and unsupported filesystems must not fabricate agreement."""
         mapping = MapStore(Path(self.temp.name) / "scanner.sqlite")
         volume = Volume(VOLUME_ID, "Synthetic volume", "", "hfs", 1, 20*GB, 15*GB, 15*GB, 5*GB)
@@ -82,14 +87,14 @@ class StorageReplay(unittest.TestCase):
             write_snapshot(mapping, volume, BASE_NS+120*SECOND, growth=GB)
             bad = self.query.storage_query("volumes")["rows"][0]
             self.assertEqual(bad["status"], "invalid")
-            self.assertIsNone(bad["uses"])
-            self.assertIsNone(bad["not_attributed"])
+            self.assertIsNone(bad["physical"])
+            self.assertIsNone(bad["not_placed"])
             self.assertEqual(bad["listed"], 9*GB)
-            self.assertTrue(all(row["uses"] is None for row in self.query.storage_query("children")["rows"]))
+            self.assertTrue(all(row["physical"] is None for row in self.query.storage_query("children")["rows"]))
             write_snapshot(mapping, replace(volume, fs="ext4", used=11*GB), BASE_NS+180*SECOND, growth=GB)
             unsupported = self.query.storage_query("volumes")["rows"][0]
             self.assertEqual(unsupported["status"], "unavailable")
-            self.assertIsNone(unsupported["uses"])
+            self.assertIsNone(unsupported["physical"])
         finally:
             mapping.close()
 

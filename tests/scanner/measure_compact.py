@@ -13,7 +13,6 @@ import tempfile
 import time
 
 from machine_audit.budget import Budget
-from machine_audit.scanner.accounting import Blocks
 from machine_audit.scanner.native import Volume
 from machine_audit.scanner.store import MapStore, MapQuery
 from machine_audit.scanner.walker import Node
@@ -70,15 +69,15 @@ def measure(directories=2000,files=8000,replace=False):
         store.start('synthetic_scale')
         phase('initial_prepare',lambda:store.prepare(volume))
         phase('initial_stage',stage)
-        phase('initial_publish',lambda:store.finish_volume(volume,Blocks(),[],full=True,lean=True))
+        phase('initial_publish',lambda:store.finish_volume(volume, None,[],full=True,lean=True))
         initial_bytes=budget.usage()['bytes']
         expected=sum(own)
-        assert MapQuery(store.path).query()['rows'][0]['uses']==expected
+        assert MapQuery(store.path).query()['rows'][0]['physical']==expected
         if replace:
             phase('replacement_prepare',lambda:store.prepare(volume))
             phase('replacement_stage',stage)
-            phase('replacement_publish',lambda:store.finish_volume(volume,Blocks(),[],full=True,lean=True))
-            assert MapQuery(store.path).query()['rows'][0]['uses']==expected
+            phase('replacement_publish',lambda:store.finish_volume(volume, None,[],full=True,lean=True))
+            assert MapQuery(store.path).query()['rows'][0]['physical']==expected
         phase('hourly_prepare',lambda:store.prepare(volume,full=False))
         def update():
             store.begin_directory('1')
@@ -87,8 +86,8 @@ def measure(directories=2000,files=8000,replace=False):
                 store.file(str(10_000_000+i),'1',f'file{i}.dat',4096*(1+i%8),0)
             store.file('999999999','1','new.dat',8192,0);store.flush()
         phase('hourly_stage',update)
-        phase('hourly_publish',lambda:store.finish_volume(volume,Blocks(),[],full=False,lean=True))
-        assert MapQuery(store.path).query()['rows'][0]['uses']==expected+8192
+        phase('hourly_publish',lambda:store.finish_volume(volume, None,[],full=False,lean=True))
+        assert MapQuery(store.path).query()['rows'][0]['physical']==expected+8192
         categories={r[0]:r[1] for r in store.db.execute('SELECT name,sum(pgsize) FROM dbstat GROUP BY name')}
         result={'directories':directories+1,'files':files,'entries':directories+files+1,
                 'initial_managed_bytes':initial_bytes,'initial_bytes_per_entry':initial_bytes/(directories+files+1),

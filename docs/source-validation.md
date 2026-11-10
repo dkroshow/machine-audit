@@ -17,7 +17,7 @@ hardware remain explicit gaps.
 | Heat/power | SMC read-only methods, admission, separate power domains; exact fan fallback rule; battery/supply, thermal state, speed limits | Compiler layouts, synthetic admission | Intel values, costs, notification availability |
 | Network | Paired timestamped ICMP, late/lost/no-path, dropouts, silent routers, connect override, own-traffic guard, salted router hardware identity, quiet baseline, DNS/connect, Wi-Fi, portal, optional bounded capacity test | Checksum/ARP fixtures; late/loss/dropout/silent-router rules | Kernel timestamps, every native/probe path, payload/wire cost and capacity method limits |
 | Self | Existing process pass, storage/operation counters, scanner run checkpoints and recovery | Source boundaries; interrupted records retained | Independent cost comparison, short-lived child coverage |
-| Scanner | Python metadata walk; direct hourly relists/new subtree walks; FSEvents replay; privacy; shared charges; staged publication; points and cursor queries | Disposable walk, arithmetic, shared-charge reuse, shallow updates, budget failure, permissions, cursor tests | Actual APFS extents, all volume layouts, full/hourly cost, stable FDA identity |
+| Scanner | Python metadata walk; direct hourly relists/new subtree walks; FSEvents replay; privacy; physical space from extents; staged publication; points and cursor queries | Disposable walk, APFS clone and hard-link fixtures, shared-term reuse, shallow updates, budget failure, permissions, cursor tests | Actual APFS extents, all volume layouts, full/hourly cost, stable FDA identity |
 
 No live collector, GPU dictionary read, protected-folder probe or live
 filesystem walk ran for this contribution. Portable fixtures do not prove
@@ -138,18 +138,20 @@ owner's installation policy.
 ## Map, accounting and queries
 
 `MapQuery(data_dir / 'scanner.sqlite').query(action, **params)` supports
-`volumes`, `children`, `growth`. Shared block addresses exist only in bounded
-memory. The private SQLite file holds names, identities, sizes and stream
-charges; ordinary record exports exclude it. Child file rows have `kind=file`
-and allocated `listed` bytes; their `uses` is null because folder charges do
-not establish a file's reclaimable or physical bytes.
+`volumes`, `children`, `growth`. Shared block addresses exist only in memory
+during a run. The private SQLite file holds names, identities, sizes, stream
+groups and per-folder byte terms; ordinary record exports exclude it. Child
+file rows have `kind=file`, allocated `listed` bytes and the same `physical`
+bytes; their `frees` and `asterisk` are null.
 
 Map generations publish only after totals and points commit. Writes use the
 shared SQLite budget, one transaction per reservation. The last published map
 survives failed construction. Replaced/abandoned generations are reclaimable;
-size points and run evidence remain. Shared charges survive unchanged updates.
-Changed partial streams can use a private-byte lower bound until the next full
-map, explicitly marked in gaps. Uses above measured volume use are withheld,
+size points and run evidence remain. Shared terms survive unchanged updates.
+An update recomputes every group it touches from fresh extents; a changed copy
+whose partner it cannot read counts its private bytes until the next full map,
+marked `shared_copy_placed_at_full_walk`. Physical space above measured volume
+use plus the tolerance is withheld,
 never rescaled. Unsupported filesystems expose listed sizes without a physical
 residual. Parent/child totals are stored; no query walks the filesystem.
 
@@ -172,15 +174,18 @@ replaced by an inferred residual. Coverage declares
 `growth_grouping=original_totals_with_overlap`, `nested_totals_overlap=true`
 and `global_growth_complete=false`, including after the final page.
 
-Volume rows include `id,label,observed_ns,full_scan_ns,listed,uses,volume_used,
-not_attributed,capacity,free,available,valid,status,mounted,gaps`. Children include
-`id,parent_id,label,kind,listed,uses,status,observed_ns`. Private names are null.
+Volume rows include `id,label,observed_ns,full_scan_ns,listed,physical,volume_used,
+not_placed,tolerance,unplaced_shared,capacity,free,available,valid,status,mounted,gaps`.
+Children include `id,parent_id,label,kind,listed,physical,frees,asterisk,status,observed_ns`,
+and the answer's `folder` gives the parent's `physical` and `shared_between_rows`
+(null under 1 GB). Private names are null.
 Growth includes `id,parent_id,parent_label,label,metric,start_metric,end_metric,start_ns,end_ns,
 start_bytes,end_bytes,change,status,hierarchy_observed_ns,hierarchy_status`.
 `start_metric` and `end_metric` identify each original observation's measure;
 each is null if that endpoint has no point. The compatibility field `metric`
-remains the end metric. A uses-to-listed transition keeps both sizes with
-their distinct labels and a null change.
+remains the end metric. A physical-to-listed transition, or a point from
+before physical space (`uses`), keeps both sizes with their distinct labels and
+a null change.
 
 Historical hierarchy observations are retained at each committed map
 publication without backdating. Growth selects the latest observation at or
@@ -224,7 +229,13 @@ the same. Stores older than format 2 are refused intact. A format-2 store migrat
 on first open: one write adds nullable `volumes.delta_generation` and sets format 3,
 so a store has both or neither. Earlier builds then
 refuse it intact (`scanner_format_requires_fresh_store`), so a format-2 release is
-not a usable rollback; there is no automatic downgrade.
+not a usable rollback; there is no automatic downgrade. A format-3 store
+converts to format 4 on the scanner's first open, in one write: node columns
+`own_uses` and `uses` become `own_physical` and `physical`, `frees` is added,
+`charges` is replaced by `streams` and `terms`, and every map is retired for
+one full walk (`awaiting_physical_walk`). Points, tracked folders, hierarchy
+and runs stay. Readers show no folder sizes for a format-3 store until it
+converts, and earlier builds refuse format 4.
 
 Opening SQLite and configuring its journal reserve 256 KiB before the first
 connection can allocate files. That reservation ends before schema creation

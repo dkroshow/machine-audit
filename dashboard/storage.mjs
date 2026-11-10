@@ -15,8 +15,28 @@ function historicalParent(row) {
 }
 
 function observation(bytes, measure, at) {
-  const label = measure === 'uses' ? 'Uses' : measure === 'listed' ? 'Listed' : measure ?? 'Unknown measure';
+  const label = measure === 'physical' ? 'Physical' : measure === 'uses' ? 'Uses (earlier measure)' :
+    measure === 'listed' ? 'Listed' : measure ?? 'Unknown measure';
   return el('span', {}, format(bytes, 'bytes'), el('span', {class:'note'}, label), el('span', {class:'note'}, time(at, true)));
+}
+
+// Kenny's note for a folder the scanner marks: its figures come from the query.
+export function sharedNote(asterisk) {
+  const parts = ['Shares data with copies elsewhere: APFS clones, hard links, snapshots.'];
+  if (asterisk.listed != null) {
+    const listed = format(asterisk.listed, 'bytes');
+    parts.push(`Finder and du show ${listed}; copying, moving or backing up elsewhere would take about ${listed}.`);
+  }
+  parts.push(asterisk.frees != null ? `Deleting it frees about ${format(asterisk.frees, 'bytes')} while the other copies remain.` :
+    'Deleting it frees less while the other copies remain.');
+  return parts.join(' ');
+}
+
+function size(row, valid) {
+  const shown = format(valid === false ? null : row.physical, 'bytes');
+  if (!row.asterisk) return shown;
+  return el('span', {}, shown, el('details', {class:'asterisk'},
+    el('summary', {'aria-label':'Shares data with copies elsewhere'}, '*'), el('span', {class:'note'}, sharedNote(row.asterisk))));
 }
 
 // The scanner owns reconciliation and growth. This file only presents its answers.
@@ -57,38 +77,42 @@ export async function storageView(api, interval, abort) {
         ` · Map as of ${time(volume.observed_ns, true)}`);
       const blocks = [breadcrumbs, details, el('p', {class:'note'}, `At this map observation: capacity ${format(volume.capacity,'bytes')} · free ${format(volume.free,'bytes')} · available to programs ${format(volume.available,'bytes')}.`)];
       if (volume.gaps?.length) blocks.push(el('p', {class:'notice'}, `Map coverage gaps: ${volume.gaps.map(statusText).join(', ')}.`));
-      if (volume.valid === true) {
-        blocks.push(el('p', {class:'banner'},
-          `Attributed ${format(volume.uses,'bytes')} + not attributed ${format(volume.not_attributed,'bytes')} = used ${format(volume.volume_used,'bytes')}`));
+      if (volume.valid === true && finite(volume.not_placed)) {
+        blocks.push(el('div', {class:'banner'},
+          el('p', {}, `Physical space in folders ${format(volume.physical,'bytes')} + not placed in a folder ${format(volume.not_placed,'bytes')} = used ${format(volume.volume_used,'bytes')}`),
+          el('p', {class:'sub'}, `Not placed in a folder: snapshots, file-system records and areas the scanner cannot read. Folders may exceed used space by up to ${format(volume.tolerance,'bytes')}, the larger of 1 GB and the change in used space during the scan.`)));
         if (finite(volume.volume_used) && volume.volume_used > 0) {
           const bar = el('svg', {class:'storage-bar', viewBox:'0 0 100 8', preserveAspectRatio:'none', role:'img', 'aria-label':
-            `Attributed ${format(volume.uses,'bytes')}; not attributed ${format(volume.not_attributed,'bytes')}`} );
+            `In folders ${format(volume.physical,'bytes')}; not placed in a folder ${format(volume.not_placed,'bytes')}`} );
           let x = 0;
-          for (const [name, value] of [['Attributed',volume.uses], ['Not attributed',volume.not_attributed]]) {
+          for (const [name, value] of [['In folders',volume.physical], ['Not placed in a folder',volume.not_placed]]) {
             if (finite(value) && value >= 0) {
               const width = value / volume.volume_used * 100;
-              bar.append(el('rect', {class:name === 'Not attributed' ? 'residual' : '', x, y:0, width, height:8},
+              bar.append(el('rect', {class:name === 'Not placed in a folder' ? 'residual' : '', x, y:0, width, height:8},
                 el('title', {}, `${name}: ${format(value,'bytes')}`)));
               x += width;
             }
           }
           blocks.push(bar);
         }
-      } else {
+      } else if (volume.valid !== true) {
         blocks.push(el('p', {class:'notice'},
-          volume.status === 'invalid' ? 'Reconciliation is invalid. Folder uses are withheld; they have not been scaled to fit the volume.' :
+          volume.status === 'invalid' ? 'Reconciliation is invalid. Folder sizes are withheld; they have not been scaled to fit the volume.' :
+          volume.status === 'awaiting_physical_walk' ? 'The map is being rebuilt to measure physical space. Folder sizes return after the next full scan.' :
             'Physical-space reconciliation is unavailable. Listed bytes are not a physical-space total.'));
       }
-      blocks.push(el('p', {class:'note'},
-        `Volume used: ${format(volume.volume_used,'bytes')} · Listed in map: ${format(volume.listed,'bytes')}. Shared copies count in full in listed bytes.`));
+      if (volume.unplaced_shared > 0) blocks.push(el('p', {class:'note'},
+        `${format(volume.unplaced_shared,'bytes')} of copies made since the last full scan share blocks with files the hourly update did not read. Those blocks count in the other copy's folder until the next full scan.`));
       if (children.truncated) blocks.push(el('p', {class:'note'}, 'More folders are available below this page.'));
-      blocks.push(rows.length ? table(['Folder / file','Uses','Listed','Coverage'], rows.map(row => {
+      blocks.push(rows.length ? table(['Folder / file','Physical space','Coverage'], rows.map(row => {
         const button = el('button', {type:'button',class:'link'}, row.label ?? '(name withheld)');
         if (row.kind === 'file' || row.is_dir === false) button.disabled = true;
         else button.addEventListener('click', () => {history.push({id:row.id,name:row.label ?? 'Folder'}); show(row.id);});
-        return [button, format(volume.valid === false ? null : row.uses,'bytes'), format(row.listed,'bytes'), badge(row.status)];
-      }), 'Sizes are from the saved scan. A withheld name can mark a privacy boundary. A missing size is not zero.') :
+        return [button, size(row, volume.valid), badge(row.status)];
+      }), 'Physical space: each block counted once, wherever copies share it. Sizes are from the saved scan. A withheld name can mark a privacy boundary. A missing size is not zero.') :
         empty('No visible children in this saved map.'));
+      if (children.folder?.shared_between_rows) blocks.push(el('p', {class:'note'},
+        `These rows add to ${format(children.folder.shared_between_rows,'bytes')} more than their folder's ${format(children.folder.physical,'bytes')}: they share blocks with each other, and each row counts every block it holds.`));
       if (children.truncated && children.next_cursor) {
         const more = el('button', {type:'button'}, 'Show more folders');
         more.addEventListener('click', () => show(parent, children.next_cursor, rows));

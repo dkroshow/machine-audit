@@ -17,6 +17,7 @@ import time
 import uuid
 
 from machine_audit.budget import Budget, BudgetExceeded
+from . import accounting
 from .accounting import reconcile
 from .encoding import inode_key, source_id
 from .hierarchy import save_hierarchy
@@ -30,13 +31,14 @@ CREATE TABLE IF NOT EXISTS volumes(
  key INTEGER PRIMARY KEY,id TEXT NOT NULL UNIQUE,label TEXT NOT NULL,mount TEXT NOT NULL,generation INTEGER,
  observed_ns INTEGER,full_ns INTEGER,volume_used INTEGER,capacity INTEGER,free INTEGER,available INTEGER,
  valid INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL,lean INTEGER NOT NULL,bookmark INTEGER,
- no_progress INTEGER NOT NULL DEFAULT 0,event_uuid TEXT,gaps TEXT NOT NULL DEFAULT '[]',mounted INTEGER NOT NULL DEFAULT 1,full_attempt_ns INTEGER,budget_retry_bytes INTEGER,delta_generation INTEGER);
+ no_progress INTEGER NOT NULL DEFAULT 0,event_uuid TEXT,gaps TEXT NOT NULL DEFAULT '[]',mounted INTEGER NOT NULL DEFAULT 1,full_attempt_ns INTEGER,budget_retry_bytes INTEGER,delta_generation INTEGER,
+ used_change INTEGER,unplaced_shared INTEGER);
 CREATE TABLE IF NOT EXISTS nodes(
  generation INTEGER NOT NULL,volume INTEGER NOT NULL,id INTEGER NOT NULL,parent INTEGER,label TEXT,kind TEXT NOT NULL,
- own_listed INTEGER NOT NULL,own_uses INTEGER NOT NULL,listed INTEGER,uses INTEGER,status TEXT NOT NULL,mtime INTEGER,
- PRIMARY KEY(generation,volume,id)) WITHOUT ROWID;
+ own_listed INTEGER NOT NULL,own_physical INTEGER NOT NULL,listed INTEGER,physical INTEGER,status TEXT NOT NULL,mtime INTEGER,
+ frees INTEGER,PRIMARY KEY(generation,volume,id)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS node_parent ON nodes(generation,volume,parent,label);
-CREATE INDEX IF NOT EXISTS node_size ON nodes(generation,volume,parent,uses DESC,id DESC);
+CREATE INDEX IF NOT EXISTS node_size ON nodes(generation,volume,parent,physical DESC,id DESC);
 CREATE INDEX IF NOT EXISTS node_listed ON nodes(generation,volume,parent,listed DESC,id DESC);
 -- Coverage counts excluded roots without scanning the whole map.
 CREATE INDEX IF NOT EXISTS node_excluded ON nodes(generation,volume) WHERE status='excluded';
@@ -50,16 +52,26 @@ CREATE TABLE IF NOT EXISTS holders(
  PRIMARY KEY(generation,volume,dir,file_id)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS holder_stream ON holders(generation,volume,stream);
 CREATE INDEX IF NOT EXISTS holder_file ON holders(generation,volume,file_id,dir);
-CREATE TABLE IF NOT EXISTS charges(
- generation INTEGER NOT NULL,volume INTEGER NOT NULL,stream INTEGER NOT NULL,charge INTEGER NOT NULL,
- allocated INTEGER NOT NULL,private INTEGER,partial INTEGER NOT NULL,dir INTEGER NOT NULL,
- PRIMARY KEY(generation,volume,stream)) WITHOUT ROWID;
+-- A stream's sharing group: streams that share any block. `unplaced` is what an
+-- update could not place: bytes APFS says are shared, with a partner it has not read.
+CREATE TABLE IF NOT EXISTS streams(
+ generation INTEGER NOT NULL,volume INTEGER NOT NULL,stream INTEGER NOT NULL,grp INTEGER NOT NULL,
+ unplaced INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(generation,volume,stream)) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS stream_group ON streams(generation,volume,grp);
+CREATE INDEX IF NOT EXISTS stream_unplaced ON streams(generation,volume) WHERE unplaced>0;
+-- Per-folder byte terms of one group. Summed over a subtree they give its physical
+-- space and what deleting it frees. Byte counts only, never block addresses.
+CREATE TABLE IF NOT EXISTS terms(
+ generation INTEGER NOT NULL,volume INTEGER NOT NULL,grp INTEGER NOT NULL,dir INTEGER NOT NULL,
+ physical INTEGER NOT NULL,frees INTEGER NOT NULL,PRIMARY KEY(generation,volume,grp,dir)) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS term_dir ON terms(generation,volume,dir);
 CREATE TABLE IF NOT EXISTS listings(
  generation INTEGER NOT NULL,volume INTEGER NOT NULL,id INTEGER NOT NULL,listed_ns INTEGER,count INTEGER,
  PRIMARY KEY(generation,volume,id)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS removed(generation INTEGER,volume INTEGER,id INTEGER,PRIMARY KEY(generation,volume,id)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS reset_dirs(generation INTEGER,volume INTEGER,id INTEGER,PRIMARY KEY(generation,volume,id)) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS removed_charges(generation INTEGER,volume INTEGER,id INTEGER,PRIMARY KEY(generation,volume,id)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS removed_streams(generation INTEGER,volume INTEGER,id INTEGER,PRIMARY KEY(generation,volume,id)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS reset_groups(generation INTEGER,volume INTEGER,id INTEGER,PRIMARY KEY(generation,volume,id)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS tracked(volume TEXT,id TEXT,parent TEXT,PRIMARY KEY(volume,id)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS points(
  volume TEXT NOT NULL,id TEXT NOT NULL,observed_ns INTEGER NOT NULL,label TEXT,metric TEXT NOT NULL,
@@ -79,30 +91,39 @@ CREATE TABLE IF NOT EXISTS runs(
  peak_rss_bytes INTEGER NOT NULL,written_bytes INTEGER,kind TEXT NOT NULL,
  volume_id TEXT,action TEXT,trigger TEXT,stage TEXT,volumes TEXT) WITHOUT ROWID;
 '''
-MAP_TABLES=('nodes','files','holders','charges','listings')
-STAGE_TABLES=('removed','reset_dirs','removed_charges')
+MAP_TABLES=('nodes','files','holders','streams','terms','listings')
+STAGE_TABLES=('removed','reset_dirs','removed_streams','reset_groups')
 MAX_ANCESTRY=1024
-KEYS={'nodes':'id','files':'parent','holders':'dir','listings':'id','charges':'stream'}
-PRIMARY={'nodes':('id',),'files':('parent','id'),'holders':('dir','file_id'),'listings':('id',),'charges':('stream',)}
+KEYS={'nodes':'id','files':'parent','holders':'dir','listings':'id','streams':'stream','terms':'grp'}
+PRIMARY={'nodes':('id',),'files':('parent','id'),'holders':('dir','file_id'),'listings':('id',),'streams':('stream',),'terms':('grp','dir')}
+# A staged marker that hides a key's rows in the base and the delta alike...
+REMOVED={'nodes':'removed','files':'removed','holders':'removed','listings':'removed','streams':'removed_streams','terms':None}
+# ...and one that hides only the base's rows, which the delta restates in full.
+RESET={'files':'reset_dirs','holders':'reset_dirs','terms':'reset_groups'}
 MERGE_ROWS=4096
-# Format 3 adds a published delta. A reader of format 2 only would read a base
-# generation a merge has partly updated, so it refuses format 3.
-FORMATS=(2,3)
+NODE_INSERT='INSERT OR REPLACE INTO nodes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)'
+# Re-read at most this many streams' extents in one hourly update.
+SHARING_REREADS=20_000
+# Format 3 adds a published delta. Format 4 measures physical space; its
+# folder figures mean something else, so a format 3 reader must refuse it.
+FORMAT=4
+OPENS=(2,3,4)
 
 
 def published(table,alias,base,volume,delta):
     """SQL condition: row `alias` of `table` is in its volume's published map, base
     generation `base` overlaid by published delta generation `delta` (NULL for none).
     These are exactly the rows a merge leaves in the base: delta rows not removed, and
-    base rows that no delta row replaces, not removed and, for files and holders, not
-    under a re-listed directory. The arguments are SQL expressions."""
+    base rows that no delta row replaces, not removed and not reset (files and holders
+    under a re-listed directory, terms of a recomputed group). The arguments are SQL
+    expressions."""
     key=KEYS[table]
     def marked(marker):
         return f'EXISTS(SELECT 1 FROM {marker} m WHERE m.generation={delta} AND m.volume={volume} AND m.id={alias}.{key})'
-    removed=marked('removed_charges' if table=='charges' else 'removed')
-    hidden=removed+(' OR '+marked('reset_dirs') if table in ('files','holders') else '')
+    markers=[marked(m) for m in (REMOVED[table],RESET.get(table)) if m]
+    removed=f'NOT {marked(REMOVED[table])}' if REMOVED[table] else '1'
     same=' AND '.join(f'o.{c}={alias}.{c}' for c in PRIMARY[table])
-    return (f'(({alias}.generation={delta} AND NOT {removed}) OR ({alias}.generation={base} AND NOT ({hidden})'
+    return (f'(({alias}.generation={delta} AND {removed}) OR ({alias}.generation={base} AND NOT ({" OR ".join(markers)})'
             f' AND NOT EXISTS(SELECT 1 FROM {table} o WHERE o.generation={delta} AND o.volume={volume} AND {same})))')
 
 
@@ -130,7 +151,7 @@ class MapStore:
                 self.db=sqlite3.connect(self.path,isolation_level=None,timeout=5)
                 self.db.row_factory=sqlite3.Row
                 existing=self.db.execute("SELECT 1 FROM sqlite_master WHERE name='volumes'").fetchone()
-                if existing and self.db.execute('PRAGMA user_version').fetchone()[0] not in FORMATS:
+                if existing and self.db.execute('PRAGMA user_version').fetchone()[0] not in OPENS:
                     raise ValueError('scanner_format_requires_fresh_store')
                 os.chmod(self.path,0o600)
                 self.db.execute('PRAGMA journal_mode=WAL')
@@ -154,7 +175,7 @@ class MapStore:
                 with self.write(rows=rows,payload_bytes=payload):
                     for statement in SCHEMA.split(';'):
                         if statement.strip():self.db.execute(statement)
-                    if not existing:self.db.execute('PRAGMA user_version=3')
+                    if not existing:self.db.execute(f'PRAGMA user_version={FORMAT}')
             # Nullable diagnostic columns extend format 2 without rewriting map
             # rows or changing old observations. Each ALTER is metadata only.
             columns={r['name'] for r in self.db.execute('PRAGMA table_info(runs)')}
@@ -172,6 +193,7 @@ class MapStore:
                 with self.write(rows=2):
                     self.db.execute('ALTER TABLE volumes ADD COLUMN delta_generation INTEGER')
                     self.db.execute('PRAGMA user_version=3')
+            if self.db.execute('PRAGMA user_version').fetchone()[0]<FORMAT:self._physical_format()
         except BaseException:
             if self.db is not None:self.db.close()
             raise
@@ -179,6 +201,29 @@ class MapStore:
         self.generation=self.volume=self.vid=self.base_gen=self.run=None
         self.changed=set();self.last_progress=0.0;self.entries=0
         self.run_context=dict(volume_id=None,action=None,trigger=None,stage=None)
+
+    def _physical_format(self):
+        """Format 3 to 4, in one transaction. The old folder figures charged shared
+        blocks to one folder; they cannot be converted, so every map is retired and
+        rebuilt by the next full walk, pruned by it like any retired map. Points,
+        tracked folders, hierarchy and runs stay. Statements are metadata, two table
+        drops and two small updates."""
+        volumes=self.db.execute('SELECT count(*) FROM volumes').fetchone()[0]
+        generations=self.db.execute('SELECT count(*) FROM generations').fetchone()[0]
+        def columns(table):return {r['name'] for r in self.db.execute(f'PRAGMA table_info({table})')}
+        with self.write(rows=16+volumes+generations):
+            if 'own_uses' in columns('nodes'):
+                self.db.execute('ALTER TABLE nodes RENAME COLUMN own_uses TO own_physical')
+                self.db.execute('ALTER TABLE nodes RENAME COLUMN uses TO physical')
+            if 'frees' not in columns('nodes'):self.db.execute('ALTER TABLE nodes ADD COLUMN frees INTEGER')
+            for column in ('used_change','unplaced_shared'):
+                if column not in columns('volumes'):self.db.execute(f'ALTER TABLE volumes ADD COLUMN {column} INTEGER')
+            self.db.execute('DROP TABLE IF EXISTS charges')
+            self.db.execute('DROP TABLE IF EXISTS removed_charges')
+            self.db.execute("UPDATE generations SET status='retired' WHERE status IN ('published','delta')")
+            self.db.execute('''UPDATE volumes SET generation=NULL,delta_generation=NULL,valid=0,full_ns=NULL,
+                status='awaiting_physical_walk' ''')
+            self.db.execute(f'PRAGMA user_version={FORMAT}')
 
     @contextmanager
     def write(self,growth=None,*,rows=None,payload_bytes=0):
@@ -331,9 +376,8 @@ class MapStore:
         if self.base_gen is not None:
             self.changed.add(identity)
             self._queue('DELETE FROM removed WHERE generation=? AND volume=? AND id=?',(self.generation,self.vid,identity))
-        self._queue('INSERT OR REPLACE INTO nodes VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-                    (self.generation,self.vid,identity,inode_key(node.parent_id),node.label,node.kind,
-                     node.listed,node.uses,None,None,node.status,node.mtime_ns))
+        self._queue(NODE_INSERT,(self.generation,self.vid,identity,inode_key(node.parent_id),node.label,node.kind,
+                                 node.listed,node.physical,None,None,node.status,node.mtime_ns,None))
 
     def file(self,identity,parent,label,allocated,mtime):
         self._queue('INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?,?)',
@@ -345,29 +389,28 @@ class MapStore:
 
     def _rows(self,table,where='1',args=()):
         """Only the scanner sees staged rows. Public queries read published rows."""
-        identity={'nodes':'id','files':'parent','holders':'dir','charges':'stream','listings':'id'}[table]
-        removed='removed_charges' if table=='charges' else 'removed'
+        identity=KEYS[table]
         # SQLite otherwise prefers the volume-wide primary-key prefix for
         # these SELECT * lookups, scanning every row per parent/stream/file.
-        index={'stream=?':'holder_stream','file_id=?':'holder_file'}.get(where) if table=='holders' else None
+        index={('holders','stream=?'):'holder_stream',('holders','file_id=?'):'holder_file',
+               ('streams','grp=?'):'stream_group',('terms','dir=?'):'term_dir'}.get((table,where))
         if table=='nodes' and where in ('parent IS NULL','parent=?','parent=? AND label=?'):
             index='node_parent'
         hint=f' INDEXED BY {index}' if index else ''
         staged=f'SELECT * FROM {table}{hint} WHERE generation=? AND volume=? AND {where}'
         params=[self.generation,self.vid,*args]
         if table in ('nodes','listings'):
-            staged+=f' AND NOT EXISTS (SELECT 1 FROM removed r WHERE r.generation=? AND r.volume=? AND r.id={table}.{identity})'
+            staged+=f' AND NOT EXISTS (SELECT 1 FROM removed r WHERE r.generation=? AND r.volume=? AND r.{"id"}={table}.{identity})'
             params.extend((self.generation,self.vid))
         if self.base_gen is None:return self.db.execute(staged,params)
-        if table in ('files','holders'):
-            hidden=f'''NOT EXISTS(SELECT 1 FROM reset_dirs s WHERE s.generation=? AND s.volume=? AND s.id=b.{identity})
-                       AND NOT EXISTS(SELECT 1 FROM removed s WHERE s.generation=? AND s.volume=? AND s.id=b.{identity})'''
-            extra=[self.generation,self.vid,self.generation,self.vid]
-        else:
-            hidden=f'''NOT EXISTS(SELECT 1 FROM {table} s WHERE s.generation=? AND s.volume=? AND s.{identity}=b.{identity})
-                       AND NOT EXISTS(SELECT 1 FROM {removed} s WHERE s.generation=? AND s.volume=? AND s.id=b.{identity})'''
-            extra=[self.generation,self.vid,self.generation,self.vid]
-        return self.db.execute(staged+f' UNION ALL SELECT * FROM {table} b{hint} WHERE generation=? AND volume=? AND {where} AND '+hidden,
+        markers=[m for m in (REMOVED[table],RESET.get(table)) if m]
+        if table not in RESET:
+            # A staged row replaces its base row.
+            hidden=[f'NOT EXISTS(SELECT 1 FROM {table} s WHERE s.generation=? AND s.volume=? AND s.{identity}=b.{identity})']
+        else:hidden=[]
+        hidden+=[f'NOT EXISTS(SELECT 1 FROM {m} s WHERE s.generation=? AND s.volume=? AND s.id=b.{identity})' for m in markers]
+        extra=[self.generation,self.vid]*len(hidden)
+        return self.db.execute(staged+f' UNION ALL SELECT * FROM {table} b{hint} WHERE generation=? AND volume=? AND {where} AND '+' AND '.join(hidden),
                                params+[self.base_gen,self.vid,*args,*extra])
 
     def _node(self,identity):
@@ -457,7 +500,7 @@ class MapStore:
                 self.begin_directory(source_id(current))
                 for f in files:self.file(source_id(f['id']),source_id(current),None,f['allocated'],f['mtime'])
                 for h in holders:self.holder(source_id(h['file_id']),source_id(current),source_id(h['stream']),h['allocated'],h['private'],h['partial'])
-            self._queue('INSERT OR REPLACE INTO nodes VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',tuple(node.values()))
+            self._queue(NODE_INSERT,tuple(node.values()))
             self.changed.add(current)
         return True
 
@@ -478,78 +521,116 @@ class MapStore:
         if self.base_gen is None:return None
         return self.db.execute('SELECT * FROM nodes WHERE generation=? AND volume=? AND id=?',(self.base_gen,self.vid,key)).fetchone()
 
-    def _charge(self,stream):
-        return self._rows('charges','stream=?',(stream,)).fetchone()
+    def _sharing(self,reader,full,parent_of):
+        """Stage the sharing groups and per-folder terms of the streams this run touched.
 
-    def _sharing(self,blocks,full):
-        charges=blocks.charges();complete=not blocks.estimated
-        affected=set(self.changed)
-        pending=[]
-        def save_charges():
-            if not pending:return
-            # Charges belong to the unpublished generation, including updates.
-            # No reservation spans the stream lookup loop.
-            with self.write(growth=16*1024**2,rows=len(pending),payload_bytes=sum(
-                    len(v.encode()) for _,args in pending for v in args if isinstance(v,str))):
-                for query,rows in groupby(pending,key=lambda row:row[0]):
-                    self.db.executemany(query,(args for _,args in rows))
-            self.progress()
-            pending.clear()
+        A full walk takes every stream. An update takes the streams of re-listed or
+        removed folders, plus every stream in their groups, so a changed copy is
+        measured against the unchanged copies it shares blocks with. `reader` gives a
+        file's extents by inode, or is None where none can be read (each stream then
+        counts once, by its allocation). Returns (folders whose terms changed,
+        {folder: [physical, frees]} for a full walk, gap codes)."""
+        gaps=set();known={};old_groups=set()
         if full:
-            streams=[r[0] for r in self.db.execute('SELECT DISTINCT stream FROM holders WHERE generation=? AND volume=?',(self.generation,self.vid))]
+            rows=self.db.execute('''SELECT stream,dir,file_id,allocated,private FROM holders INDEXED BY holder_stream
+                WHERE generation=? AND volume=? ORDER BY stream''',(self.generation,self.vid))
         else:
-            streams={r[0] for r in self.db.execute('''SELECT stream FROM holders WHERE generation=? AND volume=? AND dir IN
+            touched={r[0] for r in self.db.execute('''SELECT stream FROM holders WHERE generation=? AND volume=? AND dir IN
                  (SELECT id FROM reset_dirs WHERE generation=? AND volume=? UNION SELECT id FROM removed WHERE generation=? AND volume=?)''',
                  (self.base_gen,self.vid,self.generation,self.vid,self.generation,self.vid))}
-            streams.update(r[0] for r in self.db.execute('SELECT DISTINCT stream FROM holders WHERE generation=? AND volume=?',(self.generation,self.vid)))
+            touched.update(r[0] for r in self.db.execute('SELECT DISTINCT stream FROM holders WHERE generation=? AND volume=?',
+                                                         (self.generation,self.vid)))
+            for stream in touched:
+                row=self._rows('streams','stream=?',(stream,)).fetchone()
+                if row:known[stream]=row;old_groups.add(row['grp'])
+            for group in old_groups:
+                for row in self._rows('streams','grp=?',(group,)):
+                    known[row['stream']]=row;touched.add(row['stream'])
+            rows=((stream,h['dir'],h['file_id'],h['allocated'],h['private'])
+                  for stream in touched for h in self._rows('holders','stream=?',(stream,)))
+        # stream -> [holding folders, holding files, allocated, APFS private bytes]
+        streams={}
+        for stream,folder,file_id,allocated,private in rows:
+            entry=streams.get(stream)
+            if entry is None:streams[stream]=entry=[[],[],allocated,private]
+            entry[0].append(folder)
+            if file_id not in entry[1]:entry[1].append(file_id)
+        if reader and not full and len(streams)>SHARING_REREADS:
+            # Counted by stream until the next full walk: shared blocks between
+            # different streams may count twice, and the run says so.
+            reader=None;gaps.add('sharing_reread_capped')
+        extents={}
+        if reader:
+            for count,(stream,(_,files,_,_)) in enumerate(streams.items()):
+                for file_id in files:
+                    try:extents[stream]=reader(source_id(file_id));break
+                    except OSError:continue
+                else:gaps.add('extents_unreadable')
+                if count%1000==0:self.progress()
+        allocated={stream:entry[2] for stream,entry in streams.items()}
+        try:found,group=accounting.pieces(extents,allocated)
+        except OverflowError:
+            gaps.add('block_map_budget');found,group=accounting.pieces({},allocated)
+        del extents
+        unplaced={}
+        if reader and not full:
+            # A copy made since the last full walk can share blocks with a file the
+            # update did not read. APFS says how much of a single file is private;
+            # the rest is held, and counted, where its partner is.
+            for stream,(_,files,_,private) in streams.items():
+                previous=known.get(stream)
+                if private is None or len(files)!=1 or (previous is not None and not previous['unplaced']):continue
+                alone=frozenset((stream,))
+                unknown=min(found.get(alone,0)-private,found.get(alone,0))
+                if unknown>0:found[alone]-=unknown;unplaced[stream]=unknown
+        by_group=defaultdict(dict)
+        for members,size in found.items():
+            by_group[group[next(iter(members))]][members]=size
+        holding={stream:entry[0] for stream,entry in streams.items()}
+        affected=set();own={}
+        for key,members in by_group.items():
+            for folder,(physical,frees) in accounting.terms(members,holding,parent_of).items():
+                self._queue('INSERT OR REPLACE INTO terms VALUES(?,?,?,?,?,?)',(self.generation,self.vid,key,folder,physical,frees))
+                affected.add(folder)
+                if full:
+                    term=own.setdefault(folder,[0,0]);term[0]+=physical;term[1]+=frees
+            self.progress()
         for stream in streams:
-            old=self._charge(stream)
-            if old:affected.add(old['dir'])
-            holders=list(self._rows('holders','stream=?',(stream,)))
-            affected.update(h['dir'] for h in holders)
-            if not holders:
-                pending.append(('INSERT OR IGNORE INTO removed_charges VALUES(?,?,?)',(self.generation,self.vid,stream)))
-            else:
-                owner=min(holders,key=lambda h:(str(h['file_id']),str(h['dir'])))
-                same=old and all(old[k]==owner[k] for k in ('allocated','private','partial'))
-                if not full and same:amount=old['charge']
-                elif not full and owner['partial']:
-                    amount=owner['private'] or 0;complete=False
-                else:amount=charges.get(int(source_id(stream)),owner['private'] or 0 if owner['partial'] else owner['allocated'])
-                pending.append(('INSERT OR REPLACE INTO charges VALUES(?,?,?,?,?,?,?,?)',
-                    (self.generation,self.vid,stream,amount,owner['allocated'],owner['private'],owner['partial'],owner['dir'])))
-            if len(pending)>=4096:save_charges()
-        save_charges()
-        return affected,complete
+            self._queue('INSERT OR REPLACE INTO streams VALUES(?,?,?,?,?)',
+                        (self.generation,self.vid,stream,group[stream],unplaced.get(stream,0)))
+        if not full:
+            for stream in touched-streams.keys():
+                self._queue('INSERT OR IGNORE INTO removed_streams VALUES(?,?,?)',(self.generation,self.vid,stream))
+            for key in old_groups|by_group.keys():
+                self._queue('INSERT OR IGNORE INTO reset_groups VALUES(?,?,?)',(self.generation,self.vid,key))
+            for key in old_groups:
+                affected.update(r[0] for r in self.db.execute('SELECT dir FROM terms WHERE generation=? AND volume=? AND grp=?',
+                                                              (self.base_gen,self.vid,key)))
+        self.flush()
+        return affected,own,gaps
 
-    def _own(self,node,homes):
-        listed=uses=node['own_listed'];streams=set()
-        for h in self._rows('holders','dir=?',(node['id'],)):
-            if h['file_id'] not in homes:
-                holders=list(self._rows('holders','file_id=?',(h['file_id'],)))
-                homes[h['file_id']]=min((r['dir'] for r in holders),key=str)
-            if homes[h['file_id']]!=node['id']:listed-=h['allocated']
-            uses-=h['allocated']
-            if h['stream'] not in streams:
-                charge=self._charge(h['stream'])
-                if charge and charge['dir']==node['id']:uses+=charge['charge']
-                streams.add(h['stream'])
-        return listed,uses
+    def _own(self,node):
+        listed=node['own_listed'];physical=frees=node['own_physical']
+        for term in self._rows('terms','dir=?',(node['id'],)):
+            physical+=term['physical'];frees+=term['frees']
+        return listed,physical,frees
 
-    def _aggregate_full(self,affected):
-        # Files remain on disk. Only directory IDs and integer totals form the
-        # temporary bottom-up working set; no recursive SQL or ancestor scans.
-        keys=[];parents=[];listed=array('q');uses=array('q')
-        for row in self.db.execute('SELECT id,parent,own_listed FROM nodes WHERE generation=? AND volume=?',
+    def _tree(self):
+        """The staged folders as index arrays: keys, parents and own totals."""
+        keys=[];parents=[];listed=array('q');physical=array('q')
+        for row in self.db.execute('SELECT id,parent,own_listed,own_physical FROM nodes WHERE generation=? AND volume=?',
                                    (self.generation,self.vid)):
             keys.append(row['id']);parents.append(row['parent'])
-            listed.append(row['own_listed']);uses.append(row['own_listed'])
-        index={key:i for i,key in enumerate(keys)}
-        homes={}
-        for identity in affected:
-            node=self._node(identity)
-            if node:
-                listed[index[identity]],uses[index[identity]]=self._own(node,homes)
+            listed.append(row['own_listed']);physical.append(row['own_physical'])
+        return keys,parents,listed,physical,{key:i for i,key in enumerate(keys)}
+
+    def _aggregate_full(self,tree,own):
+        # Files remain on disk. Only directory IDs and integer totals form the
+        # temporary bottom-up working set; no recursive SQL or ancestor scans.
+        keys,parents,listed,physical,index=tree
+        frees=array('q',physical)
+        for folder,(extra,freed) in own.items():
+            i=index[folder];physical[i]+=extra;frees[i]+=freed
         parent_index=array('q');remaining=array('I',[0])*len(keys)
         for parent in parents:
             if parent is not None and parent not in index:raise ScanError('missing_directory_ancestor')
@@ -561,19 +642,18 @@ class MapStore:
         while ready:
             child=ready.popleft();visited+=1;parent=parent_index[child]
             if parent>=0:
-                listed[parent]+=listed[child];uses[parent]+=uses[child]
+                listed[parent]+=listed[child];physical[parent]+=physical[child];frees[parent]+=frees[child]
                 remaining[parent]-=1
                 if not remaining[parent]:ready.append(parent)
         if visited!=len(keys):raise ScanError('cyclic_directory_ancestry')
         self.progress()
         for first in range(0,len(keys),8192):
             with self.write(rows=min(8192,len(keys)-first)):
-                self.db.executemany('UPDATE nodes SET listed=?,uses=? WHERE generation=? AND volume=? AND id=?',
-                    ((listed[i],uses[i],self.generation,self.vid,keys[i]) for i in range(first,min(first+8192,len(keys)))))
+                self.db.executemany('UPDATE nodes SET listed=?,physical=?,frees=? WHERE generation=? AND volume=? AND id=?',
+                    ((listed[i],physical[i],frees[i],self.generation,self.vid,keys[i]) for i in range(first,min(first+8192,len(keys)))))
             self.progress()
 
     def _aggregate(self,affected):
-        homes={}
         work=set()
         for identity in affected:
             old=self._old_node(identity)
@@ -603,11 +683,11 @@ class MapStore:
             for identity in level:
                 node=self._node(identity)
                 if node is None:continue
-                listed,uses=self._own(node,homes)
+                listed,physical,frees=self._own(node)
                 for child in self._rows('nodes','parent=?',(identity,)):
-                    listed+=child['listed'];uses+=child['uses']
-                updated=list(node);updated[0]=self.generation;updated[8]=listed;updated[9]=uses
-                self._queue('INSERT OR REPLACE INTO nodes VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',updated)
+                    listed+=child['listed'];physical+=child['physical'];frees+=child['frees']
+                updated=dict(node);updated.update(generation=self.generation,listed=listed,physical=physical,frees=frees)
+                self._queue(NODE_INSERT,tuple(updated.values()))
                 self.changed.add(identity)
             # Parents must see the committed staged totals of their children.
             self.flush()
@@ -623,27 +703,45 @@ class MapStore:
         count,payload=self._row_size('dirty',where,args)
         return [(f'DELETE FROM dirty WHERE {where}',args,count,payload,'dirty')]
 
-    def finish_volume(self,volume,blocks,gaps,*,full,lean,bookmark=None,event_uuid=None,complete=True,physical=True,event_progress=None):
+    def finish_volume(self,volume,reader,gaps,*,full,lean,bookmark=None,event_uuid=None,complete=True,physical=True,
+                      event_progress=None,used_before=None):
+        """Place shared blocks, total every folder and publish. `volume` is read after the
+        walk; `used_before` is its used space before it, for the reconciliation's tolerance."""
         self.flush();old=self.db.execute('SELECT * FROM volumes WHERE id=?',(self.volume,)).fetchone()
         self.phase('sharing')
-        affected,sharing_complete=self._sharing(blocks,full)
-        self.phase('aggregate')
         if full:
-            self._aggregate_full(affected)
-        else:self._aggregate(affected)
-        if not sharing_complete:gaps=set(gaps)|{'partial_stream_needs_full_map'}
-        complete=complete and sharing_complete
+            tree=self._tree();keys,parents,_,_,index=tree
+            def parent_of(folder):
+                if folder not in index:raise ScanError('missing_directory_ancestor')
+                return parents[index[folder]]
+        else:
+            parents={}
+            def parent_of(folder):
+                if folder not in parents:
+                    node=self._node(folder)
+                    if node is None:raise ScanError('missing_directory_ancestor')
+                    parents[folder]=node['parent']
+                return parents[folder]
+        affected,own,sharing_gaps=self._sharing(reader,full,parent_of)
+        self.phase('aggregate')
+        if full:self._aggregate_full(tree,own);del tree
+        else:self._aggregate(affected|self.changed)
+        gaps=set(gaps)|sharing_gaps
+        complete=complete and not sharing_gaps
         roots=list(self._rows('nodes','parent IS NULL'))
-        total=sum(r['uses'] for r in roots) if roots else None
+        total=sum(r['physical'] for r in roots) if roots else None
+        used_change=volume.used-used_before if volume.used is not None and used_before is not None else 0
+        unplaced=sum(row['unplaced'] for row in self._rows('streams','unplaced>0'))
+        if unplaced:gaps.add('shared_copy_placed_at_full_walk')
         if physical:
             result=reconcile(volume.used,total,supported=volume.fs in ('apfs','hfs'),complete=complete,
-                             previously_invalid=bool(old['generation'] and not old['valid']),full=full)
+                             previously_invalid=bool(old['generation'] and not old['valid']),full=full,used_change=used_change)
         else:
-            # No extents provider (Linux): uses charge hard links once; no residual is claimed.
-            result={'valid':True,'uses':total,'not_attributed':None,'status':'observed' if complete else 'partial'}
+            # No extents provider (Linux): each inode counts once per folder; no residual is claimed.
+            result={'valid':True,'physical':total,'not_placed':None,'tolerance':None,'status':'observed' if complete else 'partial'}
             gaps=set(gaps)|{'physical_residual_not_computed'}
         plan=self._publication_changes()
-        metric='uses' if result['valid'] else 'listed'
+        metric='physical' if result['valid'] else 'listed'
         where='generation=? AND volume=?'
         params=(self.generation,self.vid)
         if full:
@@ -687,10 +785,11 @@ class MapStore:
                 self._points(published,now,result['valid'],full,delta)
                 save_hierarchy(self.db,published,self.volume,now,volume_key=self.vid,delta=delta)
                 self.db.execute('''UPDATE volumes SET label=?,mount=?,generation=?,observed_ns=?,full_ns=?,volume_used=?,capacity=?,free=?,available=?,
-                    valid=?,status=?,lean=?,bookmark=?,no_progress=?,event_uuid=?,gaps=?,mounted=1,budget_retry_bytes=NULL,delta_generation=? WHERE id=?''',
+                    valid=?,status=?,lean=?,bookmark=?,no_progress=?,event_uuid=?,gaps=?,mounted=1,budget_retry_bytes=NULL,delta_generation=?,
+                    used_change=?,unplaced_shared=? WHERE id=?''',
                     (volume.label,volume.mount,published,now,now if full else old['full_ns'],volume.used,volume.capacity,volume.free,volume.available,
                      int(result['valid']),result['status'],int(lean),bookmark,no_progress,
-                     event_uuid,gap_text,delta,self.volume))
+                     event_uuid,gap_text,delta,used_change,unplaced,self.volume))
                 if full and old['generation'] is not None:
                     self.db.execute("UPDATE generations SET status='retired' WHERE id=?",(old['generation'],))
                 self.db.execute("UPDATE generations SET status='published' WHERE id=?",(published,))
@@ -752,7 +851,7 @@ class MapStore:
         the delta's markers and, within each, the base rows by key, so a marker that hides
         more than one batch keeps its place."""
         key,primary=KEYS[table],PRIMARY[table]
-        markers=['removed_charges' if table=='charges' else 'removed']+(['reset_dirs'] if table in ('files','holders') else [])
+        markers=[m for m in (REMOVED[table],RESET.get(table)) if m]
         # Each marker table's next id by its key; the smaller is the next marker.
         first,following=(f"SELECT min(id) FROM ({' UNION ALL '.join(f'SELECT * FROM (SELECT id FROM {m} WHERE generation=:d AND volume=:v{bound} ORDER BY id LIMIT 1)' for m in markers)})"
                          for bound in ('',' AND id>:after'))
@@ -806,7 +905,7 @@ class MapStore:
             last=tuple(found[-1])[:-1]
 
     def _points(self,generation,now,valid,full,delta=None):
-        metric='uses' if valid else 'listed'
+        metric='physical' if valid else 'listed'
         if full:
             rows=self.db.execute(f'''SELECT * FROM nodes WHERE generation=? AND volume=? AND ({metric}>=1000000000 OR
                  EXISTS(SELECT 1 FROM tracked WHERE volume=? AND id=source_id(nodes.id)))''',(generation,self.vid,self.volume))
@@ -913,9 +1012,9 @@ def hot_set(path,limit):
     try:
         db.execute('BEGIN')  # The format and the map it selects are one snapshot.
         version=db.execute('PRAGMA user_version').fetchone()[0]
-        if version not in FORMATS:
+        if version not in OPENS:
             raise ValueError('scanner_format_requires_fresh_store')
-        rows=db.execute(hot_set_query('delta_generation' if version==3 else 'NULL'),(limit,)).fetchall()
+        rows=db.execute(hot_set_query('delta_generation' if version>=3 else 'NULL'),(limit,)).fetchall()
     finally:
         db.close()
     return [(volume,source_id(folder),source_id(parent),os.path.normpath(mount+rel)) for volume,folder,parent,mount,rel in rows]
@@ -937,8 +1036,11 @@ class MapQuery:
         db.row_factory = sqlite3.Row
         try:
             db.execute('BEGIN')
-            if db.execute('PRAGMA user_version').fetchone()[0] not in FORMATS:
-                raise ValueError('scanner_format_requires_fresh_store')
+            version=db.execute('PRAGMA user_version').fetchone()[0]
+            if version!=FORMAT:
+                if version not in OPENS:raise ValueError('scanner_format_requires_fresh_store')
+                # The scanner converts the store when it next runs; until then nothing is shown.
+                return dict(schema_version=1,shape='storage',action=action,status='awaiting_physical_walk',coverage={},rows=[],truncated=False)
             volumes = list(db.execute('SELECT * FROM volumes ORDER BY label LIMIT 2001'))
             def map_rows(table,v,where,tail='',**params):
                 # Each generation of the published map keeps its own index, seek and
@@ -948,18 +1050,27 @@ class MapQuery:
                 return [row for generation in dict.fromkeys((v['generation'],delta)) if generation is not None
                         for row in db.execute(f'''SELECT * FROM {table} x WHERE x.generation=:gen AND x.volume=:v
                             AND {published(table,'x',':g',':v',':d')} AND {where} {tail}''',dict(names,gen=generation))]
+            def map_sum(table,v,column,where,**params):
+                delta=v['delta_generation'] if 'delta_generation' in v.keys() else None
+                names=dict(params,g=v['generation'],d=delta,v=v['key'])
+                return sum(db.execute(f'''SELECT coalesce(sum(x.{column}),0) FROM {table} x WHERE x.generation=:gen AND x.volume=:v
+                    AND {published(table,'x',':g',':v',':d')} AND {where}''',dict(names,gen=generation)).fetchone()[0]
+                    for generation in dict.fromkeys((v['generation'],delta)) if generation is not None)
             chosen = params.get('volume_id') or (volumes[0]['id'] if volumes else None)
             volume = next((v for v in volumes if v['id']==chosen),None)
-            rows=[];truncated=False;next_cursor=None;hierarchy=None
+            rows=[];truncated=False;next_cursor=None;hierarchy=None;folder=None
             if action == 'volumes':
                 if cursor:raise ValueError('incompatible_storage_cursor')
                 for v in volumes[:limit+1]:
                     root = next(iter(map_rows('nodes',v,'x.parent IS NULL','LIMIT 1')),None)
-                    listed,uses=(root['listed'],root['uses']) if root else (None,None)
-                    valid = bool(v['valid'])
+                    listed,physical=(root['listed'],root['physical']) if root else (None,None)
+                    valid = bool(v['valid']) and physical is not None
+                    placed=valid and v['volume_used'] is not None and 'physical_residual_not_computed' not in json.loads(v['gaps'])
                     rows.append(dict(id=v['id'],label=v['label'],observed_ns=v['observed_ns'],full_scan_ns=v['full_ns'],
-                                     listed=listed,uses=uses if valid else None,volume_used=v['volume_used'],
-                                     not_attributed=v['volume_used']-uses if valid and uses is not None and v['volume_used'] is not None else None,
+                                     listed=listed,physical=physical if valid else None,volume_used=v['volume_used'],
+                                     not_placed=v['volume_used']-physical if placed else None,
+                                     tolerance=max(accounting.GB,abs(v['used_change'] or 0)) if placed else None,
+                                     unplaced_shared=v['unplaced_shared'] or 0,
                                      capacity=v['capacity'],free=v['free'],available=v['available'],valid=valid,status=v['status'],
                                      mounted=bool(v['mounted']),gaps=json.loads(v['gaps'])))
                 truncated=len(rows)>limit
@@ -968,7 +1079,7 @@ class MapQuery:
                 if parent is None:
                     root = next(iter(map_rows('nodes',volume,'x.parent IS NULL','LIMIT 1')),None)
                     parent = source_id(root['id']) if root else None
-                metric='uses' if volume['valid'] else 'listed'
+                metric='physical' if volume['valid'] else 'listed'
                 scope=_scope([action,volume['generation'],volume['observed_ns'],chosen,parent,metric,'size-desc-id-desc-v2'])
                 if cursor and cursor['scope']!=scope:raise ValueError('stale_or_incompatible_storage_cursor')
                 seek='';values={}
@@ -978,13 +1089,18 @@ class MapQuery:
                 seek=f' AND (x.{metric},x.id)<(:size,:id)' if cursor else ''
                 for n in map_rows('nodes',volume,f'x.parent IS :parent{seek}',f'ORDER BY x.{metric} DESC,x.id DESC LIMIT :n',
                                   parent=inode_key(parent),n=limit+1,**values):
+                    valid=bool(volume['valid'])
                     rows.append(dict(id=source_id(n['id']),parent_id=source_id(n['parent']),label=n['label'],kind=n['kind'],listed=n['listed'],
-                                     uses=n['uses'] if volume['valid'] else None,status=n['status'],observed_ns=volume['observed_ns'],_size=n[metric] or 0))
+                                     physical=n['physical'] if valid else None,frees=n['frees'] if valid else None,
+                                     asterisk=accounting.asterisk(n['physical'],n['listed'],n['frees']) if valid else None,
+                                     status=n['status'],observed_ns=volume['observed_ns'],_size=n[metric] or 0))
                 seek=' AND (x.allocated,x.id)<(:size,:id)' if cursor else ''
                 for f in map_rows('files',volume,f'x.parent IS :parent{seek}','ORDER BY x.allocated DESC,x.id DESC LIMIT :n',
                                   parent=inode_key(parent),n=limit+1,**values):
+                    # A file's allocation is its own physical space, shared blocks included.
                     rows.append(dict(id=source_id(f['id']),parent_id=source_id(f['parent']),label=f['label'],kind='file',listed=f['allocated'],
-                                     uses=None,status='observed',observed_ns=volume['observed_ns'],_size=f['allocated']))
+                                     physical=f['allocated'] if volume['valid'] else None,frees=None,asterisk=None,
+                                     status='observed',observed_ns=volume['observed_ns'],_size=f['allocated']))
                 def order(row):
                     key=inode_key(row['id'])
                     return row['_size'],isinstance(key,str),key
@@ -993,6 +1109,14 @@ class MapQuery:
                 rows=rows[:limit]
                 if truncated and rows:next_cursor=_encode_cursor({'size':rows[-1]['_size'],'id':rows[-1]['id'],'scope':scope})
                 for row in rows:row.pop('_size')
+                own=next(iter(map_rows('nodes',volume,'x.id=:id','LIMIT 1',id=inode_key(parent))),None) if parent is not None else None
+                if own is not None and volume['valid']:
+                    # Rows add to more than their folder when they share blocks with each
+                    # other: each counts every block it holds. Its own entry's blocks are
+                    # in the folder but in no row, a few kilobytes.
+                    shared=(map_sum('nodes',volume,'physical','x.parent IS :parent',parent=inode_key(parent))+
+                            map_sum('files',volume,'allocated','x.parent IS :parent',parent=inode_key(parent))-own['physical'])
+                    folder=dict(id=parent,physical=own['physical'],shared_between_rows=shared if shared>=accounting.GB else None)
             elif volume:
                 start = int(params.get('start_ns',float(params.get('start',0))*1e9))
                 end = int(params.get('end_ns',float(params.get('end',time.time()))*1e9))
@@ -1044,5 +1168,6 @@ class MapQuery:
                 coverage.update(nested_totals_overlap=True,hierarchy_observed_ns=hierarchy['observed_ns'] if hierarchy else None,
                                 hierarchy_status='observed' if hierarchy else 'unobserved')
             return dict(schema_version=1,shape='storage',action=action,status=volume['status'] if volume else 'unobserved',coverage=coverage,
-                        rows=rows[:limit],truncated=truncated,next_cursor=next_cursor)
+                        rows=rows[:limit],truncated=truncated,next_cursor=next_cursor,
+                        **({'folder':folder} if action=='children' else {}))
         finally:db.close()

@@ -7,7 +7,6 @@ import unittest
 from unittest.mock import patch
 
 from machine_audit.budget import Budget, BudgetExceeded
-from machine_audit.scanner.accounting import Blocks, Stream
 from machine_audit.scanner.encoding import inode_key, source_id
 from machine_audit.scanner.native import Volume
 from machine_audit.scanner.store import MapStore, MapQuery
@@ -58,8 +57,9 @@ class CompactMapTests(unittest.TestCase):
     def tearDown(self):
         self.store.close();self.temp.cleanup()
 
-    def node(self,identity,parent,size=0,label=None):
-        self.store.directory(Node(identity,parent,label or identity,'directory',size,size,'observed',None,0))
+    def node(self,identity,parent,size=0,label=None,physical=None):
+        # `physical` is the folder's own bytes outside holder files; listed includes them.
+        self.store.directory(Node(identity,parent,label or identity,'directory',size,size if physical is None else physical,'observed',None,0))
 
     def seed(self):
         self.store.prepare(self.volume)
@@ -67,29 +67,30 @@ class CompactMapTests(unittest.TestCase):
         for branch in range(2,22):
             self.node(str(branch),'1',2*GB)
             for file in range(50):self.store.file(str(branch*100+file),str(branch),f'f{file}',40_000_000,0)
-        self.store.finish_volume(self.volume,Blocks(),[],full=True,lean=True)
+        self.store.finish_volume(self.volume, None,[],full=True,lean=True)
 
     def test_obsolete_generation_pruning_is_batched_resumable_and_generation_last(self):
         # A restarted walk used one transaction to delete millions of abandoned
         # rows; cache_spill=OFF retained its dirty pages for the whole deletion.
         self.store.prepare(self.volume);self.node('published',None,2*GB)
-        self.store.finish_volume(self.volume,Blocks(),[],full=True,lean=True)
+        self.store.finish_volume(self.volume, None,[],full=True,lean=True)
         before=MapQuery(self.store.path).query()
         vid=self.store.vid
         with self.store.write():
             for generation,status in ((100,'retired'),(101,'building')):
                 self.store.db.execute('INSERT INTO generations VALUES(?,?,?)',(generation,vid,status))
-                self.store.db.execute('INSERT INTO nodes VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-                    (generation,vid,0,None,'obsolete','directory',0,0,0,0,'observed',0))
+                self.store.db.execute('INSERT INTO nodes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (generation,vid,0,None,'obsolete','directory',0,0,0,0,'observed',0,0))
                 self.store.db.executemany('INSERT INTO files VALUES(?,?,?,?,?,?,?)',
                     ((generation,vid,i//100,i%100,'obsolete',1,0) for i in range(4097)))
                 self.store.db.executemany('INSERT INTO holders VALUES(?,?,?,?,?,?,?,?)',
                     ((generation,vid,i//100,i%100,i%100,1,None,0) for i in range(4097)))
-                self.store.db.execute('INSERT INTO charges VALUES(?,?,?,?,?,?,?,?)',(generation,vid,0,1,1,None,0,0))
+                self.store.db.execute('INSERT INTO streams VALUES(?,?,?,?,?)',(generation,vid,0,0,0))
+                self.store.db.execute('INSERT INTO terms VALUES(?,?,?,?,?,?)',(generation,vid,0,0,1,1))
                 self.store.db.execute('INSERT INTO listings VALUES(?,?,?,?,?)',(generation,vid,0,0,4097))
-                for table in ('removed','reset_dirs','removed_charges'):
+                for table in ('removed','reset_dirs','removed_streams','reset_groups'):
                     self.store.db.execute(f'INSERT INTO {table} VALUES(?,?,?)',(generation,vid,0))
-        tables=('nodes','files','holders','charges','listings','removed','reset_dirs','removed_charges')
+        tables=('nodes','files','holders','streams','terms','listings','removed','reset_dirs','removed_streams','reset_groups')
         original_write=self.store.write;committed=[];interrupt=True
         @contextmanager
         def checked_write(*args,**kwargs):
@@ -124,7 +125,7 @@ class CompactMapTests(unittest.TestCase):
         self.assertEqual([source_id(v) for v in keys],values)
         self.store.prepare(self.volume);self.node('root',None)
         for identity in values:self.store.file(identity,'root',identity,10,0)
-        self.store.finish_volume(self.volume,Blocks(),[],full=True,lean=True)
+        self.store.finish_volume(self.volume, None,[],full=True,lean=True)
         query=MapQuery(self.store.path);cursor=None;found=[]
         while True:
             page=query.query('children',volume_id='v',limit=2,cursor=cursor)
@@ -135,27 +136,25 @@ class CompactMapTests(unittest.TestCase):
 
     def test_unsigned_clone_and_negative_partial_stream_do_not_alias(self):
         # The native uint64 clone and signed partial-stream key must stay
-        # distinct through persisted holders, charges and public totals.
-        blocks=Blocks()
-        blocks.add(Stream(2**64-7,'a',8,None,False),[(0,8)])
-        blocks.add(Stream(-7,'b',8,0,True),[(8,8)])
+        # distinct through persisted holders, streams and public totals.
+        extents={'1':[(0,8)],'2':[(8,8)]}
         self.store.prepare(self.volume)
         self.node('root',None)
-        self.node('a','root',8);self.node('b','root',8)
+        self.node('a','root',8,physical=0);self.node('b','root',8,physical=0)
         self.store.holder(1,'a',2**64-7,8,None,False)
         self.store.holder(2,'b',-7,8,0,True)
-        self.store.finish_volume(self.volume,blocks,[],full=True,lean=True)
-        charges={int(source_id(row['stream'])):row['charge']
-                 for row in self.store.db.execute('SELECT stream,charge FROM charges')}
-        self.assertEqual(charges,{2**64-7:8,-7:8})
+        self.store.finish_volume(self.volume,extents.__getitem__,[],full=True,lean=True)
+        groups={int(source_id(row['stream'])):int(source_id(row['grp']))
+                for row in self.store.db.execute('SELECT stream,grp FROM streams')}
+        self.assertEqual(groups,{2**64-7:2**64-7,-7:-7})
         children=MapQuery(self.store.path).query('children',volume_id='v')['rows']
-        self.assertEqual({row['id']:row['uses'] for row in children},{'a':8,'b':8})
+        self.assertEqual({row['id']:row['physical'] for row in children},{'a':8,'b':8})
 
     def test_holder_lookups_use_specific_indexes_and_keep_shared_totals(self):
         # The volume-wide primary-key scan made each stream/file lookup
         # revisit every holder after the first real full walk.
         self.store.prepare(self.volume)
-        self.node('root',None);self.node('a','root',4*GB);self.node('b','root',8*GB)
+        self.node('root',None);self.node('a','root',4*GB,physical=0);self.node('b','root',8*GB,physical=0)
         self.store.holder(1,'a',1,4*GB,None,False)
         self.store.holder(1,'b',1,4*GB,None,False)  # Same file in two directories.
         self.store.holder(2,'b',2,4*GB,2*GB,True)
@@ -174,19 +173,19 @@ class CompactMapTests(unittest.TestCase):
                     self.assertEqual(sum('USING INDEX '+index+' ' in detail for detail in plan),branches,plan)
 
         check_lookups(1)
-        blocks=Blocks()
-        blocks.add(Stream(1,'a',4*GB,None,False),[(0,4*GB)])
-        blocks.add(Stream(2,'b',4*GB,2*GB,True),[(2*GB,4*GB)])
-        self.store.finish_volume(self.volume,blocks,[],full=True,lean=True)
+        # Stream 2 shares 2 GB with stream 1: the union is 6 GB. Listed counts the
+        # link to file 1 in each folder, as Finder does.
+        extents={'1':[(0,4*GB)],'2':[(2*GB,4*GB)]}
+        self.store.finish_volume(self.volume,extents.__getitem__,[],full=True,lean=True)
         first=MapQuery(self.store.path).query()['rows'][0]
-        self.assertEqual((first['listed'],first['uses']),(8*GB,6*GB))
+        self.assertEqual((first['listed'],first['physical']),(12*GB,6*GB))
         self.store.prepare(self.volume,full=False)
-        self.store.begin_directory('a');self.node('a','root',4*GB)
+        self.store.begin_directory('a');self.node('a','root',4*GB,physical=0)
         self.store.holder(1,'a',1,4*GB,None,False);self.store.flush()
         check_lookups(2)
-        self.store.finish_volume(self.volume,Blocks(),[],full=False,lean=True)
+        self.store.finish_volume(self.volume,extents.__getitem__,[],full=False,lean=True)
         second=MapQuery(self.store.path).query()['rows'][0]
-        self.assertEqual((second['listed'],second['uses']),(8*GB,6*GB))
+        self.assertEqual((second['listed'],second['physical']),(12*GB,6*GB))
 
     def test_parent_lookups_use_index_through_staged_moves_and_path_resolution(self):
         # Hourly replay repeatedly resolved paths by scanning every directory
@@ -194,7 +193,7 @@ class CompactMapTests(unittest.TestCase):
         self.store.prepare(self.volume)
         self.node('root',None);self.node('branch','root')
         self.node('leaf','branch');self.node('other','root')
-        self.store.finish_volume(self.volume,Blocks(),[],full=True,lean=True)
+        self.store.finish_volume(self.volume, None,[],full=True,lean=True)
 
         def check_lookups(branches,moved=False):
             cases=[('parent IS NULL',(),{'root'}),
@@ -228,7 +227,7 @@ class CompactMapTests(unittest.TestCase):
             self.store.prepare(self.volume)
             self.node('parent',None,10*GB+extra);self.node('child','parent',10*GB)
             with patch('machine_audit.scanner.store.time.time_ns',return_value=at):
-                self.store.finish_volume(self.volume,Blocks(),[],full=True,lean=True)
+                self.store.finish_volume(self.volume, None,[],full=True,lean=True)
         result=MapQuery(self.store.path).query('growth',start_ns=1_000_000_000,end_ns=2_000_000_000)
         changes={row['id']:row['change'] for row in result['rows']}
         self.assertEqual(changes,{'parent':50_000_000,'child':0})
@@ -239,13 +238,13 @@ class CompactMapTests(unittest.TestCase):
         self.store.prepare(self.volume);self.node('root',None)
         self.node('a','root');self.node('b','root');self.node('leaf','a',2*GB)
         with patch('machine_audit.scanner.store.time.time_ns',return_value=1_000_000_000):
-            self.store.finish_volume(self.volume,Blocks(),[],full=True,lean=True)
+            self.store.finish_volume(self.volume, None,[],full=True,lean=True)
         query=MapQuery(self.store.path)
         first=query.query('growth',start_ns=0,end_ns=1_000_000_000,limit=1)
         self.store.prepare(self.volume,full=False)
         self.store.relocate('leaf','b','leaf','/synthetic/b/leaf',False)
         with patch('machine_audit.scanner.store.time.time_ns',return_value=2_000_000_000):
-            self.store.finish_volume(self.volume,Blocks(),[],full=False,lean=True)
+            self.store.finish_volume(self.volume, None,[],full=False,lean=True)
         observed=list(self.store.db.execute('''SELECT e.observed_ns,n.parent FROM hierarchy_epochs e JOIN hierarchy_nodes n
             ON n.volume=e.volume AND n.version=e.version WHERE n.id='leaf' ORDER BY e.observed_ns'''))
         self.assertEqual([tuple(row) for row in observed],[(1_000_000_000,'a'),(2_000_000_000,'b')])
@@ -264,7 +263,7 @@ class CompactMapTests(unittest.TestCase):
         self.store.begin_directory('2');self.node('2','1',3*GB)
         self.store.file('9999','2','new',3*GB,0)
         self.store.flush();before=self.store.db.total_changes
-        self.store.finish_volume(self.volume,Blocks(),[],full=False,lean=True)
+        self.store.finish_volume(self.volume, None,[],full=False,lean=True)
         self.assertLess(self.store.db.total_changes-before,150)
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM files WHERE generation=?',(published,)).fetchone()[0],951)
         self.assertEqual(self.store.generation,published)
@@ -272,26 +271,26 @@ class CompactMapTests(unittest.TestCase):
             query.query('children',limit=2,cursor=cursor)
         result=MapQuery(self.store.path).query('children',volume_id='v',parent_id='3')
         self.assertEqual(len(result['rows']),50)
-        self.assertEqual(MapQuery(self.store.path).query()['rows'][0]['uses'],41*GB)
+        self.assertEqual(MapQuery(self.store.path).query()['rows'][0]['physical'],41*GB)
         self.store.prepare(self.volume,full=False);self.store.clear_subtree('2')
-        self.store.finish_volume(self.volume,Blocks(),[],full=False,lean=True)
+        self.store.finish_volume(self.volume, None,[],full=False,lean=True)
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM files').fetchone()[0],950)
-        self.assertEqual(MapQuery(self.store.path).query()['rows'][0]['uses'],38*GB)
+        self.assertEqual(MapQuery(self.store.path).query()['rows'][0]['physical'],38*GB)
         last=self.store.db.execute("SELECT status FROM points WHERE id='2' ORDER BY observed_ns DESC LIMIT 1").fetchone()
         self.assertEqual(last['status'],'not_observed')
 
     def test_full_sharing_commits_bounded_unpublished_batches(self):
         self.store.prepare(self.volume);self.node('old',None,2*GB)
-        self.store.finish_volume(self.volume,Blocks(),[],full=True,lean=True)
+        self.store.finish_volume(self.volume, None,[],full=True,lean=True)
         before=MapQuery(self.store.path).query()
         self.store.prepare(self.volume)
-        self.node('replacement',None,4097*4096)
+        self.node('replacement',None,4097*4096,physical=0)
         for identity in range(4097):self.store.holder(identity,'replacement',identity,4096,None,False)
         self.store.flush()
         batches=[];current=0
         def trace(sql):
             nonlocal current
-            if sql.startswith('INSERT OR REPLACE INTO charges'):current+=1
+            if sql.startswith(('INSERT OR REPLACE INTO streams','INSERT OR REPLACE INTO terms')):current+=1
             if sql=='COMMIT' and current:batches.append(current);current=0
         self.store.db.set_trace_callback(trace)
         try:
@@ -299,11 +298,12 @@ class CompactMapTests(unittest.TestCase):
             # though completed charge batches exist in the building generation.
             with patch.object(self.store,'_aggregate_full',side_effect=RuntimeError('synthetic failure')):
                 with self.assertRaises(RuntimeError):
-                    self.store.finish_volume(self.volume,Blocks(),[],full=True,lean=True)
+                    self.store.finish_volume(self.volume, None,[],full=True,lean=True)
         finally:self.store.db.set_trace_callback(None)
-        self.assertEqual(batches,[4096,1])
+        # A stream row and a term row per holder, in buffered batches of 8,192.
+        self.assertEqual(batches,[8192,2])
         self.assertEqual(MapQuery(self.store.path).query(),before)
-        self.assertEqual(self.store.db.execute('SELECT count(*) FROM charges WHERE generation=?',
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM streams WHERE generation=?',
                                               (self.store.generation,)).fetchone()[0],4097)
 
     def test_failure_after_applying_staged_rows_rolls_back_map_and_points(self):
@@ -313,7 +313,7 @@ class CompactMapTests(unittest.TestCase):
         self.store.begin_directory('2');self.node('2','1',3*GB)
         with patch('machine_audit.scanner.store.save_hierarchy',side_effect=sqlite3.OperationalError('synthetic failure')):
             with self.assertRaises(sqlite3.OperationalError):
-                self.store.finish_volume(self.volume,Blocks(),[],full=False,lean=True)
+                self.store.finish_volume(self.volume, None,[],full=False,lean=True)
         self.assertEqual(query.query(),before)
         self.assertEqual([tuple(r) for r in self.store.db.execute('SELECT * FROM points')],[tuple(r) for r in points])
         self.assertEqual(len(query.query('children',parent_id='2')['rows']),50)
@@ -323,7 +323,7 @@ class CompactMapTests(unittest.TestCase):
         self.store.prepare(self.volume,full=False);self.store.begin_directory('2')
         self.node('2','1',3*GB);self.store.flush()
         self.store.budget.limit_bytes=self.store.budget.usage()['bytes']
-        with self.assertRaises(BudgetExceeded):self.store.finish_volume(self.volume,Blocks(),[],full=False,lean=True)
+        with self.assertRaises(BudgetExceeded):self.store.finish_volume(self.volume, None,[],full=False,lean=True)
         self.assertEqual(query.query(),before)
         self.assertEqual(len(query.query('children',parent_id='2')['rows']),50)
 
@@ -343,22 +343,22 @@ class CompactMapTests(unittest.TestCase):
         self.node('replacement',None,3*GB)
         with patch('machine_audit.scanner.store.save_hierarchy',side_effect=sqlite3.OperationalError('synthetic failure')):
             with self.assertRaises(sqlite3.OperationalError):
-                self.store.finish_volume(self.volume,Blocks(),[],full=True,lean=True)
+                self.store.finish_volume(self.volume, None,[],full=True,lean=True)
         self.assertEqual(query.query(),before)
-        self.assertEqual(self.store.db.execute('SELECT uses FROM nodes WHERE generation=?',(staged,)).fetchone()[0],3*GB)
+        self.assertEqual(self.store.db.execute('SELECT physical FROM nodes WHERE generation=?',(staged,)).fetchone()[0],3*GB)
 
     def test_parent_move_reconstructs_paths_and_recomputes_both_ancestor_totals(self):
         self.store.prepare(self.volume);self.node('root',None)
         self.node('left','root');self.node('right','root');self.node('leaf','left',2*GB)
-        self.store.finish_volume(self.volume,Blocks(),[],full=True,lean=True)
+        self.store.finish_volume(self.volume, None,[],full=True,lean=True)
         self.store.prepare(self.volume,full=False)
         self.assertTrue(self.store.relocate('leaf','right','leaf','/synthetic/right/leaf',False))
-        self.store.finish_volume(self.volume,Blocks(),[],full=False,lean=True)
+        self.store.finish_volume(self.volume, None,[],full=False,lean=True)
         self.store.prepare(self.volume,full=False)
         self.assertEqual(self.store.known_directory('leaf')['path'],'/synthetic/right/leaf')
         rows={r['id']:r for r in MapQuery(self.store.path).query('children')['rows']}
-        self.assertEqual(rows['left']['uses'],0)
-        self.assertEqual(rows['right']['uses'],2*GB)
+        self.assertEqual(rows['left']['physical'],0)
+        self.assertEqual(rows['right']['physical'],2*GB)
 
     def test_reconstructed_path_detects_missing_and_cyclic_ancestry(self):
         self.store.prepare(self.volume)

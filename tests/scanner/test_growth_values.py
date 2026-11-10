@@ -5,7 +5,6 @@ import unittest
 from unittest.mock import patch
 
 from machine_audit.budget import Budget
-from machine_audit.scanner.accounting import Blocks
 from machine_audit.scanner.native import Volume
 from machine_audit.scanner.store import MapQuery, MapStore
 from machine_audit.scanner.walker import Node
@@ -32,10 +31,10 @@ class GrowthValuesTests(unittest.TestCase):
                         1000 * GB, 100 * GB, 100 * GB, 900 * GB)
         self.store.prepare(volume)
         for identity, parent, label, own in nodes:
-            self.store.directory(Node(identity, parent, label, 'directory', own, 0,
+            self.store.directory(Node(identity, parent, label, 'directory', own, own,
                                       'observed', None, 0))
         with patch('machine_audit.scanner.store.time.time_ns', return_value=at):
-            self.store.finish_volume(volume, Blocks(), [], full=True, lean=True)
+            self.store.finish_volume(volume, None, [], full=True, lean=True)
 
     def answer(self, start=T0, end=T1, limit=100, volume_id='v'):
         return self.query.query('growth', volume_id=volume_id, start_ns=start,
@@ -79,7 +78,7 @@ class GrowthValuesTests(unittest.TestCase):
                                      (initial, initial + change, change))
                     self.assertEqual((row['start_ns'], row['end_ns']),
                                      (T0, T1 if change else T0))
-                    self.assertEqual((row['metric'], row['status']), ('uses', 'observed'))
+                    self.assertEqual((row['metric'], row['status']), ('physical', 'observed'))
                     self.assertEqual((row['hierarchy_observed_ns'], row['hierarchy_status']),
                                      (T1, 'observed'))
                 self.assertEqual((rows['parent']['parent_id'], rows['parent']['parent_label']), (None, None))
@@ -116,10 +115,10 @@ class GrowthValuesTests(unittest.TestCase):
             row = rows[identity]
             self.assertEqual((row['start_bytes'], row['end_bytes']), (initial, final))
             self.assertEqual((row['start_ns'], row['end_ns']), (T0, T1))
-            self.assertEqual((row['start_metric'], row['end_metric']), ('uses', 'listed'))
+            self.assertEqual((row['start_metric'], row['end_metric']), ('physical', 'listed'))
             self.assertEqual((row['metric'], row['status'], row['change']), ('listed', 'unobserved', None))
         for row in self.answer(start=0, end=T0)['rows']:
-            self.assertEqual((row['start_metric'], row['end_metric']), (None, 'uses'))
+            self.assertEqual((row['start_metric'], row['end_metric']), (None, 'physical'))
         for row in self.answer(start=0, end=T0 - 1)['rows']:
             self.assertEqual((row['start_metric'], row['end_metric']), (None, None))
 
@@ -148,7 +147,7 @@ class GrowthValuesTests(unittest.TestCase):
         # Retained size evidence can predate the first hierarchy observation.
         with self.store.write():
             self.store.db.executemany('INSERT INTO points VALUES(?,?,?,?,?,?,?)',
-                                      [('v', 'leaf', at, 'Earlier leaf', 'uses', size, 'observed')
+                                      [('v', 'leaf', at, 'Earlier leaf', 'physical', size, 'observed')
                                        for at, size in ((10, 3 * GB), (20, 4 * GB))])
         earlier = next(row for row in self.answer(start=10, end=20)['rows'] if row['id'] == 'leaf')
         self.assertEqual((earlier['start_bytes'], earlier['end_bytes'], earlier['change']), (3 * GB, 4 * GB, GB))

@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch,Mock
 from machine_audit.budget import Budget, BudgetExceeded
-from machine_audit.scanner.accounting import Blocks, Stream, reconcile
+from machine_audit.scanner.accounting import reconcile
 from machine_audit.scanner.events import Replay, next_action, next_decision, USER_DROP, KERNEL_DROP, WRAPPED, ROOT_CHANGED, HISTORY_DONE
 from machine_audit.scanner.native import Volume
 from machine_audit.scanner.policy import Decision, Policy
@@ -29,14 +29,14 @@ class ScannerTests(unittest.TestCase):
             self.addCleanup(store.close)
             volume=Volume('v','Volume',str(tree),'hfs',1,10**9,1,1,10**8)
             store.prepare(volume)
-            walker=Walker(volume,Policy(home=temp,homes=[]),store,Blocks())
+            walker=Walker(volume,Policy(home=temp,homes=[]),store)
             original=os.stat
             def denied(path,*args,**kwargs):
                 if path==str(child):raise PermissionError(13,'synthetic denial')
                 return original(path,*args,**kwargs)
             with patch('machine_audit.scanner.walker.os.stat',side_effect=denied):
                 self.assertTrue(walker.walk())
-            result=store.finish_volume(volume,walker.blocks,walker.gaps,full=True,lean=True)
+            result=store.finish_volume(volume, None,walker.gaps,full=True,lean=True)
             self.assertTrue(result['valid'])
             self.assertIn('denied',walker.gaps)
             self.assertEqual([tuple(row) for row in store.db.execute('SELECT parent,status FROM nodes')],[(None,'observed')])
@@ -52,26 +52,31 @@ class ScannerTests(unittest.TestCase):
             self.addCleanup(store.close)
             volume=Volume('v','Volume',str(tree),'hfs',1,10**9,1,1,10**8)
             store.prepare(volume)
-            walker=Walker(volume,Policy(home=str(home),homes=[str(home)],data_root=str(own)),store,Blocks())
+            walker=Walker(volume,Policy(home=str(home),homes=[str(home)],data_root=str(own)),store)
             self.assertTrue(walker.walk())
-            result=store.finish_volume(volume,walker.blocks,walker.gaps,full=True,lean=True)
+            result=store.finish_volume(volume, None,walker.gaps,full=True,lean=True)
             self.assertTrue(result['valid'])
             self.assertEqual(walker.gaps,{'cloud','other_account','own_store'})
 
-    def test_shared_partial_extents_go_to_oldest_stream_once(self):
-        b=Blocks()
-        b.add(Stream(10,'a',8192,None,False),[(0,8192)])
-        b.add(Stream(20,'b',8192,4096,True),[(4096,8192)])
-        self.assertEqual(b.charges(),{10:8192,20:4096})
-        self.assertEqual(reconcile(20000,12288)['not_attributed'],7712)
-        self.assertFalse(reconcile(1,12288)['valid'])
-        self.assertIsNone(reconcile(1,12288)['uses'])
+    def test_reconciliation_tolerates_the_walks_own_change_and_withholds_beyond_it(self):
+        # Owner rule (WI tolerance fork): folders may exceed used space by at most
+        # max(1 GB, the change in used space during the walk), never rescaled.
+        GB=10**9
+        self.assertEqual(reconcile(100*GB,90*GB)['not_placed'],10*GB)
+        self.assertTrue(reconcile(100*GB,101*GB)['valid'])
+        self.assertFalse(reconcile(100*GB,101*GB+1)['valid'])
+        self.assertTrue(reconcile(100*GB,105*GB,used_change=-5*GB)['valid'])
+        self.assertIsNone(reconcile(100*GB,106*GB,used_change=5*GB)['physical'])
 
-    def test_failed_block_budget_keeps_private_lower_bound_and_explicit_estimate(self):
-        b=Blocks(max_bytes=24)
-        b.add(Stream(20,'b',8192,100,True),[(0,4096),(8192,4096)])
-        self.assertEqual(b.charges(),{20:100})
-        self.assertEqual(b.estimated,{20})
+    def test_asterisk_marks_finder_excess_and_shared_outside_at_ten_percent_and_one_gb(self):
+        # Kenny's thresholds: at least 10% and 1 GB, for each of the two conditions.
+        from machine_audit.scanner.accounting import asterisk
+        GB=10**9
+        self.assertEqual(asterisk(7_550_000_000,434*GB,5_280_000_000),{'listed':434*GB,'frees':5_280_000_000})
+        self.assertIsNone(asterisk(30*GB,30*GB,30*GB))
+        self.assertIsNone(asterisk(5*GB,5*GB+GB-1,5*GB))       # under 1 GB more
+        self.assertIsNone(asterisk(20*GB,21*GB+GB//2,20*GB))   # 1.5 GB more is under 10%
+        self.assertEqual(asterisk(4_500_000_000,4_500_000_000,0),{'frees':0})
 
     def test_privacy_rules_apply_before_open_and_keep_browser_contents_unnamed(self):
         policy=Policy(home='/Users/tester',homes=['/Users/tester'])
@@ -96,8 +101,8 @@ class ScannerTests(unittest.TestCase):
             store=MapStore(data/'scanner.sqlite',Budget(data,limit_bytes=16*1024**2,warning_bytes=8*1024**2,free_margin_bytes=0))
             volume=Volume('synthetic','Synthetic',str(tree),'hfs',1,1_000_000,800000,800000,200000)
             store.start('full');store.prepare(volume)
-            blocks=Blocks();walker=Walker(volume,Policy(home=temp,homes=[],exclusions=[str(tree/'private')]),store,blocks)
-            walker.walk();store.finish_volume(volume,blocks,walker.gaps,full=True,lean=True);store.close()
+            walker=Walker(volume,Policy(home=temp,homes=[],exclusions=[str(tree/'private')]),store)
+            walker.walk();store.finish_volume(volume,None,walker.gaps,full=True,lean=True);store.close()
             answers=[MapQuery(store.path).query(action) for action in ('volumes','children')]
             for answer in answers:
                 self.assertEqual(answer['coverage']['excluded_roots'],1)
@@ -138,12 +143,12 @@ class ScannerTests(unittest.TestCase):
             store=MapStore(data/'scanner.sqlite',budget)
             volume=Volume('synthetic','Synthetic',str(tree),'hfs',1,1_000_000,800000,800000,200000)
             store.start('full');store.prepare(volume)
-            blocks=Blocks();walker=Walker(volume,Policy(home=temp,homes=[],data_root=str(data)),store,blocks)
-            walker.walk();result=store.finish_volume(volume,blocks,walker.gaps,full=True,lean=True)
+            walker=Walker(volume,Policy(home=temp,homes=[],data_root=str(data)),store)
+            walker.walk();result=store.finish_volume(volume,None,walker.gaps,full=True,lean=True)
             self.assertTrue(result['valid'])
-            total=result['uses'];self.assertLess(total,200000)
+            total=result['physical'];self.assertLess(total,200000)
             before=MapQuery(store.path).query()['rows'][0]
-            self.assertEqual(before['uses']+before['not_attributed'],before['volume_used'])
+            self.assertEqual(before['physical']+before['not_placed'],before['volume_used'])
             generation=store.generation
             budget.limit_bytes=budget.usage()['bytes']
             with self.assertRaises(BudgetExceeded):store.prepare(volume)
@@ -152,9 +157,9 @@ class ScannerTests(unittest.TestCase):
             self.assertEqual(store.db.execute('SELECT generation FROM volumes').fetchone()[0],generation)
             store.close()
 
-    def test_incremental_metadata_copy_preserves_known_shared_charges(self):
-        # Regression: reusing an unchanged map must not turn 6 GB shared use
-        # back into 8 GB listed allocation when no new block map is present.
+    def test_incremental_metadata_copy_preserves_known_shared_terms(self):
+        # Regression: reusing an unchanged map must not turn 6 GB physical back
+        # into 8 GB listed allocation when the update reads no extents.
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
             store=MapStore(Path(temp)/'scanner.sqlite',Budget(temp,free_margin_bytes=0))
             volume=Volume('v','Volume',temp,'apfs',1,10**12,1,1,10**11)
@@ -162,14 +167,12 @@ class ScannerTests(unittest.TestCase):
             store.directory(Node('1',None,'root','directory',8*10**9,0,'observed',temp,0))
             store.holder(1,'1',1,4*10**9,None,False)
             store.holder(2,'1',2,4*10**9,2*10**9,True)
-            blocks=Blocks()
-            blocks.add(Stream(1,'1',4*10**9,None,False),[(0,4*10**9)])
-            blocks.add(Stream(2,'1',4*10**9,2*10**9,True),[(2*10**9,4*10**9)])
-            first=store.finish_volume(volume,blocks,[],full=True,lean=True)
+            extents={'1':[(0,4*10**9)],'2':[(2*10**9,4*10**9)]}
+            first=store.finish_volume(volume,extents.__getitem__,[],full=True,lean=True)
             store.prepare(volume,full=False)
-            second=store.finish_volume(volume,Blocks(),[],full=False,lean=True)
-            self.assertEqual(first['uses'],6*10**9)
-            self.assertEqual(second['uses'],first['uses'])
+            second=store.finish_volume(volume,None,[],full=False,lean=True)
+            self.assertEqual(first['physical'],6*10**9)
+            self.assertEqual(second['physical'],first['physical'])
             store.close()
 
     def test_hourly_direct_relist_keeps_unchanged_descendants(self):
@@ -179,13 +182,13 @@ class ScannerTests(unittest.TestCase):
             store=MapStore(data/'scanner.sqlite',Budget(data,free_margin_bytes=0))
             v=Volume('v','Volume',str(tree),'hfs',1,10**9,1,1,10**8)
             policy=Policy(home=temp,homes=[])
-            store.prepare(v);w=Walker(v,policy,store,Blocks());w.walk()
-            store.finish_volume(v,Blocks(),[],full=True,lean=True)
+            store.prepare(v);w=Walker(v,policy,store);w.walk()
+            store.finish_volume(v, None,[],full=True,lean=True)
             (tree/'new').write_bytes(b'y'*4096)
             store.prepare(v,full=False)
-            w=Walker(v,policy,store,Blocks());w.walk(recursive=False)
+            w=Walker(v,policy,store);w.walk(recursive=False)
             self.assertEqual(w.entries,2)  # child directory + new file, not its unchanged content
-            store.finish_volume(v,Blocks(),[],full=False,lean=True)
+            store.finish_volume(v, None,[],full=False,lean=True)
             self.assertEqual(store.db.execute('SELECT count(*) FROM files WHERE generation=?',(store.generation,)).fetchone()[0],2)
             store.close()
 
@@ -207,7 +210,7 @@ class ScannerTests(unittest.TestCase):
             v=Volume('v','Volume',temp,'apfs',1,10**9,1,1,10**8)
             store.prepare(v,lean=False)
             store.directory(Node('1',None,'Prior map','directory',100,100,'observed',temp,0))
-            store.finish_volume(v,Blocks(),[],full=True,lean=False)
+            store.finish_volume(v, None,[],full=True,lean=False)
             generation=store.generation;store.close()
             native=Mock();native.process.return_value.proc_start_abstime=1
             native.process.return_value.diskio_byteswritten=0
@@ -227,8 +230,8 @@ class ScannerTests(unittest.TestCase):
             store.prepare(v)
             store.directory(Node('root',None,'Root','directory',0,0,'observed',temp,0))
             for i in range(5):
-                store.directory(Node(str(i),'root',f'Folder {i}','directory',(i+1)*10**9,0,'observed',None,0))
-            store.finish_volume(v,Blocks(),[],full=True,lean=True)
+                store.directory(Node(str(i),'root',f'Folder {i}','directory',(i+1)*10**9,(i+1)*10**9,'observed',None,0))
+            store.finish_volume(v, None,[],full=True,lean=True)
             query=MapQuery(store.path)
             one=query.query('children',volume_id='v',limit=2)
             two=query.query('children',volume_id='v',limit=2,cursor=one['next_cursor'])
@@ -252,9 +255,9 @@ class ScannerTests(unittest.TestCase):
             store=MapStore(Path(temp)/'scanner.sqlite',budget)
             volume=Volume('v','Volume',temp,'hfs',1,10**12,1,1,10**11)
             store.prepare(volume);store.directory(Node('1',None,'Root','directory',2*10**9,2*10**9,'observed',temp,0))
-            store.finish_volume(volume,Blocks(),[],full=True,lean=True)
+            store.finish_volume(volume, None,[],full=True,lean=True)
             point=store.db.execute('SELECT * FROM points').fetchone()
-            self.assertEqual(point['metric'],'uses')
+            self.assertEqual(point['metric'],'physical')
             store.db.execute('UPDATE points SET observed_ns=100')
             store.db.execute('INSERT INTO points VALUES(?,?,?,?,?,?,?)',('v','1',200,'Root','listed',3*10**9,'observed'))
             answer=MapQuery(store.path).query('growth',volume_id='v',start_ns=100,end_ns=200)

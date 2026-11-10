@@ -497,6 +497,20 @@ button.link {
 .disclosure summary {
   cursor:pointer;
 }
+.asterisk {
+  display:inline;
+  margin-left:3px;
+}
+.asterisk summary {
+  display:inline;
+  cursor:pointer;
+  color:var(--accent);
+  font-weight:600;
+  list-style:none;
+}
+.asterisk summary::-webkit-details-marker {
+  display:none;
+}
 .source-facts {
   margin:8px 0;
   display:grid;
