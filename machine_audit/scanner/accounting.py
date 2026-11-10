@@ -9,7 +9,6 @@ from collections import defaultdict
 from .errors import ScanError
 
 GB = 10**9
-MAX_ANCESTRY = 1024
 
 
 def pieces(streams, *, max_ranges=16_000_000):
@@ -25,7 +24,7 @@ def pieces(streams, *, max_ranges=16_000_000):
     group, keyed by its least stream key (any other stream is its own group)."""
     order = []
     ranges = array('q')
-    rest = array('q')
+    private = array('q')
     overflowed = False
     for stream, allocated, found in streams:
         i = len(order)
@@ -47,13 +46,12 @@ def pieces(streams, *, max_ranges=16_000_000):
                 for start, end in merged:
                     ranges.extend((start, end, i))
                     covered += end - start
-        rest.append(max(0, allocated - covered))
+        private.append(max(0, allocated - covered))
     # Two sorted event lists, packed as position and ordinal: an end and a start
     # at one position bound no bytes between them.
     starts = sorted(ranges[k] << 32 | ranges[k + 2] for k in range(0, len(ranges), 3))
     ends = sorted(ranges[k + 1] << 32 | ranges[k + 2] for k in range(0, len(ranges), 3))
     del ranges
-    private = rest
     shared = defaultdict(int)
     active = set()
     s = e = 0
@@ -139,7 +137,8 @@ def _shape(dirs, parent_of):
     seen = set()
     roots = set()
     for d in dirs:
-        node, steps = d, 0
+        node = d
+        # A cycle ends at a folder already seen and leaves no root.
         while node not in seen:
             seen.add(node)
             parent = parent_of(node)
@@ -149,9 +148,6 @@ def _shape(dirs, parent_of):
             children[parent] += 1
             only[parent] = node
             node = parent
-            steps += 1
-            if steps > MAX_ANCESTRY:
-                raise ScanError('directory_ancestry_limit')
     if len(roots) != 1:
         raise ScanError('missing_directory_ancestor')
     top = next(iter(roots))

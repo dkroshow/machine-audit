@@ -21,7 +21,7 @@ function observation(bytes, measure, at) {
 }
 
 // Kenny's note for a folder the scanner marks: its figures come from the query.
-export function sharedNote(asterisk) {
+function sharedNote(asterisk) {
   const parts = ['Shares data with copies elsewhere: APFS clones, hard links, snapshots.'];
   if (asterisk.listed != null) {
     const listed = format(asterisk.listed, 'bytes');
