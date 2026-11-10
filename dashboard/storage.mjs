@@ -39,6 +39,17 @@ function size(row, valid) {
     el('summary', {'aria-label':'Shares data with copies elsewhere'}, '*'), el('span', {class:'note'}, sharedNote(row.asterisk))));
 }
 
+// Free space as macOS reports it, and why Finder shows more: it counts what macOS
+// would purge on demand as available.
+function freeSpace(volume) {
+  const when = volume.capacity_source === 'live' ? `read ${time(volume.capacity_observed_ns)}` :
+    `from the scan at ${time(volume.capacity_observed_ns, true)}; no current reading`;
+  const parts = [el('p', {}, `Free ${format(volume.available,'bytes')} of ${format(volume.capacity,'bytes')}, as macOS reports it (${when}).`)];
+  if (finite(volume.purgeable) && volume.purgeable > 0) parts.push(el('p', {class:'sub'},
+    `Purgeable ${format(volume.purgeable,'bytes')}: macOS frees this on demand. Finder counts it as available, so Finder shows ${format(volume.available_important,'bytes')}.`));
+  return el('div', {class:'note'}, ...parts);
+}
+
 // The scanner owns reconciliation and growth. This file only presents its answers.
 export async function storageView(api, interval, abort) {
   const answer = await api('storage', {action:'volumes'}, abort);
@@ -75,7 +86,7 @@ export async function storageView(api, interval, abort) {
       const rows = previousRows.concat(children.rows ?? []);
       const details = el('p', {class:'note'}, badge(children.status),
         ` · Map as of ${time(volume.observed_ns, true)}`);
-      const blocks = [breadcrumbs, details, el('p', {class:'note'}, `At this map observation: capacity ${format(volume.capacity,'bytes')} · free ${format(volume.free,'bytes')} · available to programs ${format(volume.available,'bytes')}.`)];
+      const blocks = [breadcrumbs, details, freeSpace(volume)];
       if (volume.gaps?.length) blocks.push(el('p', {class:'notice'}, `Map coverage gaps: ${volume.gaps.map(statusText).join(', ')}.`));
       if (volume.valid === true && finite(volume.not_placed)) {
         blocks.push(el('div', {class:'banner'},
@@ -109,7 +120,7 @@ export async function storageView(api, interval, abort) {
         if (row.kind === 'file' || row.is_dir === false) button.disabled = true;
         else button.addEventListener('click', () => {history.push({id:row.id,name:row.label ?? 'Folder'}); show(row.id);});
         return [button, size(row, volume.valid), badge(row.status)];
-      }), 'Physical space: each block counted once, wherever copies share it. Sizes are from the saved scan. A withheld name can mark a privacy boundary. A missing size is not zero.') :
+      }), 'Physical space: each block counted once, wherever copies share it. Finder counts every copy in full; a folder marked * is one where the two differ by at least 10% and 1 GB. Sizes are from the saved scan. A withheld name can mark a privacy boundary. A missing size is not zero.') :
         empty('No visible children in this saved map.'));
       if (children.folder?.shared_between_rows) blocks.push(el('p', {class:'note'},
         `These rows add to ${format(children.folder.shared_between_rows,'bytes')} more than their folder's ${format(children.folder.physical,'bytes')}: they share blocks with each other, and each row counts every block it holds.`));

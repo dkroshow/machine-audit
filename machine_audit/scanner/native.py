@@ -46,6 +46,49 @@ class MacFilesystem:
         self.attrs = bind(native.lib, 'getattrlist', I32, C.c_char_p, C.POINTER(Attr), C.c_void_p, C.c_size_t, C.c_ulong)
         self.at = bind(native.lib, 'getattrlistat', I32, I32, C.c_char_p, C.POINTER(Attr), C.c_void_p, C.c_size_t, C.c_ulong)
         self.fcntl = bind(native.lib, 'fcntl', I32, I32, I32, C.c_void_p)
+        self.foundation = None
+
+    def _foundation(self):
+        """Foundation calls through the Objective-C runtime, bound once. False when
+        the system lacks the key: that field reads unavailable, the rest stands."""
+        if self.foundation is None:
+            try:
+                objc = C.CDLL('/usr/lib/libobjc.A.dylib')
+                foundation = C.CDLL('/System/Library/Frameworks/Foundation.framework/Foundation')
+                key = C.c_void_p.in_dll(foundation, 'NSURLVolumeAvailableCapacityForImportantUsageKey').value
+            except (OSError, ValueError):
+                self.foundation = False
+                return False
+            send = C.cast(objc.objc_msgSend, C.c_void_p).value
+            self.foundation = dict(
+                cls=bind(objc, 'objc_getClass', C.c_void_p, C.c_char_p),
+                sel=bind(objc, 'sel_registerName', C.c_void_p, C.c_char_p),
+                push=bind(objc, 'objc_autoreleasePoolPush', C.c_void_p),
+                pop=bind(objc, 'objc_autoreleasePoolPop', None, C.c_void_p),
+                string=C.CFUNCTYPE(C.c_void_p, C.c_void_p, C.c_void_p, C.c_char_p)(send),
+                url=C.CFUNCTYPE(C.c_void_p, C.c_void_p, C.c_void_p, C.c_void_p, C.c_bool)(send),
+                value=C.CFUNCTYPE(C.c_bool, C.c_void_p, C.c_void_p, C.POINTER(C.c_void_p), C.c_void_p,
+                                  C.POINTER(C.c_void_p))(send),
+                number=C.CFUNCTYPE(C.c_longlong, C.c_void_p, C.c_void_p)(send), key=key)
+        return self.foundation
+
+    def important_available(self, mount):
+        """Bytes free for important use, as Finder shows: free space plus what macOS
+        would purge on demand (NSURLVolumeAvailableCapacityForImportantUsageKey).
+        About 7-13 ms of CPU a volume. None when the system does not answer."""
+        f = self._foundation()
+        if not f:
+            return None
+        pool = f['push']()
+        try:
+            path = f['string'](f['cls'](b'NSString'), f['sel'](b'stringWithUTF8String:'), os.fsencode(mount))
+            url = f['url'](f['cls'](b'NSURL'), f['sel'](b'fileURLWithPath:isDirectory:'), path, True)
+            found, error = C.c_void_p(), C.c_void_p()
+            if not url or not f['value'](url, f['sel'](b'getResourceValue:forKey:error:'), C.byref(found), f['key'], C.byref(error)):
+                return None
+            return f['number'](found, f['sel'](b'longLongValue')) if found.value else None
+        finally:
+            f['pop'](pool)
 
     def volumes(self):
         pointer = C.POINTER(StatFS)()

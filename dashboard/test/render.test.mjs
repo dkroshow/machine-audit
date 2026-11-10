@@ -155,6 +155,9 @@ test('all dashboard views render real stored replay without leaked tokens or fak
       assert.match(await run("document.querySelector('details.asterisk').innerText"),/Deleting it frees about \d GB while the other copies remain/);
       assert.match(await run("document.querySelector('#view').innerText"),/These rows add to 2 GB more than their folder's 7 GB/);
       assert.doesNotMatch(await run("document.querySelector('#view thead').innerText"),/Listed/);
+      // Free space is the collector's live reading, not the map scan's, with purgeable beside it.
+      assert.match(await run("document.querySelector('#view').innerText"),/Free 8 GB of 20 GB, as macOS reports it \(read /);
+      assert.match(await run("document.querySelector('#view').innerText"),/Purgeable 2\.5 GB: macOS frees this on demand\. Finder counts it as available, so Finder shows 10\.5 GB\./);
       assert.match(await run("document.querySelector('#view').innerText"),/Example data/);
       await run("[...document.querySelectorAll('button')].find(button=>button.textContent==='Example projects').click()");
       await until(()=>run("[...document.querySelectorAll('button')].some(button=>button.textContent==='Example data')"),Boolean,'Folder drilldown did not render');

@@ -910,4 +910,32 @@ class Query:
     def storage_query(self,action="volumes",**params):
         if self.storage is None:
             return dict(self._base("storage","unavailable"),reason="scanner_adapter_not_available",rows=[])
-        return self.storage.query(action,**params)
+        answer=self.storage.query(action,**params)
+        if action=="volumes":
+            # A map row's capacity is from its scan's start, which can be an hour old.
+            # Free space is shown as macOS reports it now: the collector's minute reading.
+            live=self._live_capacity()
+            for row in answer.get("rows",[]):
+                reading=live.get("volume:"+row["id"])
+                if reading and reading["capacity_observed_ns"]>=(row.get("observed_ns") or 0):row.update(reading,capacity_source="live")
+                else:row.update(capacity_source="map",capacity_observed_ns=row.get("observed_ns"),
+                                available_important=None,purgeable=None)
+        return answer
+
+    def _live_capacity(self):
+        """Each volume's newest capacity reading from the live cache: capacity, free,
+        available (statfs, as diskutil reports it), what Finder shows as available
+        (free plus what macOS purges on demand) and purgeable, their difference."""
+        found={}
+        for _,_,records in self.collector.recent_records("storage") if self.collector else ():
+            reading=records[-1].reading
+            for f in reading.fields:
+                name=f.name.removeprefix("storage.")
+                if not f.entity.startswith("volume:") or name not in ("capacity","free","available","available_important"):continue
+                volume=found.setdefault(f.entity,{"capacity_observed_ns":reading.end.wall_ns})
+                volume[name]=f.value if f.status in GOOD else None
+        for volume in found.values():
+            important,available=volume.get("available_important"),volume.get("available")
+            # Two reads moments apart can disagree by a write; purgeable is never negative.
+            volume["purgeable"]=max(0,important-available) if important is not None and available is not None else None
+        return found

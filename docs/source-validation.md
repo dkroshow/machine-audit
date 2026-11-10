@@ -175,7 +175,10 @@ replaced by an inferred residual. Coverage declares
 and `global_growth_complete=false`, including after the final page.
 
 Volume rows include `id,label,observed_ns,full_scan_ns,listed,physical,volume_used,
-not_placed,tolerance,unplaced_shared,capacity,free,available,valid,status,mounted,gaps`.
+not_placed,tolerance,unplaced_shared,capacity,free,available,available_important,purgeable,
+capacity_source,capacity_observed_ns,valid,status,mounted,gaps`. Capacity, free and available
+come from the collector's newest minute reading when it is newer than the map
+(`capacity_source=live`), otherwise from the map's scan (`map`, with purgeable null).
 Children include `id,parent_id,label,kind,listed,physical,frees,asterisk,status,observed_ns`,
 and the answer's `folder` gives the parent's `physical` and `shared_between_rows`
 (null under 1 GB). Private names are null.

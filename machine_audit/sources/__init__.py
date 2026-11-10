@@ -78,6 +78,8 @@ def _macos(config,budget,operations,scanner):
         for v in fs.volumes():
             for name,value in [('capacity',v.capacity),('free',v.free),('available',v.available),('used',v.used)]:
                 yield field('storage.'+name,value,'bytes',entity='volume:'+v.id,scope='volume')
+            # What Finder shows as available: free plus what macOS purges on demand.
+            yield field('storage.available_important',fs.important_available(v.mount),'bytes',entity='volume:'+v.id,scope='volume')
     sources=mac.sources()+[
         ReadSource('macos.disk','storage',5,device.disk,mac.clock),
         ReadSource('macos.capacity','storage',60,volumes,mac.clock),

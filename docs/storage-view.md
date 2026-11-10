@@ -48,7 +48,24 @@ and live free space separately. macOS: `statfs` per disk and `getattrlist`
 (`ATTR_VOL_SPACEUSED`) per volume give capacity, free, available to programs
 and each volume's own used bytes; the rest is not mounted; the parts add to
 the byte; a container's volumes share one free pool; purgeable space is a
-note, not a part. Ubuntu: `statvfs` per mount gives capacity, free and
+note, not a part.
+
+**Consistent with Finder.** Every size is decimal (1 GB = 10^9 bytes), as
+Finder and macOS settings show them. Free space is shown as macOS reports it:
+`statfs` available, the figure `diskutil` and About This Mac give, from the
+collector's minute reading (`storage.available`), with the time it was read.
+The map's own capacity figures are from its scan's start and can be an hour
+old, so the storage answer replaces them with the newer live reading and says
+which it used (`capacity_source`). Finder shows more: it counts what macOS would
+purge on demand as available. The capacity source also reads that figure,
+`NSURLVolumeAvailableCapacityForImportantUsageKey`, as
+`storage.available_important` (about 7–13 ms of CPU a volume, about 5 s an
+hour on Big Mac's nine volumes), and the view shows the difference as its own
+line: purgeable, which macOS frees on demand and Finder counts as available,
+so Finder shows free plus purgeable. Folders differ from Finder where copies
+share blocks; the asterisk's note says so beside the number.
+
+Ubuntu: `statvfs` per mount gives capacity, free and
 available (free less the root reserve) per filesystem. One filesystem per
 partition adds trivially; btrfs, LVM thin pools and ZFS share pools and their
 snapshots sit in no folder. The Ubuntu layout is unverified; the record

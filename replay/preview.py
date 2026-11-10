@@ -19,7 +19,7 @@ from machine_audit.query import Query
 from machine_audit.serve import make_server
 from machine_audit.store import Store
 from replay.scenarios import BASE_NS, SECOND, all_components, crowded_dashboard
-from replay.storage_scenario import seed_storage
+from replay.storage_scenario import capacity_reading, seed_storage
 
 
 def seed(store, crowded=False):
@@ -56,6 +56,7 @@ def main():
         token = secrets.token_urlsafe(32)
         storage_end = int(time.time())*SECOND
         storage = seed_storage(directory, storage_end, args.storage_state, start_ns=storage_end-7200*SECOND)
+        collector.ingest(capacity_reading(time.time_ns()))
         server = make_server(Query(store, collector, storage), token, port=args.port,
                              dashboard=Path(__file__).resolve().parent.parent / "dashboard")
         receipt = {"origin": f"http://127.0.0.1:{server.server_port}", "token": token,

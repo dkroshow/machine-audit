@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from machine_audit.model import Clock, Field, Reading
 from machine_audit.scanner.native import Volume
 from machine_audit.scanner.store import MapStore, MapQuery
 from machine_audit.scanner.walker import Node
@@ -14,6 +15,17 @@ from replay.scenarios import BASE_NS, SECOND
 
 GB = 1_000_000_000
 VOLUME_ID = "00000000-0000-4000-8000-000000000001"
+
+
+def capacity_reading(at_ns):
+    """The collector's minute capacity reading for the synthetic volume, later than
+    and different from its map's: 8 GB free as macOS reports it, 2.5 GB purgeable,
+    so Finder would show 10.5 GB."""
+    clock = Clock(at_ns, at_ns, at_ns)
+    fields = tuple(Field("storage." + name, value, "bytes", entity="volume:" + VOLUME_ID, scope="volume")
+                   for name, value in (("capacity", 20*GB), ("free", 8*GB), ("available", 8*GB),
+                                       ("available_important", 10_500_000_000)))
+    return Reading("synthetic.capacity", "storage", clock, clock, fields)
 
 
 def write_snapshot(store, volume, at_ns, *, growth=0, complete=True, extra_folders=0):

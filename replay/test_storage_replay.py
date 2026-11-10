@@ -45,6 +45,25 @@ class StorageReplay(unittest.TestCase):
         self.assertEqual(data[0]["label"], "Example data")
         self.assertEqual(data[0]["physical"], projects["physical"])
 
+    def test_free_space_is_the_live_reading_with_purgeable_beside_it(self):
+        """A page showed the map scan's free space, read at the scan's start, as if
+        current: 20 GB below macOS's own figure. The live minute reading wins, and
+        purgeable is what Finder adds on top."""
+        from machine_audit.collector import Collector
+        from machine_audit.model import Clock
+        from replay.storage_scenario import capacity_reading
+        mapped = self.query.storage_query("volumes")["rows"][0]
+        self.assertEqual((mapped["available"], mapped["capacity_source"], mapped["purgeable"]), (9*GB, "map", None))
+        later = mapped["observed_ns"] + SECOND
+        collector = Collector(self.store, boot_id="synthetic-boot", run_id="synthetic",
+                              clock=lambda: Clock(later, later, later))
+        self.addCleanup(collector.close)
+        collector.ingest(capacity_reading(later))
+        live = Query(self.store, collector, storage=self.query.storage).storage_query("volumes")["rows"][0]
+        self.assertEqual((live["available"], live["purgeable"], live["available_important"], live["capacity_source"]),
+                         (8*GB, 2_500_000_000, 10_500_000_000, "live"))
+        self.assertEqual(live["capacity_observed_ns"], later)
+
     def test_growth_keeps_original_parent_and_child_points_with_overlap_explicit(self):
         """The shared query must preserve, not suppress, nested original growth."""
         answer = self.query.storage_query("growth", volume_id=VOLUME_ID,
