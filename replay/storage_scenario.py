@@ -68,6 +68,12 @@ def seed_storage(directory, end_ns=BASE_NS + 60*SECOND, state="shared", start_ns
         write_snapshot(store, replace(volume, used=5*GB), end_ns-10*SECOND, growth=GB)
     elif state == "unsupported":
         write_snapshot(store, replace(volume, fs="ext4", used=11*GB), end_ns-10*SECOND, growth=GB)
+    else:
+        # A paced full walk under way: the tab says how far along it is.
+        with patch("machine_audit.scanner.store.time.time_ns", return_value=end_ns-10*SECOND):
+            store.begin_walk(volume, lean=True, bookmark=1, event_uuid="events", trigger="weekly_full")
+        with store.write(rows=1):
+            store.db.execute("UPDATE walks SET entries=5400000,expected=13300000")
     store.close()
     return MapQuery(Path(directory) / "scanner.sqlite")
 

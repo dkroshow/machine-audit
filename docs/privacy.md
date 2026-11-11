@@ -80,7 +80,9 @@ only after the receiving party has read this page.
 5. The scanner store is the only home for names; nothing from it enters
    readings, exports or feedback. Linux default exclusions: `/proc`, `/sys`,
    `/dev`, `/run`, `/tmp` and other users' homes. The Linux watcher's dirty
-   file holds volume and inode numbers only.
+   file holds volume and inode numbers only. A paced walk's checkpoint holds
+   inode numbers and flags, never names or paths; paths found again from an
+   inode stay in memory.
 6. Tests and fixtures use synthetic names and paths only.
 
 Regression tests for the unit, reason and salt rules live in

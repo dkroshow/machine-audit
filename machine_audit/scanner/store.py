@@ -89,7 +89,18 @@ CREATE TABLE IF NOT EXISTS runs(
  id TEXT PRIMARY KEY,started_ns INTEGER NOT NULL,updated_ns INTEGER NOT NULL,ended_ns INTEGER,
  pid INTEGER NOT NULL,pid_start TEXT,status TEXT NOT NULL,entries INTEGER NOT NULL DEFAULT 0,cpu_ns INTEGER NOT NULL,
  peak_rss_bytes INTEGER NOT NULL,written_bytes INTEGER,kind TEXT NOT NULL,
- volume_id TEXT,action TEXT,trigger TEXT,stage TEXT,volumes TEXT) WITHOUT ROWID;
+ volume_id TEXT,action TEXT,trigger TEXT,stage TEXT,volumes TEXT,
+ stage_cpu TEXT,extent_reads INTEGER,allowance_ns INTEGER,room_ns INTEGER) WITHOUT ROWID;
+-- A paced full walk's checkpoint, one per volume (storage-approach.md#paced-full-walks):
+-- its staged generation, the folders left to list as (inode, parent inode, name
+-- withheld) and never as names or paths, and what it has found so far. It commits
+-- with the staged rows it describes.
+CREATE TABLE IF NOT EXISTS walks(
+ volume TEXT PRIMARY KEY,generation INTEGER NOT NULL,phase TEXT NOT NULL,started_ns INTEGER NOT NULL,
+ phase_ns INTEGER NOT NULL,trigger TEXT,bookmark INTEGER,event_uuid TEXT,lean INTEGER NOT NULL,
+ used_last INTEGER,used_change INTEGER NOT NULL DEFAULT 0,expected INTEGER,entries INTEGER NOT NULL DEFAULT 0,
+ cpu_ns INTEGER NOT NULL DEFAULT 0,runs INTEGER NOT NULL DEFAULT 0,gaps TEXT NOT NULL DEFAULT '[]',
+ sharing_complete INTEGER NOT NULL DEFAULT 1,pending BLOB) WITHOUT ROWID;
 '''
 MAP_TABLES=('nodes','files','holders','streams','terms','listings')
 STAGE_TABLES=('removed','reset_dirs','removed_streams','reset_groups')
@@ -174,11 +185,13 @@ class MapStore:
             # Nullable diagnostic columns extend format 2 without rewriting map
             # rows or changing old observations. Each ALTER is metadata only.
             columns={r['name'] for r in self.db.execute('PRAGMA table_info(runs)')}
-            missing_columns={'volume_id','action','trigger','stage','volumes'}-columns
+            kinds=dict.fromkeys(('volume_id','action','trigger','stage','volumes','stage_cpu'),'TEXT')
+            kinds.update(dict.fromkeys(('extent_reads','allowance_ns','room_ns'),'INTEGER'))
+            missing_columns=kinds.keys()-columns
             if missing_columns:
                 with self.write(rows=len(missing_columns)):
                     for column in sorted(missing_columns):
-                        self.db.execute(f'ALTER TABLE runs ADD COLUMN {column} TEXT')
+                        self.db.execute(f'ALTER TABLE runs ADD COLUMN {column} {kinds[column]}')
             for table,column in (('volumes','full_attempt_ns'),('volumes','budget_retry_bytes'),('dirty','recursive')):
                 if column not in {r['name'] for r in self.db.execute(f'PRAGMA table_info({table})')}:
                     with self.write(rows=1):
@@ -196,6 +209,10 @@ class MapStore:
         self.generation=self.volume=self.vid=self.base_gen=self.run=None
         self.changed=set();self.last_progress=0.0;self.entries=0
         self.run_context=dict(volume_id=None,action=None,trigger=None,stage=None)
+        # CPU by stage across this run, the extents it read, and its allowance.
+        self.stage_cpu=defaultdict(int);self.stage_mark=None;self.extent_reads=0
+        self.allowance_ns=self.room_ns=None
+        self.walk=None
 
     def _configure(self):
         self.db.row_factory=sqlite3.Row
@@ -270,6 +287,10 @@ class MapStore:
         return self.run
 
     def phase(self,stage,*,volume_id=None,action=None,trigger=None):
+        now=time.process_time_ns()
+        if self.stage_mark is not None and self.run_context['stage'] is not None:
+            self.stage_cpu[self.run_context['stage']]+=now-self.stage_mark
+        self.stage_mark=now
         self.run_context.update(stage=stage)
         for key,value in (('volume_id',volume_id),('action',action),('trigger',trigger)):
             if value is not None:self.run_context[key]=value
@@ -285,12 +306,18 @@ class MapStore:
         try:written=self.written_bytes() if hasattr(self,'written_bytes') else None
         except OSError:written=None
         context=tuple(self.run_context[key] for key in ('volume_id','action','trigger','stage'))
-        with self.write(rows=1,payload_bytes=sum(len(v.encode()) for v in context if v is not None)):
+        cpu=time.process_time_ns()
+        stages=dict(self.stage_cpu)
+        if self.stage_mark is not None and self.run_context['stage'] is not None:
+            stages[self.run_context['stage']]=stages.get(self.run_context['stage'],0)+cpu-self.stage_mark
+        stages=json.dumps(stages,separators=(',',':'),sort_keys=True)
+        with self.write(rows=1,payload_bytes=sum(len(v.encode()) for v in context if v is not None)+len(stages)):
             self.db.execute('''UPDATE runs SET updated_ns=?,entries=?,cpu_ns=?,peak_rss_bytes=?,written_bytes=?,status=?,ended_ns=?,
-                volume_id=?,action=?,trigger=?,stage=? WHERE id=?''',
-                (time.time_ns(),self.entries,time.process_time_ns(),int(r.ru_maxrss*(1 if sys.platform=='darwin' else 1024)),
+                volume_id=?,action=?,trigger=?,stage=?,stage_cpu=?,extent_reads=?,allowance_ns=?,room_ns=? WHERE id=?''',
+                (time.time_ns(),self.entries,cpu,int(r.ru_maxrss*(1 if sys.platform=='darwin' else 1024)),
                  written,status,
-                 None if status=='running' else time.time_ns(),*context,self.run))
+                 None if status=='running' else time.time_ns(),*context,stages,self.extent_reads,
+                 self.allowance_ns,self.room_ns,self.run))
 
     def record_volumes(self,results):
         """Each volume's outcome codes for this run (status, action, trigger, gaps,
@@ -324,8 +351,13 @@ class MapStore:
         self.pending_resets.clear()
         return old
 
-    def prune_generations(self,full=True):
-        obsolete=[r[0] for r in self.db.execute("SELECT id FROM generations WHERE status='building' OR (? AND status='retired')",(full,))]
+    def prune_generations(self,full=True,pace=None):
+        """Delete unreferenced staged and (with `full`) retired generations in bounded
+        batches. A paced walk's own generation is kept. `pace`, when given, is asked
+        between batches; False stops the pruning, which resumes on the next call.
+        Returns whether it finished."""
+        obsolete=[r[0] for r in self.db.execute('''SELECT id FROM generations WHERE (status='building' OR (? AND status='retired'))
+            AND id NOT IN (SELECT generation FROM walks)''',(full,))]
         for generation in obsolete:
             for table in MAP_TABLES+STAGE_TABLES:
                 columns=sorted(self.db.execute(f'PRAGMA table_info({table})'),key=lambda r:r['pk'])
@@ -335,6 +367,7 @@ class MapStore:
                 # Each batch declares its actual rows: a small leftover must not
                 # reserve a full batch.
                 while True:
+                    if pace is not None and not pace():return False
                     batch=self.db.execute(f'SELECT count(*) FROM (SELECT 1 FROM {table} WHERE generation=? LIMIT 4096)',
                                           (generation,)).fetchone()[0]
                     if not batch:break
@@ -344,6 +377,107 @@ class MapStore:
                     if batch<4096:break
             with self.write(rows=1):
                 self.db.execute('DELETE FROM generations WHERE id=?',(generation,))
+        return True
+
+    def walks(self):
+        """Each volume's paced-walk checkpoint, by volume id."""
+        return {row['volume']:dict(row) for row in self.db.execute('SELECT * FROM walks')}
+
+    def begin_walk(self,volume,*,lean,bookmark,event_uuid,trigger,pace=None):
+        """Start a paced full walk: prune what earlier walks left, within `pace`, then
+        create its staged generation and checkpoint together. Returns False when the
+        pruning stopped first; the next run starts it again."""
+        self.flush()
+        pending=self.db.execute('SELECT delta_generation FROM volumes WHERE id=?',(volume.id,)).fetchone()
+        if pending and pending[0] is not None:raise ValueError('merge_pending')
+        self.volume,self.generation,self.base_gen=volume.id,None,None
+        with self.write(rows=2):
+            self.db.execute('INSERT OR IGNORE INTO volumes(id,label,mount,status,lean) VALUES(?,?,?,?,?)',
+                            (volume.id,volume.label,volume.mount,'building',int(lean)))
+            self.db.execute('UPDATE volumes SET full_attempt_ns=? WHERE id=?',(time.time_ns(),volume.id))
+        if not self.prune_generations(True,pace):return False
+        old=self.db.execute('SELECT * FROM volumes WHERE id=?',(volume.id,)).fetchone()
+        # How far along a walk is: the entries the previous full walk listed.
+        expected=self.db.execute('SELECT sum(count) FROM listings WHERE generation=? AND volume=?',
+                                 (old['generation'],old['key'])).fetchone()[0] if old['generation'] else None
+        now=time.time_ns()
+        with self.write(rows=3,payload_bytes=len((trigger or '')+(event_uuid or ''))):
+            generation=self.db.execute("SELECT value FROM map_meta WHERE key='next_generation'").fetchone()[0]
+            self.db.execute("UPDATE map_meta SET value=value+1 WHERE key='next_generation'")
+            self.db.execute("INSERT INTO generations VALUES(?,?,'building')",(generation,old['key']))
+            self.db.execute('''INSERT INTO walks(volume,generation,phase,started_ns,phase_ns,trigger,bookmark,event_uuid,lean,
+                used_last,expected) VALUES(?,?,'listing',?,?,?,?,?,?,?,?)''',
+                (volume.id,generation,now,now,trigger,bookmark,event_uuid,int(lean),volume.used,expected))
+        return self.resume_walk(volume)
+
+    def resume_walk(self,volume):
+        """Continue this volume's paced walk in its own staged generation. Its used
+        space is read at each run: the reconciliation's tolerance is how much used
+        space moved, in either direction, while the walk went on."""
+        self.flush()
+        walk=self.db.execute('SELECT * FROM walks WHERE volume=?',(volume.id,)).fetchone()
+        self.volume,self.mount,self.base_gen=volume.id,volume.mount,None
+        self.generation=walk['generation']
+        self.vid=self.db.execute('SELECT key FROM volumes WHERE id=?',(volume.id,)).fetchone()[0]
+        self.changed=set();self.pending_resets.clear()
+        self.walk=dict(walk);self.walk_mark=time.process_time_ns()
+        if volume.used is not None and walk['used_last'] is not None:
+            self.walk['used_change']+=abs(volume.used-walk['used_last'])
+        self.walk['used_last']=volume.used
+        self.walk['runs']+=1
+        return self.walk
+
+    def walk_valid(self,walk,*,lean,event_uuid):
+        """A checkpoint is dropped, and its walk starts over, when the volume's event
+        history was replaced (its start bookmark means nothing), when name access
+        changed, or when its generation is gone (an older release pruned it)."""
+        return (walk['event_uuid']==event_uuid and walk['lean']==int(lean) and
+                self.db.execute("SELECT 1 FROM generations WHERE id=? AND status='building'",(walk['generation'],)).fetchone() is not None)
+
+    def staged_count(self,table):
+        """Rows of `table` in the generation being built: the size of a walk's pieces."""
+        self.flush()
+        return self.db.execute(f'SELECT count(*) FROM {table} WHERE generation=? AND volume=?',(self.generation,self.vid)).fetchone()[0]
+
+    def walk_root_listed(self):
+        """Whether this walk listed its volume's root: a walk starts with one root,
+        and a root that cannot be listed leaves nothing to publish."""
+        self.flush()
+        return self.db.execute('''SELECT 1 FROM nodes n INDEXED BY node_parent JOIN listings l
+            ON l.generation=n.generation AND l.volume=n.volume AND l.id=n.id
+            WHERE n.generation=? AND n.volume=? AND n.parent IS NULL LIMIT 1''',(self.generation,self.vid)).fetchone() is not None
+
+    def drop_walk(self,volume_id):
+        with self.write(rows=1):self.db.execute('DELETE FROM walks WHERE volume=?',(volume_id,))
+        if self.walk and self.walk['volume']==volume_id:self.walk=None
+
+    def checkpoint(self,pending=None,*,entries,gaps,sharing_complete,phase=None):
+        """Commit the buffered staged rows and the checkpoint that describes them in
+        one transaction. `pending` is the walker's stack as (inode, parent inode, name
+        withheld); None keeps the stored one."""
+        walk=self.walk;now=time.process_time_ns()
+        walk['cpu_ns']+=now-self.walk_mark;self.walk_mark=now
+        walk.update(entries=entries,gaps=json.dumps(sorted(gaps)),sharing_complete=int(sharing_complete))
+        if phase is not None and phase!=walk['phase']:walk.update(phase=phase,phase_ns=time.time_ns())
+        if pending is not None:
+            # Three integers a folder: inode, parent inode (0 for the root, flagged)
+            # and flags: 1 name withheld, 2 no parent.
+            packed=array('q')
+            for identity,parent,private in pending:
+                keys=(inode_key(identity),inode_key(parent) if parent is not None else 0)
+                if not all(isinstance(key,int) for key in keys):raise ScanError('invalid_checkpoint_identity')
+                packed.extend((*keys,int(private)|(parent is None)<<1))
+            walk['pending']=packed.tobytes()
+        state=('phase','phase_ns','used_last','used_change','entries','cpu_ns','runs','gaps','sharing_complete','pending')
+        statement=f'UPDATE walks SET {",".join(c+"=?" for c in state)} WHERE volume=?'
+        self._flush([(statement,[tuple(walk[c] for c in state)+(walk['volume'],)])],
+                    len(walk['gaps'])+len(walk['pending'] or b''))
+
+    def pending(self):
+        """The checkpoint's folders still to list, in stack order."""
+        packed=array('q');packed.frombytes(self.walk['pending'] or b'')
+        return [(source_id(packed[i]),None if packed[i+2]&2 else source_id(packed[i+1]),bool(packed[i+2]&1))
+                for i in range(0,len(packed),3)]
 
     def observe_unscanned(self,volume,reason,lean=True):
         with self.write(rows=1):
@@ -358,16 +492,19 @@ class MapStore:
         if len(self.buffer)>=8192 or self.buffer_bytes>=2*1024**2:self.flush()
 
     def flush(self):
-        if not self.buffer:return
+        if self.buffer:self._flush()
+
+    def _flush(self,extra=(),extra_bytes=0):
+        """Write the buffered rows, then `extra` statements, in one transaction."""
         if self.base_gen is None:
             grouped=defaultdict(list)
             for query,args in self.buffer:grouped[query].append(args)
-            groups=grouped.items()
+            groups=list(grouped.items())
         else:
             # Reset/delete operations must stay before that directory's inserts.
-            groups=((query,[args for _,args in batch]) for query,batch in groupby(self.buffer,key=lambda item:item[0]))
-        with self.write(rows=len(self.buffer),payload_bytes=self.buffer_bytes):
-            for query,rows in groups:self.db.executemany(query,rows)
+            groups=[(query,[args for _,args in batch]) for query,batch in groupby(self.buffer,key=lambda item:item[0])]
+        with self.write(rows=len(self.buffer)+len(extra),payload_bytes=self.buffer_bytes+extra_bytes):
+            for query,rows in groups+list(extra):self.db.executemany(query,rows)
         self.buffer.clear();self.buffer_bytes=0;self.pending_resets.clear()
 
     def listed(self,identity,count):
@@ -480,13 +617,31 @@ class MapStore:
         self._queue('INSERT OR IGNORE INTO reset_dirs VALUES(?,?,?)',(self.generation,self.vid,identity))
 
     def _subtree(self,identity):
-        pending=[identity];seen=set()
-        while pending:
-            current=pending.pop()
-            if current in seen:raise ScanError('cyclic_directory_ancestry')
-            seen.add(current)
-            pending.extend(row['id'] for row in self._rows('nodes','parent=?',(current,)))
-        return seen
+        """A folder and every folder below it in the map being built, read a level at a
+        time in batches: a staged row replaces its base row, a removed one hides it."""
+        found={identity};level=[identity]
+        while level:
+            children=set()
+            for first in range(0,len(level),500):
+                part=level[first:first+500];marks=','.join('?'*len(part))
+                staged=self.db.execute(f'''SELECT id,parent FROM nodes INDEXED BY node_parent WHERE generation=? AND volume=?
+                    AND parent IN ({marks})''',(self.generation,self.vid,*part)).fetchall()
+                base=self.db.execute(f'''SELECT id FROM nodes INDEXED BY node_parent WHERE generation=? AND volume=?
+                    AND parent IN ({marks})''',(self.base_gen,self.vid,*part)).fetchall() if self.base_gen is not None else []
+                candidates={row[0] for row in staged}|{row[0] for row in base}
+                hidden=set()
+                for chunk in range(0,len(candidates),500):
+                    ids=list(candidates)[chunk:chunk+500];marks=','.join('?'*len(ids))
+                    hidden.update(r[0] for r in self.db.execute(f'SELECT id FROM removed WHERE generation=? AND volume=? AND id IN ({marks})',
+                                                               (self.generation,self.vid,*ids)))
+                    if base:  # A base child moved elsewhere by a staged row is not below this folder.
+                        moved=self.db.execute(f'''SELECT id,parent FROM nodes WHERE generation=? AND volume=? AND id IN ({marks})''',
+                                              (self.generation,self.vid,*ids)).fetchall()
+                        within=set(part);hidden.update(i for i,parent in moved if parent not in within)
+                children|=candidates-hidden
+            if children&found:raise ScanError('cyclic_directory_ancestry')
+            found|=children;level=list(children)
+        return found
 
     def relocate(self,identity,parent,label,path,private):
         key=inode_key(identity);old=self._node(key)
@@ -574,6 +729,7 @@ class MapStore:
                     # reports oddly, costs that stream its sharing, never the run.
                     for file_id in files:
                         try:
+                            self.extent_reads+=1
                             found_ranges=reader(source_id(file_id))
                             if any(start<0 or length<=0 for start,length in found_ranges):raise ValueError('invalid_extent')
                             ranges=found_ranges;break
@@ -729,6 +885,12 @@ class MapStore:
             self.progress()
 
     def _aggregate(self,affected):
+        # Each folder's row is read once: a re-listed subtree shares its ancestors, and
+        # an ancestor already in the work set has its own ancestors there too.
+        rows={}
+        def node_of(key):
+            if key not in rows:rows[key]=self._node(key)
+            return rows[key]
         work=set()
         for identity in affected:
             old=self._old_node(identity)
@@ -736,9 +898,9 @@ class MapStore:
             for seed in seeds:
                 seen=set()
                 for _ in range(MAX_ANCESTRY):
-                    if seed is None:break
+                    if seed is None or (seed in work and seed not in seen):break
                     if seed in seen:raise ScanError('cyclic_directory_ancestry')
-                    seen.add(seed);work.add(seed);node=self._node(seed)
+                    seen.add(seed);work.add(seed);node=node_of(seed)
                     if node is None:break
                     seed=node['parent']
                 else:raise ScanError('directory_ancestry_limit')
@@ -748,7 +910,7 @@ class MapStore:
             while current is not None and current not in depths:
                 if current in seen:raise ScanError('cyclic_directory_ancestry')
                 if len(chain)>=MAX_ANCESTRY:raise ScanError('directory_ancestry_limit')
-                seen.add(current);chain.append(current);node=self._node(current)
+                seen.add(current);chain.append(current);node=node_of(current)
                 if node is None and current!=key:raise ScanError('missing_directory_ancestor')
                 current=node['parent'] if node else None
             value=depths.get(current,-1)
@@ -756,7 +918,7 @@ class MapStore:
             return depths[key]
         for _,level in groupby(sorted(work,key=depth,reverse=True),key=depth):
             for identity in level:
-                node=self._node(identity)
+                node=node_of(identity)
                 if node is None:continue
                 listed,physical,frees=self._own(node)
                 for child in self._rows('nodes','parent=?',(identity,)):
@@ -778,13 +940,21 @@ class MapStore:
         count,payload=self._row_size('dirty',where,args)
         return [(f'DELETE FROM dirty WHERE {where}',args,count,payload,'dirty')]
 
+    def place_sharing(self,reader):
+        """A paced walk's sharing piece: it needs every extent in one process."""
+        self.flush();self.phase('sharing')
+        return self._sharing(reader,True)[1]
+
     def finish_volume(self,volume,reader,gaps,*,full,lean,bookmark=None,event_uuid=None,complete=True,physical=True,
-                      event_progress=None,used_before=None):
+                      event_progress=None,used_before=None,shared=False):
         """Place shared blocks, total every folder and publish. `volume` is read after the
-        walk; `used_before` is its used space before it, for the reconciliation's tolerance."""
+        walk; `used_before` is its used space before it, for the reconciliation's tolerance.
+        `shared`: a paced walk's earlier piece already placed the shared blocks."""
         self.flush();old=self.db.execute('SELECT * FROM volumes WHERE id=?',(self.volume,)).fetchone()
-        self.phase('sharing')
-        affected,sharing_gaps=self._sharing(reader,full)
+        if shared:affected,sharing_gaps=set(),set()
+        else:
+            self.phase('sharing')
+            affected,sharing_gaps=self._sharing(reader,full)
         self.phase('aggregate')
         if full:self._aggregate_full()
         else:self._aggregate(affected|self.changed)
@@ -792,7 +962,12 @@ class MapStore:
         complete=complete and not sharing_gaps
         roots=list(self._rows('nodes','parent IS NULL'))
         total=sum(r['physical'] for r in roots) if roots else None
-        used_change=volume.used-used_before if volume.used is not None and used_before is not None else 0
+        if self.walk is not None:
+            # A paced walk's folders were listed over many hours: every move of used
+            # space since it began, either way, bounds how far they can disagree.
+            used_change=self.walk['used_change']+(abs(volume.used-self.walk['used_last'])
+                if volume.used is not None and self.walk['used_last'] is not None else 0)
+        else:used_change=volume.used-used_before if volume.used is not None and used_before is not None else 0
         unplaced=sum(row['unplaced'] for row in self._rows('streams','unplaced>0'))
         if unplaced:gaps.add('shared_copy_placed_at_full_walk')
         if physical:
@@ -849,16 +1024,17 @@ class MapStore:
                 self.db.execute('''UPDATE volumes SET label=?,mount=?,generation=?,observed_ns=?,full_ns=?,volume_used=?,capacity=?,free=?,available=?,
                     valid=?,status=?,lean=?,bookmark=?,no_progress=?,event_uuid=?,gaps=?,mounted=1,budget_retry_bytes=NULL,delta_generation=?,
                     used_change=?,unplaced_shared=? WHERE id=?''',
-                    (volume.label,volume.mount,published,now,now if full else old['full_ns'],volume.used,volume.capacity,volume.free,volume.available,
+                    (volume.label,volume.mount,published,now,(self.walk['started_ns'] if self.walk else now) if full else old['full_ns'],volume.used,volume.capacity,volume.free,volume.available,
                      int(result['valid']),result['status'],int(lean),bookmark,no_progress,
                      event_uuid,gap_text,delta,used_change,unplaced,self.volume))
                 if full and old['generation'] is not None:
                     self.db.execute("UPDATE generations SET status='retired' WHERE id=?",(old['generation'],))
                 self.db.execute("UPDATE generations SET status='published' WHERE id=?",(published,))
                 if delta is not None:self.db.execute("UPDATE generations SET status='delta' WHERE id=?",(delta,))
+                if full:self.db.execute('DELETE FROM walks WHERE volume=?',(self.volume,))
         except BudgetExceeded as exc:
             exc.publication=dict(receipt,shortfall_bytes=exc.shortfall_bytes);raise
-        self.generation=published;self.base_gen=None
+        self.generation=published;self.base_gen=None;self.walk=None
         if delta is not None:
             try:self.merge_delta(self.volume)
             except Exception as exc:raise MergePending(exc) from exc
@@ -909,33 +1085,29 @@ class MapStore:
         if batch:yield batch
 
     def _merge_removals(self,table,names):
-        """Delete base rows the delta removes, or re-lists without a replacement. It walks
-        the delta's markers and, within each, the base rows by key, so a marker that hides
-        more than one batch keeps its place."""
-        key,primary=KEYS[table],PRIMARY[table]
+        """Delete base rows the delta removes, or re-lists without a replacement. Each
+        marker table is joined to the base rows it hides, a page at a time by key, so a
+        marker that hides more than one page keeps its place and a re-listed subtree
+        costs one query a page, not one a folder."""
+        primary=PRIMARY[table]
         markers=[m for m in (REMOVED[table],RESET.get(table)) if m]
-        # Each marker table's next id by its key; the smaller is the next marker.
-        first,following=(f"SELECT min(id) FROM ({' UNION ALL '.join(f'SELECT * FROM (SELECT id FROM {m} WHERE generation=:d AND volume=:v{bound} ORDER BY id LIMIT 1)' for m in markers)})"
-                         for bound in ('',' AND id>:after'))
-        within=primary[1:]
         keys=','.join('b.'+c for c in primary)
         replaced=' AND '.join(f'r.{c}=b.{c}' for c in primary)
         def doomed():
-            marker=None
-            while (marker:=self.db.execute(following if marker is not None else first,dict(names,after=marker)).fetchone()[0]) is not None:
+            for marker in markers:
                 last=None
                 while True:
-                    seek=f" AND ({','.join('b.'+c for c in within)})>({','.join(':s'+str(i) for i in range(len(within)))})" if last else ''
+                    seek=f" AND ({keys})>({','.join(':s'+str(i) for i in range(len(primary)))})" if last else ''
                     # A delta row with this key replaces the base row instead.
-                    rows=self.db.execute(f'''SELECT {keys},{self._payload(table,'b')} FROM {table} b
-                        WHERE b.generation=:g AND b.volume=:v AND b.{key}=:marker{seek}
+                    rows=self.db.execute(f'''SELECT {keys},{self._payload(table,'b')} FROM {marker} m
+                        JOIN {table} b ON b.generation=:g AND b.volume=:v AND b.{primary[0]}=m.id
+                        WHERE m.generation=:d AND m.volume=:v{seek}
                         AND NOT EXISTS(SELECT 1 FROM {table} r WHERE r.generation=:d AND r.volume=:v AND {replaced}
                             AND {published(table,'r',':g',':v',':d')})
-                        ORDER BY {keys} LIMIT :n''',dict(names,marker=marker,n=MERGE_ROWS,
-                        **{f's{i}':v for i,v in enumerate(last or ())})).fetchall()
+                        ORDER BY {keys} LIMIT :n''',dict(names,n=MERGE_ROWS,**{f's{i}':v for i,v in enumerate(last or ())})).fetchall()
                     yield from rows
-                    if len(rows)<MERGE_ROWS or not within:break
-                    last=tuple(rows[-1])[1:len(primary)]
+                    if len(rows)<MERGE_ROWS:break
+                    last=tuple(rows[-1])[:len(primary)]
         for batch in self._chunks(doomed()):
             with self.write(rows=len(batch),payload_bytes=sum(r[-1] for r in batch)):
                 self.db.executemany(f'DELETE FROM {table} WHERE generation=? AND volume=? AND {" AND ".join(c+"=?" for c in primary)}',
@@ -1123,6 +1295,13 @@ class MapQuery:
             rows=[];truncated=False;next_cursor=None;hierarchy=None;folder=None
             if action == 'volumes':
                 if cursor:raise ValueError('incompatible_storage_cursor')
+                # A paced full walk in progress, and how far along it is. A store the
+                # scanner has not opened since the upgrade has no walks table yet.
+                walks={}
+                if db.execute("SELECT 1 FROM sqlite_master WHERE name='walks'").fetchone():
+                    walks={w['volume']:dict(phase=w['phase'],started_ns=w['started_ns'],entries=w['entries'],expected=w['expected'],
+                                            runs=w['runs'],cpu_ns=w['cpu_ns'])
+                           for w in db.execute('SELECT volume,phase,started_ns,entries,expected,runs,cpu_ns FROM walks')}
                 for v in volumes[:limit+1]:
                     root = next(iter(map_rows('nodes',v,'x.parent IS NULL','LIMIT 1')),None)
                     listed,physical=(root['listed'],root['physical']) if root else (None,None)
@@ -1134,7 +1313,7 @@ class MapQuery:
                                      tolerance=max(accounting.GB,abs(v['used_change'] or 0)) if placed else None,
                                      unplaced_shared=v['unplaced_shared'] or 0,
                                      capacity=v['capacity'],free=v['free'],available=v['available'],valid=valid,status=v['status'],
-                                     mounted=bool(v['mounted']),gaps=json.loads(v['gaps'])))
+                                     mounted=bool(v['mounted']),gaps=json.loads(v['gaps']),walk=walks.get(v['id'])))
                 truncated=len(rows)>limit
             elif volume and action == 'children':
                 parent = params.get('parent_id')

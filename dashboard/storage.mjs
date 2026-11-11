@@ -20,6 +20,17 @@ function observation(bytes, measure, at) {
   return el('span', {}, format(bytes, 'bytes'), el('span', {class:'note'}, label), el('span', {class:'note'}, time(at, true)));
 }
 
+// A paced full walk spans hours; the map shown meanwhile is the previous one, kept current.
+function walkProgress(walk) {
+  const phase = {listing:'listing folders', sharing:'placing shared blocks', totals:'totalling folders'}[walk.phase] ?? walk.phase;
+  const listed = Math.min(walk.entries, walk.expected ?? Infinity);
+  const share = finite(walk.expected) && walk.expected > 0 ?
+    `${Math.floor(100 * listed / walk.expected)}% (${format(walk.entries)} of about ${format(walk.expected)} entries)` :
+    `${format(walk.entries)} entries so far`;
+  return `Full walk in progress, ${phase}: ${share}, started ${time(walk.started_ns, true)}. ` +
+    'It runs a little each hour so the scanner stays light. Until it finishes, this map is the previous full walk plus hourly updates.';
+}
+
 // Kenny's note for a folder the scanner marks: its figures come from the query.
 function sharedNote(asterisk) {
   const parts = ['Shares data with copies elsewhere: APFS clones, hard links, snapshots.'];
@@ -87,11 +98,12 @@ export async function storageView(api, interval, abort) {
       const details = el('p', {class:'note'}, badge(children.status),
         ` · Map as of ${time(volume.observed_ns, true)}`);
       const blocks = [breadcrumbs, details, freeSpace(volume)];
+      if (volume.walk) blocks.push(el('p', {class:'notice'}, walkProgress(volume.walk)));
       if (volume.gaps?.length) blocks.push(el('p', {class:'notice'}, `Map coverage gaps: ${volume.gaps.map(statusText).join(', ')}.`));
       if (volume.valid === true && finite(volume.not_placed)) {
         blocks.push(el('div', {class:'banner'},
           el('p', {}, `Physical space in folders ${format(volume.physical,'bytes')} + not placed in a folder ${format(volume.not_placed,'bytes')} = used ${format(volume.volume_used,'bytes')}`),
-          el('p', {class:'sub'}, `Not placed in a folder: snapshots, file-system records and areas the scanner cannot read. Folders may exceed used space by up to ${format(volume.tolerance,'bytes')}, the larger of 1 GB and the change in used space during the scan.`)));
+          el('p', {class:'sub'}, `Not placed in a folder: snapshots, file-system records and areas the scanner cannot read. Folders may exceed used space by up to the larger of 1 GB and the change in used space during the scan (here ${format(volume.tolerance,'bytes')}).`)));
         if (finite(volume.volume_used) && volume.volume_used > 0) {
           const bar = el('svg', {class:'storage-bar', viewBox:'0 0 100 8', preserveAspectRatio:'none', role:'img', 'aria-label':
             `In folders ${format(volume.physical,'bytes')}; not placed in a folder ${format(volume.not_placed,'bytes')}`} );

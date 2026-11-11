@@ -56,8 +56,31 @@ class Walker:
             self.gaps.add('directory_unreadable');return None
         finally:os.close(fd)
 
-    def walk(self, root=None, parent_id=None, inherited_private=False, recursive=True):
+    def path_of(self, identity):
+        """A folder's path now, found from its inode and kept in memory only: a
+        checkpointed or deferred folder needs no stored name. None when it is gone:
+        its parent's change event corrects the map."""
+        from .native import inode_path
+        if not str(identity).isdigit():
+            return None
+        try:
+            found = inode_path(self.volume.device, int(identity))
+        except OSError as exc:
+            if exc.errno != errno.ENOENT:
+                self.gaps.add('directory_unreadable')
+            return None
+        mount = self.volume.mount
+        if found != mount and not found.startswith(mount.rstrip('/') + '/'):
+            # The Data volume answers with its firmlinked path (/Users/...).
+            found = os.path.normpath(mount + found)
+        return found
+
+    def walk(self, root=None, parent_id=None, inherited_private=False, recursive=True, resume=None, pace=None):
+        """`resume` continues a paced walk: its checkpointed folders, as (inode, parent,
+        name withheld). `pace` is asked before each folder, with a function giving the
+        folders left in that form; False pauses the walk and sets `paused`."""
         root = root or self.volume.mount
+        self.paused = False
         try:
             rootstat = os.stat(root, follow_symlinks=False)
         except OSError:
@@ -67,9 +90,19 @@ class Walker:
             self.gaps.add('root_not_directory')
             return False
         root_listed=False
-        stack = [(root, parent_id, inherited_private,recursive)]
+        # Each entry: (path or None when only its inode is known, parent, private,
+        # descend, its own inode).
+        stack = ([(None, parent, private, True, identity) for identity, parent, private in resume] if resume is not None
+                 else [(root, parent_id, inherited_private, recursive, str(rootstat.st_ino))])
         while stack:
-            path, parent, hidden, descend_all = stack.pop()
+            if pace is not None and not pace(lambda: [(identity, parent, private) for _, parent, private, _, identity in stack]):
+                self.paused = True
+                return root_listed
+            path, parent, hidden, descend_all, expected = stack.pop()
+            if path is None:
+                path = self.path_of(expected)
+                if path is None:
+                    continue
             st = None
             try:
                 st = os.stat(path, follow_symlinks=False)
@@ -125,7 +158,7 @@ class Walker:
                                     self.gaps.add('cloud_placeholder')
                                     continue
                                 if stat.S_ISDIR(child.st_mode):
-                                    children.append((os.path.join(path, entry.name), identity, not names,True))
+                                    children.append((os.path.join(path, entry.name), identity, not names, True, str(child.st_ino)))
                                     continue
                                 alloc = child.st_blocks * 512
                                 shared = None
@@ -167,14 +200,14 @@ class Walker:
                     else:
                         self.sink.flush()
                         present=set()
-                        for child_path,child_parent,private,_ in children:
+                        for child_path,child_parent,private,_,_ in children:
                             child_stat=os.stat(child_path,follow_symlinks=False)
                             child_id=str(child_stat.st_ino)
                             present.add(child_id)
                             decision=self.policy.decide(shown_path(self.volume,child_path),private)
                             known=self.sink.relocate(child_id,child_parent,os.path.basename(child_path),child_path,
                                                       private or not decision.names)
-                            if not known:stack.append((child_path,child_parent,private,True))
+                            if not known:stack.append((child_path,child_parent,private,True,child_id))
                         if outcome=='observed':self.sink.forget_children(identity,present)
                 finally:
                     os.close(fd)

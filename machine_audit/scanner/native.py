@@ -26,6 +26,27 @@ class Log2Phys(C.Structure):
     _fields_ = [('flags', U32), ('length', I64), ('offset', I64)]
 
 
+_fsgetpath = None
+
+
+def inode_path(device, inode):
+    """A file system object's current path from its volume and inode (fsgetpath),
+    following renames, so a paced walk's checkpoint needs no names. The path stays in
+    memory. Raises OSError when it cannot be found (ENOENT: it is gone)."""
+    global _fsgetpath
+    if _fsgetpath is None:
+        libc = C.CDLL(None, use_errno=True)
+        _fsgetpath = libc.fsgetpath
+        _fsgetpath.restype = C.c_ssize_t
+        _fsgetpath.argtypes = [C.c_char_p, C.c_size_t, C.POINTER(I32 * 2), U64]
+    buf = C.create_string_buffer(4096)
+    fsid = (I32 * 2)(device, 0)
+    if _fsgetpath(buf, len(buf), C.byref(fsid), inode) < 0:
+        code = C.get_errno()
+        raise OSError(code, os.strerror(code))
+    return os.fsdecode(buf.value)
+
+
 @dataclass(frozen=True)
 class Volume:
     id: str

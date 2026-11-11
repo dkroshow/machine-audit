@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import errno
 import fcntl
 import gc
+import json
 import os
 import stat
 from pathlib import Path
@@ -18,6 +19,7 @@ from machine_audit.sources.iokit import IOKit
 from .native import MacFilesystem
 from .events import FSEvents, next_decision
 from .errors import ScanError
+from .pace import PIECE_WAIT_NS, SHARING_NS_PER_HOLDER, TOTALS_NS_PER_FOLDER, allowance
 from .policy import Policy
 from .store import MapStore, MergePending
 from .walker import Walker, shown_path
@@ -65,17 +67,20 @@ def live_parent(store,walker,volume,path,stored):
     return identity if identity is not None and identity!=stored and store.known_directory(identity) else stored
 
 
-def relist(store,walker,policy,volume,now,changes):
-    """Re-list changed folders, given as (absolute path, recursive), plus deferred ones now due."""
+def relist(store,walker,policy,volume,now,changes,pace=None):
+    """Re-list changed folders, given as (absolute path, recursive), plus deferred ones now due.
+    Folders left when `pace` is spent are deferred to the next run."""
     roots_to_update={}
     recursive_roots=set()
     due_paths={}
-    for due,recursive in store.db.execute('SELECT id,recursive FROM dirty WHERE volume=? AND due_ns<=?',(volume.id,now)):
+    for due,recursive in store.db.execute('SELECT id,recursive FROM dirty WHERE volume=? AND due_ns<=?',(volume.id,now)).fetchall():
         saved=store.known_directory(due)
-        if saved and saved['path']:
-            roots_to_update[saved['path']]=saved
-            due_paths[saved['id']]=saved['path']
-            if recursive is None or recursive:recursive_roots.add(saved['path'])
+        # A name-withheld folder has no stored path; its inode finds it, in memory.
+        path=saved and (saved['path'] or walker.path_of(due))
+        if path:
+            roots_to_update[path]=saved
+            due_paths[saved['id']]=path
+            if recursive is None or recursive:recursive_roots.add(path)
     for path,recursive in changes:
         if os.path.commonpath([path,volume.mount])!=volume.mount:
             continue
@@ -112,6 +117,9 @@ def relist(store,walker,policy,volume,now,changes):
         chosen.append(path)
         previous=roots_to_update[path]
         recursive=path in recursive_roots
+        if pace is not None and pace.exhausted():
+            # The hour's allowance is spent: the next run re-lists it first.
+            store.defer(previous['id'],now,recursive);walker.gaps.add('update_deferred');continue
         # Open it before anything is cleared: a walk lists nothing when the open is
         # denied, and a cleared, unwalked directory orphans whatever is staged beneath.
         if walker.directory_identity(path) is None:
@@ -139,6 +147,86 @@ def relist(store,walker,policy,volume,now,changes):
     return complete
 
 
+CHECKPOINT_NS=30*10**9
+
+
+def paced_walk(store,events,fs,policy,grain,volume,trigger,event_uuid,pace,*,lean):
+    """One run's share of a volume's full walk: start it, or resume it from its
+    checkpoint, and go on through listing, sharing and totals while the allowance
+    lasts (storage-approach.md#paced-full-walks). Sharing and totals each run whole,
+    in a run whose allowance covers their estimate, or after a day of waiting.
+    Returns the walk's state for the run record; `failure` names a failed attempt."""
+    walker=None;listed_before=0
+    try:
+        if not pace.walk_open():
+            walk=store.walks().get(volume.id)
+            return {'state':'waiting_allowance','phase':walk['phase'] if walk else None}
+        walk=store.walks().get(volume.id)
+        if walk is None:
+            store.phase('prepare',volume_id=volume.id,action='full',trigger=trigger)
+            if not store.begin_walk(volume,lean=lean,bookmark=events.current_id(),event_uuid=event_uuid,
+                                    trigger=trigger,pace=pace.walk_open):
+                return {'state':'pruning'}
+            fresh=True
+        else:
+            store.phase('prepare',volume_id=volume.id,action='full',trigger=walk['trigger'])
+            store.resume_walk(volume);fresh=False
+        walk=store.walk
+        walker=Walker(volume,policy,store,fs,grain)
+        # The walker counts this run's entries; the checkpoint keeps the walk's total.
+        listed_before=walk['entries'];walker.gaps=set(json.loads(walk['gaps']))
+        walker.sharing_complete=bool(walk['sharing_complete'])
+        def save(phase=None,pending=None):
+            store.checkpoint(pending,entries=listed_before+walker.entries,gaps=walker.gaps,
+                             sharing_complete=walker.sharing_complete,phase=phase)
+        def state():
+            return dict(state='paused',phase=walk['phase'],entries=listed_before+walker.entries,expected=walk['expected'],
+                        started_ns=walk['started_ns'],cpu_ns=walk['cpu_ns'],runs=walk['runs'],listed=walker.entries)
+        if walk['phase']=='listing':
+            store.phase('walk')
+            mark=pace.clock()
+            def ticker(pending):
+                # Checkpoint every CHECKPOINT_NS of CPU, so a stop or crash loses little,
+                # and when the allowance is spent, which pauses the walk.
+                nonlocal mark
+                go=pace.walk_open()
+                if not go or pace.clock()-mark>=CHECKPOINT_NS:save(pending=pending());mark=pace.clock()
+                return go
+            walker.walk(resume=None if fresh else store.pending(),pace=ticker)
+            if walker.paused:return state()
+            if not store.walk_root_listed():
+                # The root could not be listed: nothing was walked, nothing is kept.
+                store.drop_walk(volume.id)
+                reason='root_unreadable'+''.join('_'+gap for gap in sorted(walker.gaps-{'root_unreadable'}))
+                store.mark_failed(reason,end_run=False)
+                return dict(state='failed',failure='root_unreadable',listed=walker.entries,
+                            result=dict(reason=reason,gaps=sorted(walker.gaps)))
+            save('sharing',[])
+        waited=time.time_ns()-walk['phase_ns']>=PIECE_WAIT_NS
+        reader=(lambda inode,device=volume.device:fs.extents(device,int(inode))) if volume.fs=='apfs' else None
+        if walk['phase']=='sharing':
+            if not (pace.covers(SHARING_NS_PER_HOLDER*store.staged_count('holders')) or waited):return dict(state(),state='waiting_allowance')
+            gaps=store.place_sharing(reader)
+            walker.gaps|=gaps;walker.sharing_complete=walker.sharing_complete and not gaps
+            save('totals')
+            waited=False
+        if not (pace.covers(TOTALS_NS_PER_FOLDER*store.staged_count('nodes')) or waited):return dict(state(),state='waiting_allowance')
+        after=next((v for v in fs.volumes() if v.id==volume.id),volume)
+        result=state()
+        store.finish_volume(after,reader,walker.gaps,full=True,lean=lean,bookmark=walk['bookmark'],event_uuid=walk['event_uuid'],
+                            complete=walker.sharing_complete,shared=True)
+        return dict(result,state='published',phase='published',result=dict(gaps=sorted(walker.gaps)))
+    except BudgetExceeded as exc:
+        # The checkpoint and its rows stand. A refusal for want of managed storage
+        # drops the walk: its staged rows are what the cap lacks. The recovery rules
+        # then decide the next attempt, as for any refused full walk.
+        if exc.code in CAPACITY_REFUSALS:store.drop_walk(volume.id)
+        blocked=f'budget_blocked_{exc.code}'
+        store.mark_failed(blocked,end_run=False,retry_bytes=exc.retry_bytes)
+        return dict(state='failed',failure=blocked,listed=walker.entries if walker else 0,
+                    result=dict(stage=store.run_context['stage'],**({'publication':exc.publication} if hasattr(exc,'publication') else {})))
+
+
 def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roots=None, access=None, exclusions=(), force=False):
     if grain not in ('files','folders'):
         raise ValueError('invalid_scanner_grain')
@@ -160,7 +248,10 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
         fs=MacFilesystem(native)
         events=FSEvents(IOKit())
         policy=Policy(full_disk_access=full_disk_access,exclusions=exclusions,data_root=str(root))
+        # The allowance counts from here; the operator's forced scan is unpaced.
+        pace=allowance(root,force=force)
         store=MapStore(root/'scanner.sqlite',budget)
+        store.allowance_ns,store.room_ns=pace.limit,pace.room
         processed=0
         root_failed=False
         published=0
@@ -180,6 +271,8 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                 if len(selected)!=len(roots):
                     raise ValueError('only_discovered_volume_roots_are_allowed')
                 volumes=selected
+            walks=store.walks()
+            walking=[]  # (volume, trigger, event uuid): paced walk work, after every update
             for volume in volumes:
                 if volume.id in pending:
                     # Its update is published; it is not scanned until its delta merges.
@@ -204,7 +297,6 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     store.observe_unscanned(volume,'needs_full_disk_access')
                     results.append({'volume_id':volume.id,'status':'not_enabled','reason':'external_volume_requires_full_disk_access'})
                     continue
-                old=store.db.execute('SELECT * FROM volumes WHERE id=?',(volume.id,)).fetchone()
                 now=time.time_ns()
                 # Legacy failed walks could publish a timestamp without a root.
                 # Such a generation is not a completed scan for cooldown purposes.
@@ -236,26 +328,38 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     if failed_full and not force and (retry is None or not budget.retry_level_reached(retry)):
                         action,trigger='wait','budget_retry_gate'
                     else:action,trigger='full','budget_recovery'
-                if action=='wait':
+                walk=walks.get(volume.id)
+                if action=='wait' and not walk:
                     store.phase('complete',action=action,trigger=trigger)
                     status=old['status'] if capacity or trigger=='failed_full_retry_cooldown' else 'current'
                     if capacity:  # Blocked, not up to date, whichever wait held it.
                         root_failed=True;blocked=status
                     results.append({'volume_id':volume.id,'status':status,'action':action,'trigger':trigger})
                     continue
+                # A full walk is paced: it runs after every volume's update, in this
+                # run's allowance. While one goes on, an update keeps the published map
+                # current whenever its events can (a weekly or requested walk).
+                walk_trigger=walk['trigger'] if walk else None
+                if action=='full':
+                    if not walk:walk_trigger=trigger
+                    update_due=(walk and not force and old['bookmark'] is not None and trigger in ('weekly_full','requested_full')
+                                and (old['observed_ns'] is None or now-old['observed_ns']>=3600*10**9))
+                    action,trigger=('update','hourly_update') if update_due else ('wait',trigger)
                 store.phase('events',action=action,trigger=trigger)
                 event_uuid=events.uuid(volume.device)
-                if old and old['event_uuid']!=event_uuid:action,trigger='full','event_uuid_mismatch'
+                if walk and not store.walk_valid(walk,lean=not full_disk_access,event_uuid=event_uuid):
+                    store.drop_walk(volume.id);walk=None;walk_trigger='walk_restarted'
+                if action=='update' and old['event_uuid']!=event_uuid:action,trigger,walk_trigger='wait','event_uuid_mismatch',walk_trigger or 'event_uuid_mismatch'
                 replay=None
                 if action=='update':
                     replay=events.replay(volume.device,old['bookmark'])
                     if replay.lost:
-                        action,trigger='full',replay.loss_reason or 'events_lost'
+                        action,trigger='wait',replay.loss_reason or 'events_lost'
                     elif any(recursive and not os.path.normpath('/'+relative.lstrip('/')).strip('/')
                              for relative,recursive in replay.paths.items()):
                         # Replaying a recursive volume root is a full walk. Use
                         # the full staging/aggregation path, not subtree resets.
-                        action,trigger='full','event_root_must_scan'
+                        action,trigger='wait','event_root_must_scan'
                     elif any(replay.paths.values()):trigger='event_subtree_must_scan'
                     elif store.db.execute('SELECT 1 FROM dirty WHERE volume=? AND due_ns<=? LIMIT 1',
                                           (volume.id,now)).fetchone():trigger='deferred_folder_due'
@@ -264,44 +368,38 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                         WHERE n.generation=? AND n.volume=? AND n.parent IS NULL AND d.due_ns<=?
                         AND coalesce(d.recursive,1) LIMIT 1''',
                         (volume.id,old['generation'],old['key'],now)).fetchone():
-                        action,trigger='full','deferred_root_due'
-                bookmark=events.current_id() if action=='full' else replay.up_to or replay.last_good or old['bookmark']
+                        action,trigger='wait','deferred_root_due'
+                    if action=='wait':walk_trigger=walk_trigger or trigger
+                if walk_trigger:walking.append((volume,walk_trigger,event_uuid))
+                if action=='wait':
+                    # Only the walk has work here; it reports in the walk pass.
+                    store.phase('complete',action='walk',trigger=walk_trigger)
+                    results.append({'volume_id':volume.id,'status':old['status'] if old else 'building','action':'full','trigger':walk_trigger})
+                    continue
+                bookmark=replay.up_to or replay.last_good or old['bookmark']
                 walker=None
                 try:
                     store.phase('prepare',action=action,trigger=trigger)
-                    store.prepare(volume,full=action=='full',lean=not full_disk_access)
+                    store.prepare(volume,full=False,lean=not full_disk_access)
                     walker=Walker(volume,policy,store,fs,grain)
                     store.phase('walk')
-                    if action=='full':
-                        walker.walk()
-                        # A full walk starts with one root; descendants are queued
-                        # only after its listing completes. Empty is still listed.
-                        if not walker.listed:
-                            root_failed=True
-                            processed+=walker.entries
-                            reason='root_unreadable'+''.join('_'+gap for gap in sorted(walker.gaps-{'root_unreadable'}))
-                            store.mark_failed(reason,end_run=False)
-                            results.append({'volume_id':volume.id,'status':'root_unreadable','action':action,'trigger':trigger,
-                                            'reason':reason,'entries':walker.entries,'gaps':sorted(walker.gaps)})
-                            continue
-                    else:
-                        complete=relist(store,walker,policy,volume,now,
-                               ((os.path.normpath(os.path.join(volume.mount,relative.lstrip('/'))),recursive)
-                                for relative,recursive in replay.paths.items()))
-                        if not complete:
-                            root_failed=True
-                            processed+=walker.entries
-                            store.mark_failed('update_unreadable',end_run=False)
-                            results.append({'volume_id':volume.id,'status':'update_unreadable','action':action,
-                                            'trigger':trigger,'entries':walker.entries,'gaps':sorted(walker.gaps)})
-                            continue
+                    complete=relist(store,walker,policy,volume,now,
+                           ((os.path.normpath(os.path.join(volume.mount,relative.lstrip('/'))),recursive)
+                            for relative,recursive in replay.paths.items()),pace)
+                    if not complete:
+                        root_failed=True
+                        processed+=walker.entries
+                        store.mark_failed('update_unreadable',end_run=False)
+                        results.append({'volume_id':volume.id,'status':'update_unreadable','action':action,
+                                        'trigger':trigger,'entries':walker.entries,'gaps':sorted(walker.gaps)})
+                        continue
                     # Read used space again: the walk took time, and the reconciliation's
                     # tolerance is how much it changed meanwhile.
                     after=next((v for v in fs.volumes() if v.id==volume.id),volume)
                     reader=(lambda inode,device=volume.device:fs.extents(device,int(inode))) if volume.fs=='apfs' else None
-                    store.finish_volume(after,reader,walker.gaps,full=action=='full',lean=not full_disk_access,used_before=volume.used,
-                        bookmark=bookmark,event_uuid=event_uuid,complete=walker.sharing_complete and (action=='full' or not replay.interrupted),
-                        event_progress=None if not replay or not replay.paths else bookmark!=old['bookmark'])
+                    store.finish_volume(after,reader,walker.gaps,full=False,lean=not full_disk_access,used_before=volume.used,
+                        bookmark=bookmark,event_uuid=event_uuid,complete=walker.sharing_complete and not replay.interrupted,
+                        event_progress=None if not replay.paths else bookmark!=old['bookmark'])
                 except BudgetExceeded as exc:
                     # Only this attempt is dropped: its pending writes now, its
                     # staged generation at the next preparation. Other volumes go on.
@@ -326,6 +424,28 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                 store.progress(processed)
                 results.append({'volume_id':volume.id,'status':'observed','action':action,'trigger':trigger,'entries':walker.entries,
                                 'gaps':sorted(walker.gaps)})
+            for volume,trigger,event_uuid in walking:
+                outcome=paced_walk(store,events,fs,policy,grain,volume,trigger,event_uuid,pace,lean=not full_disk_access)
+                store.walk=None  # Ended for this run; a later failure is not this walk's.
+                listed=outcome.pop('listed',0);processed+=listed
+                store.progress(processed)
+                result=next((r for r in results if r['volume_id']==volume.id),None)
+                if result is None:results.append(result:={'volume_id':volume.id,'action':'full','trigger':trigger})
+                if result['action']=='full':result.update(entries=listed,**outcome.pop('result',{}))
+                else:outcome.pop('result',None)
+                failure=outcome.pop('failure',None)
+                if failure:
+                    root_failed=True
+                    if failure.startswith('budget_blocked_'):blocked=failure
+                    result.update(status=failure)
+                elif outcome['state']=='published':
+                    published+=1
+                    if result['action']=='full':result.update(status='observed')
+                result['walk']=outcome
+            if pace.walk_open():
+                # A replaced map is pruned in the time the hour has left, not in one burst.
+                store.phase('prune')
+                store.prune_generations(True,pace.walk_open)
             current={v.id for v in volumes}
             missing=[row[0] for row in store.db.execute('SELECT id FROM volumes') if row[0] not in current]
             if missing:
@@ -337,6 +457,9 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
             store.progress(processed,run_status)
             return {'status':run_status if root_failed else 'observed','volumes':results,'entries':processed,**store.run_context}
         except Exception as exc:
+            # A failed attempt, unlike a stop or crash, does not resume: its staged
+            # rows may be what failed. The retry rules decide the next walk.
+            failed_walk=store.walk['volume'] if store.walk else None
             exception_type=type(exc).__name__;retry_bytes=getattr(exc,'retry_bytes',None)
             if isinstance(exc,BudgetExceeded):status,reason='budget_blocked',f'budget_blocked_{exc.code}'
             else:
@@ -359,6 +482,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
         recorded=False
         try:
             store.reopen()
+            if failed_walk:store.drop_walk(failed_walk)
             store.record_volumes(results)
             store.mark_failed(reason,retry_bytes=retry_bytes)
         except Exception:

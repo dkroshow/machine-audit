@@ -153,8 +153,9 @@ allocated space with hard links once, and no residual is claimed.
 folders, plus a separately labelled line, **not placed in a folder**, equal
 the volume's used space read after the walk. Not placed covers snapshots,
 file-system records and areas the scanner cannot read. Folders may exceed used
-space by up to max(1 GB, the change in used space during the walk), because
-files change while the walk runs; beyond that the folder figures are withheld
+space by up to the larger of 1 GB and the change in used space during the walk
+(for a paced walk, every move of used space while it ran), because files change
+while the walk runs; beyond that the folder figures are withheld
 until the next full scan, never rescaled. Rows on one page can add to more
 than their folder when they share blocks with each other; the page states that
 amount ("shared between the rows") when it is at least 1 GB, so rows, that
@@ -217,7 +218,7 @@ Same model on both operating systems; different mechanism, stated on the map.
 
 | | macOS | Ubuntu |
 | --- | --- | --- |
-| Full scan | Weekly; also first run, a lost change log, or on request (at most daily) | Nightly: the update *is* a re-walk |
+| Full scan | Weekly; also first run, a lost change log, or on request (at most daily); paced over hours within a CPU allowance ([paced full walks](storage-approach.md#paced-full-walks)) | Nightly: the update *is* a re-walk |
 | Update | Hourly: replay the file system event log since the last bookmark, re-list only changed folders; folders with more than about 20,000 direct entries at most daily | Hourly: re-list the hot folders an inotify watch in the collector saw change (folders of 1 GB or more, or directly holding a file of 100 MB or more; at most 8,192 and an eighth of `max_user_watches`), with the same daily limit for large folders |
 | Why | The event service keeps a persistent log whether or not anyone listens | Change notifications exist only while a process listens; per-folder watches cost kernel memory, need a raised limit and lose events on overflow; mount-wide watching needs root. So the walk is nightly, as Linux's own `locate` does, and only a bounded hot set is watched; an overflow re-lists every hot folder |
 | History grain | Hourly points | Daily points; hourly for hot folders that changed |

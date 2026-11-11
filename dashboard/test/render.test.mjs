@@ -149,6 +149,9 @@ test('all dashboard views render real stored replay without leaked tokens or fak
     }
     if(view==='storage') {
       assert.match(await run("document.querySelector('#view').innerText"),/Physical space in folders 7 GB \+ not placed in a folder 4 GB = used 11 GB/);
+      assert.match(await run("document.querySelector('#view').innerText"),/may exceed used space by up to the larger of 1 GB and the change in used space during the scan \(here 1 GB\)/);
+      // A paced full walk under way says so, and how far along it is (the seeded checkpoint).
+      assert.match(await run("document.querySelector('#view').innerText"),/Full walk in progress, listing folders: 40% \(5,400,000 of about 13,300,000 entries\), started /);
       // The two folders share 2 GB: each is marked, and the root page states the overlap.
       assert.equal(await run("document.querySelectorAll('details.asterisk').length"),2);
       await run("document.querySelector('details.asterisk').open=true");

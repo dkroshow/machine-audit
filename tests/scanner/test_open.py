@@ -277,20 +277,22 @@ class RootPublicationTests(unittest.TestCase):
         original = MapStore.prune_generations
         def refuse_on(call):
             calls = []
-            def prune(store, full=True):
+            def prune(store, full=True, pace=None):
                 calls.append(full)
                 if len(calls)==call:
                     refused = BudgetExceeded('sqlite_checkpoint_headroom', 1)
                     refused.retry_bytes = 1
                     raise refused
-                return original(store, full)
+                return original(store, full, pace)
             return prune
         def stored():
             with sqlite3.connect(self.data/'scanner.sqlite') as db:
                 return dict((r[0], r[1:]) for r in db.execute('SELECT id,status,budget_retry_bytes FROM volumes'))
         blocked = ('budget_blocked_sqlite_checkpoint_headroom', 1)
+        # Updates run before paced walks: in the second run the recovery walk of 'w'
+        # prunes after 'v' prepares its update.
         for hours, order, call, expected in ((1, [self.volume, second], 2, {'v':('observed', None), 'w':blocked}),
-                                             (2, [second, self.volume], 1, {'v':('observed', None), 'w':blocked})):
+                                             (2, [second, self.volume], 2, {'v':('observed', None), 'w':blocked})):
             with patch.object(MapStore, 'prune_generations', refuse_on(call)), \
                  patch('machine_audit.scanner.runner.time.time_ns', return_value=start+hours*3600*10**9):
                 result, status = self.scan(order, events=events, full=False)

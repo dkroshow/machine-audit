@@ -47,7 +47,8 @@ class PublicationBudgetTests(unittest.TestCase):
         return evidence
 
     def test_run_diagnostics_migrate_without_changing_prior_run_evidence(self):
-        legacy = (SCHEMA.replace(',\n volume_id TEXT,action TEXT,trigger TEXT,stage TEXT,volumes TEXT', '')
+        legacy = (SCHEMA.replace(',\n volume_id TEXT,action TEXT,trigger TEXT,stage TEXT,volumes TEXT,'
+                                 '\n stage_cpu TEXT,extent_reads INTEGER,allowance_ns INTEGER,room_ns INTEGER', '')
                   .replace(',full_attempt_ns INTEGER,budget_retry_bytes INTEGER,delta_generation INTEGER', '').replace('due_ns INTEGER,recursive INTEGER', 'due_ns INTEGER'))
         original = ('old',1,2,2,123,'start','complete',10,20,30,40,'scheduled')
         with sqlite3.connect(self.path) as db:
@@ -75,7 +76,7 @@ class PublicationBudgetTests(unittest.TestCase):
         self.addCleanup(store.close)
         row = tuple(store.db.execute("SELECT * FROM runs WHERE id='old'").fetchone())
         self.assertEqual(row[:12],original)
-        self.assertEqual(row[12:],(None,None,None,None,None))
+        self.assertEqual(row[12:],(None,)*9)
         # Format 4 retires every map for one full walk: its old folder figures meant
         # something else. Run evidence and deferred folders stay.
         self.assertEqual(tuple(store.db.execute('SELECT full_ns,full_attempt_ns,budget_retry_bytes,delta_generation,status FROM volumes').fetchone()),

@@ -495,6 +495,61 @@ processes in 31 minutes that lived a single pass and had none counted. What is l
 process's own peak is a 30-second average, and a process that starts and exits between
 two passes is not seen.
 
+## Paced full walks
+
+The scanner's full walk was the one case where Machine-audit still crossed its own bar:
+on Big Mac (Nov 10) a walk of all nine volumes cost 2,948 s of CPU in 65 minutes, against
+a bar of 134–146 s that hour. The weekly walk is now paced by a CPU allowance per run;
+the hourly schedule is the only scheduler.
+
+**The allowance.** Each scheduled run may spend `max(room, 120 s)` of CPU, counted from
+its start. Room is the bar for the trailing hour, 1% (`SHARE`) of the machine's process
+CPU, minus the collector's own CPU in that hour, both read read-only from the collector's
+store (about 0.3 s). When that store cannot answer, the floor governs. The floor keeps
+hourly updates current in hours the collector alone fills: on Nov 7–10, 27–40% of hours
+were over the bar from the collector and the routine update before any walk. A run
+spends the allowance in this order:
+
+1. Every volume's hourly update. An update that reaches the allowance defers the
+   folders it has not re-listed through the deferral table; the next run re-lists them
+   first. A single folder's re-list is not split.
+2. Paced walk work, which always gets at least 20 s even when the updates spent the
+   allowance, so a walk of Big Mac (about 3,100 s with pruning and finishing) ends
+   within a week. At the room measured on Nov 7–10 it takes about 1.5–2 days.
+3. Pruning a replaced map, in what is left.
+
+The operator's `scan --full` is unpaced. The run row records `allowance_ns`, `room_ns`
+(null when unknown), CPU by stage (`stage_cpu`, ns: `walk` is listing, `sharing`,
+`aggregate` is totals, `publication`, `merge`, `prune`) and `extent_reads`.
+
+**The checkpoint.** One `walks` row per volume holds the walk's staged generation, its
+phase, its start bookmark and event UUID, the entries listed and the folders still to
+list as (inode, parent inode, name withheld): never names or paths. It is written in
+the same transaction as the staged rows it describes, every 30 s of CPU and when the
+walk pauses, so a stop, reboot or crash loses at most 30 s of work and the next run
+resumes. A resumed folder's path is found again from its inode (`fsgetpath`), in memory
+only; a folder gone since is skipped, and its parent's change event corrects the map.
+Deferred name-withheld folders are found the same way. A failed attempt (an exception
+the scanner catches) does not resume: its checkpoint is dropped and the retry rules
+decide the next walk. So does a change of the volume's event UUID or name access.
+
+**Phases.** Listing pauses between folders. Placing shared blocks needs every extent in
+one process, and extents are never stored, so it runs whole; so does totalling folders.
+Each waits for a run whose allowance covers its estimate (about 120 µs a file that may
+share blocks, 30 µs a folder: 127 s and 47 s on Big Mac's startup volume), but never
+longer than a day.
+
+**The map meanwhile.** The published map, the previous full walk plus hourly deltas,
+keeps serving and taking updates; the walk's generation is invisible to queries and
+never pruned. The walk publishes by the same pointer switch as before, with its start
+bookmark, so the next update replays every change since it began (on Big Mac, 9 hours
+of changes touched 31.7 k folders with 402 k entries, not counting the over-20 k
+folders limited to daily), paced by the same allowance. The weekly cadence counts from
+the walk's start, which becomes the map's full-scan time. The reconciliation's
+tolerance is every move of used space while the walk ran, in either direction. The
+storage answer's volume rows carry `walk` (phase, entries, expected entries from the
+previous walk, start, runs, CPU), and the tab says how far along it is.
+
 ## Saving, cost and retention
 
 Saving in transactions once a minute is the starting design. The dashboard can

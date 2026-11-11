@@ -149,6 +149,31 @@ class RelistTests(unittest.TestCase):
         labels={r[0] for r in self.store.db.execute('SELECT label FROM nodes UNION SELECT label FROM files')}
         self.assertTrue({'inner','sensitive','Local State'}.isdisjoint(labels))
 
+    def test_restaging_a_subtree_does_not_query_once_a_folder(self):
+        # A recursive re-list cost about 6 times a fresh walk per entry: clearing the
+        # old subtree and merging its removals each issued queries for every folder.
+        for name,folders in (('small',40),('large',320)):
+            for i in range(folders):
+                (self.tree/name/str(i)).mkdir(parents=True);(self.tree/name/str(i)/'f').write_bytes(b'x')
+        self.baseline()
+        statements={}
+        for name in ('small','large'):
+            seen=[]
+            def counted(method):
+                def run(*args,**kwargs):
+                    self.store.db.set_trace_callback(seen.append)
+                    try:return method(*args,**kwargs)
+                    finally:self.store.db.set_trace_callback(None)
+                return run
+            with patch.object(self.store,'clear_subtree',counted(self.store.clear_subtree)), \
+                 patch.object(self.store,'merge_delta',counted(self.store.merge_delta)):
+                walker=self.update(self.tree/name,recursive=True)
+                self.store.finish_volume(self.volume,None,walker.gaps,full=False,lean=True)
+            # Reads only: writing each changed row once is the work itself.
+            statements[name]=sum(1 for statement in seen if statement.lstrip().startswith('SELECT'))
+            self.store.prepare(self.volume,full=False)
+        self.assertLessEqual(statements['large'],statements['small']+20,statements)
+
     def test_repeated_directory_reset_does_not_restore_deleted_staged_files(self):
         (self.tree/'kept').write_bytes(b'kept')
         self.baseline()

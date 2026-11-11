@@ -176,7 +176,9 @@ and `global_growth_complete=false`, including after the final page.
 
 Volume rows include `id,label,observed_ns,full_scan_ns,listed,physical,volume_used,
 not_placed,tolerance,unplaced_shared,capacity,free,available,available_important,purgeable,
-capacity_source,capacity_observed_ns,valid,status,mounted,gaps`. Capacity, free and available
+capacity_source,capacity_observed_ns,valid,status,mounted,gaps,walk`. `walk` is null unless a
+paced full walk is under way: then its `phase`, `entries`, `expected` (the previous walk's
+entries, or null), `started_ns`, `runs` and `cpu_ns`. Capacity, free and available
 come from the collector's newest minute reading when it is newer than the map
 (`capacity_source=live`), otherwise from the map's scan (`map`, with purgeable null).
 Children include `id,parent_id,label,kind,listed,physical,frees,asterisk,status,observed_ns`,
@@ -466,6 +468,8 @@ operator's CLI `scan --full` retries regardless. A successful publication clears
 the level. Reader contention and the free-space margin keep their hourly retry.
 To resume a gated volume, free managed storage down to its level, or run
 `scan --full`, the only resume when no level is stored.
+A paced walk refused for want of managed storage drops its checkpoint: its staged
+rows are what the cap lacks. Other refusals keep it, and the walk resumes.
 The store gains nullable `volumes.budget_retry_bytes` and `dirty.recursive` on
 first open. A release before them inserted `dirty` rows positionally and fails
 on a migrated store; rolling back needs a release that names `dirty`'s columns,
