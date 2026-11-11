@@ -113,7 +113,12 @@ for each extra branch where copies meet. Summed over a subtree, as every other
 total is, the terms count the piece once in every folder holding a copy. A
 second term at the copies' common ancestor gives frees. Extents exist only in
 memory during the run; the map keeps stream keys, groups and byte terms,
-never block addresses.
+never block addresses. The pass reads holders a page at a time and writes only
+between pages: an open statement pins the WAL that every counted write must
+checkpoint first, and on Big Mac that failed the first two full walks at the
+start of sharing. On Big Mac's startup volume (1.55 M folders, 1.06 M holders,
+267 k streams, Nov 10 2026) the whole pass took 127 s of CPU and 215 s, with
+560 k extent reads and a peak of 471 MiB.
 
 An hourly update re-reads the extents of every stream in the groups it
 touches, so a changed copy is measured against the unchanged copies it shares

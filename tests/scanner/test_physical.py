@@ -233,6 +233,28 @@ class SharingUpdateCostTests(unittest.TestCase):
             self.assertEqual(MapQuery(store.path).query('volumes')['rows'][0]['physical'], before)
 
 
+class SharingProgressTests(unittest.TestCase):
+    def test_full_sharing_survives_progress_writes_between_holder_pages(self):
+        # At Big Mac's scale the sharing pass wrote progress while its holders
+        # query was still open; the write's checkpoint then failed with 'database
+        # table is locked' and killed every full walk at the start of sharing.
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
+            store = MapStore(Path(temp) / 'scanner.sqlite', Budget(temp, free_margin_bytes=0))
+            self.addCleanup(store.close)
+            volume = Volume('v', 'Synthetic', '/synthetic', 'apfs', 1, 100 * GB, 50 * GB, 50 * GB, 50 * GB)
+            store.start('requested_full')
+            store.prepare(volume)
+            store.directory(Node('root', None, 'root', 'directory', 0, 0, 'observed', None, 0))
+            for k in range(2500):
+                store.holder(k, 'root', k, BLOCK, None, False)
+            extents = {str(k): [(k * BLOCK, BLOCK)] for k in range(2500)}
+            clock = iter(range(0, 10**9, 10))  # Every progress call is due.
+            with patch('machine_audit.scanner.store.time.monotonic', lambda: next(clock)):
+                result = store.finish_volume(volume, extents.__getitem__, [], full=True, lean=True)
+            self.assertEqual(result['physical'], 2500 * BLOCK)
+
+
 class FormatConversionTests(unittest.TestCase):
     def test_previous_release_store_converts_keeps_history_and_rebuilds_its_map(self):
         # The previous release's schema, captured from it. Its folder figures charged

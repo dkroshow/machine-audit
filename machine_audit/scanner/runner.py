@@ -3,12 +3,14 @@ from __future__ import annotations
 from contextlib import contextmanager
 import errno
 import fcntl
+import gc
 import os
 import stat
 from pathlib import Path
 import sqlite3
 import sys
 import time
+import traceback
 
 from machine_audit.budget import Budget, BudgetExceeded
 from machine_audit.sources.native import Darwin
@@ -164,6 +166,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
         published=0
         blocked=None
         results=[]
+        failed=False
         try:
             store.written_bytes=lambda:native.process(os.getpid()).diskio_byteswritten
             store.process_start=str(native.process(os.getpid()).proc_start_abstime)
@@ -334,7 +337,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
             store.progress(processed,run_status)
             return {'status':run_status if root_failed else 'observed','volumes':results,'entries':processed,**store.run_context}
         except Exception as exc:
-            exception_type=type(exc).__name__
+            exception_type=type(exc).__name__;retry_bytes=getattr(exc,'retry_bytes',None)
             if isinstance(exc,BudgetExceeded):status,reason='budget_blocked',f'budget_blocked_{exc.code}'
             else:
                 if isinstance(exc,sqlite3.Error):status=reason='write_failed'
@@ -342,20 +345,31 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     status='scan_failed'
                     reason=exc.code if isinstance(exc,ScanError) else 'os_error' if isinstance(exc,OSError) else 'invalid_scan_state' if isinstance(exc,ValueError) else 'unexpected_error'
                 reason=f'{reason}_{exception_type}'
-            # Never print exception text: native/file errors can contain paths.
-            # A separate failure to persist the reason is visible in the JSON.
-            recorded=False
-            try:
-                store.record_volumes(results)
-                store.mark_failed(reason,retry_bytes=getattr(exc,'retry_bytes',None))
-            except Exception:
-                pass
-            try:
-                recorded=bool(store.db.execute('SELECT 1 FROM runs WHERE id=? AND status=? AND ended_ns IS NOT NULL',
-                                               (store.run,reason)).fetchone())
-            except Exception:
-                pass
-            return {'status':status,'reason':reason,'exception_type':exception_type,
-                    'failure_recorded':recorded,'entries':store.entries,'volumes':results,**store.run_context}
+            # Never print exception text: native/file errors can contain paths. The
+            # code locations of the failure are this program's own, never user data.
+            at=[f'{Path(frame.filename).stem}:{frame.name}:{frame.lineno}' for frame in traceback.extract_tb(exc.__traceback__)[-8:]]
+            failed=True
+        finally:
+            if not failed:store.close()
+        # The failure is recorded only after its handler ends: until then its
+        # traceback keeps the failing frames, and any statement they left open
+        # holds a read lock that refuses every counted write, even on a new
+        # connection. Frames in reference cycles go with a collection.
+        gc.collect()
+        recorded=False
+        try:
+            store.reopen()
+            store.record_volumes(results)
+            store.mark_failed(reason,retry_bytes=retry_bytes)
+        except Exception:
+            pass
+        try:
+            recorded=bool(store.db.execute('SELECT 1 FROM runs WHERE id=? AND status=? AND ended_ns IS NOT NULL',
+                                           (store.run,reason)).fetchone())
+        except Exception:
+            pass
         finally:
             store.close()
+        # A separate failure to persist the reason is visible in the JSON.
+        return {'status':status,'reason':reason,'exception_type':exception_type,'at':at,
+                'failure_recorded':recorded,'entries':store.entries,'volumes':results,**store.run_context}

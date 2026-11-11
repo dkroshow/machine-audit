@@ -3,7 +3,11 @@ from __future__ import annotations
 from dataclasses import asdict
 import json
 import os
+from pathlib import Path
+import stat
+import sys
 import time
+import traceback
 
 from .budget import Budget
 from .config import Config
@@ -53,9 +57,32 @@ def main(installation: dict, *, check_only=False) -> int:
         # The CLI owns and removes its request; checking access never scans.
         return 0 if observation.status == 'observed' else 1
     from .scanner.runner import run_scan
-    result = run_scan(config.root, full_disk_access=requested, access=observation,
-                      full=bool(config.source_options.get('scanner_full', False)),
-                      grain=config.source_options.get('scanner_grain', 'files'),
-                      exclusions=config.scanner_exclusions)
-    print(json.dumps(result))
+    bound_log()
+    try:
+        result = run_scan(config.root, full_disk_access=requested, access=observation,
+                          full=bool(config.source_options.get('scanner_full', False)),
+                          grain=config.source_options.get('scanner_grain', 'files'),
+                          exclusions=config.scanner_exclusions)
+    except BaseException as exc:
+        if isinstance(exc, SystemExit):
+            raise
+        # A failure the runner did not record: its type and this program's own code
+        # locations, never its text, which can hold paths.
+        frames = traceback.extract_tb(exc.__traceback__)[-8:]
+        print(json.dumps({'status': 'scanner_crashed', 'exception_type': type(exc).__name__,
+                          'at': [f'{Path(f.filename).stem}:{f.name}:{f.lineno}' for f in frames]}), file=sys.stderr, flush=True)
+        return 3
+    print(json.dumps(result), flush=True)
     return 0 if result['status'] == 'observed' else 1
+
+
+def bound_log(limit=1024**2):
+    """launchd appends the scanner's output to one file in the data directory and
+    never trims it. Past `limit` it starts again; one run's lines are a few kB."""
+    for fd in (1, 2):
+        try:
+            info = os.fstat(fd)
+            if stat.S_ISREG(info.st_mode) and info.st_size > limit:
+                os.ftruncate(fd, 0)
+        except OSError:
+            pass

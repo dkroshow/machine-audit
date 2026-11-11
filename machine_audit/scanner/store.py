@@ -149,16 +149,11 @@ class MapStore:
             # Release this startup reservation before taking sqlite_write's lock.
             with self.budget.reserve(256*1024):
                 self.db=sqlite3.connect(self.path,isolation_level=None,timeout=5)
-                self.db.row_factory=sqlite3.Row
                 existing=self.db.execute("SELECT 1 FROM sqlite_master WHERE name='volumes'").fetchone()
                 if existing and self.db.execute('PRAGMA user_version').fetchone()[0] not in OPENS:
                     raise ValueError('scanner_format_requires_fresh_store')
                 os.chmod(self.path,0o600)
-                self.db.execute('PRAGMA journal_mode=WAL')
-                self.db.execute('PRAGMA temp_store=MEMORY')
-                self.db.execute('PRAGMA busy_timeout=5000')
-                self.db.create_function('source_id',1,source_id,deterministic=True)
-                self.db.create_function('inode_key',1,inode_key,deterministic=True)
+                self._configure()
             objects={r[0] for r in self.db.execute('SELECT name FROM sqlite_master')}
             missing=[(kind,name,table) for kind,name,table in re.findall(
                 r'CREATE (TABLE|INDEX) IF NOT EXISTS (\w+)(?: ON (\w+))?',SCHEMA) if name not in objects]
@@ -201,6 +196,21 @@ class MapStore:
         self.generation=self.volume=self.vid=self.base_gen=self.run=None
         self.changed=set();self.last_progress=0.0;self.entries=0
         self.run_context=dict(volume_id=None,action=None,trigger=None,stage=None)
+
+    def _configure(self):
+        self.db.row_factory=sqlite3.Row
+        self.db.execute('PRAGMA journal_mode=WAL')
+        self.db.execute('PRAGMA temp_store=MEMORY')
+        self.db.execute('PRAGMA busy_timeout=5000')
+        self.db.create_function('source_id',1,source_id,deterministic=True)
+        self.db.create_function('inode_key',1,inode_key,deterministic=True)
+
+    def reopen(self):
+        """A fresh connection for recording a failure. The failure can leave a
+        statement open, which pins the WAL every counted write checkpoints first."""
+        self.db.close()
+        self.db=sqlite3.connect(self.path,isolation_level=None,timeout=5)
+        self._configure()
 
     def _physical_format(self):
         """Format 3 to 4, in one transaction. The old folder figures charged shared
@@ -532,9 +542,7 @@ class MapStore:
         Returns (folders whose totals an update changes, gap codes)."""
         gaps=set();known={};old_groups=set()
         if full:
-            rows=self.db.execute('''SELECT stream,dir,file_id,allocated,private FROM holders INDEXED BY holder_stream
-                WHERE generation=? AND volume=? ORDER BY stream''',(self.generation,self.vid))
-            by_stream=((stream,list(found)) for stream,found in groupby(rows,key=lambda row:row[0]))
+            by_stream=((stream,list(found)) for stream,found in groupby(self._holder_pages(),key=lambda row:row[0]))
         else:
             touched={r[0] for r in self.db.execute('''SELECT stream FROM holders WHERE generation=? AND volume=? AND dir IN
                  (SELECT id FROM reset_dirs WHERE generation=? AND volume=? UNION SELECT id FROM removed WHERE generation=? AND volume=?)''',
@@ -562,9 +570,14 @@ class MapStore:
                 streams[stream]=(tuple(dict.fromkeys(row[1] for row in found)),found[0][4],len(files)==1)
                 ranges=None
                 if reader:
+                    # A file deleted or replaced since the walk, or an extent the system
+                    # reports oddly, costs that stream its sharing, never the run.
                     for file_id in files:
-                        try:ranges=reader(source_id(file_id));break
-                        except OSError:continue
+                        try:
+                            found_ranges=reader(source_id(file_id))
+                            if any(start<0 or length<=0 for start,length in found_ranges):raise ValueError('invalid_extent')
+                            ranges=found_ranges;break
+                        except (OSError,ValueError):continue
                     else:gaps.add('extents_unreadable')
                 if count%1000==0:self.progress()
                 yield stream,max(row[3] for row in found),ranges
@@ -634,6 +647,20 @@ class MapStore:
                             (self.generation,self.vid,stream,key,unplaced.get(stream,0)))
         self.flush()
         return affected,gaps
+
+    def _holder_pages(self,size=20_000):
+        """The staged holders in stream order, a page at a time. Each page is read in
+        full before the caller writes anything: an open statement pins the WAL that
+        every counted write must first checkpoint, and that write then fails."""
+        after=()
+        while True:
+            seek=' AND (stream,dir,file_id)>(?,?,?)' if after else ''
+            page=self.db.execute(f'''SELECT stream,dir,file_id,allocated,private FROM holders INDEXED BY holder_stream
+                WHERE generation=? AND volume=?{seek} ORDER BY stream,dir,file_id LIMIT ?''',
+                (self.generation,self.vid,*after,size)).fetchall()
+            yield from page
+            if len(page)<size:return
+            after=tuple(page[-1])[:3]
 
     def _parents(self,folders):
         """Each folder's parent, and its ancestors' parents, in the map being built.

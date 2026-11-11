@@ -37,11 +37,20 @@ class InstallationTests(unittest.TestCase):
         # Big Mac's job had no ExitTimeOut: launchd sent SIGKILL 5 s after SIGTERM,
         # before the stopping collector had saved, and unsaved readings were lost.
         candidate = {'release': '/synthetic/release', 'python': '/synthetic/python3.12',
-                     'config': '/synthetic/config.json', 'scanner': '/synthetic/scanner'}
+                     'config': '/synthetic/config.json', 'scanner': '/synthetic/scanner', 'data': '/synthetic/data'}
         job = plistlib.loads(plistlib.dumps(job_plists(candidate)[COLLECTOR]))
         close_deadline = inspect.signature(Collector.close).parameters['timeout_s'].default
         self.assertEqual(job.get('ExitTimeOut'), 60)
         self.assertGreater(job['ExitTimeOut'], close_deadline)
+
+    def test_scanner_job_keeps_its_output_in_the_data_directory(self):
+        # Big Mac's first physical walks failed twice with exit code 1 and no output
+        # anywhere: the scanner job had no StandardOutPath or StandardErrorPath.
+        candidate = {'release': '/synthetic/release', 'python': '/synthetic/python3.12',
+                     'config': '/synthetic/config.json', 'scanner': '/synthetic/scanner', 'data': '/synthetic/data'}
+        job = plistlib.loads(plistlib.dumps(job_plists(candidate)[SCANNER]))
+        self.assertEqual((job.get('StandardOutPath'), job.get('StandardErrorPath')),
+                         ('/synthetic/data/scanner.log', '/synthetic/data/scanner.log'))
 
     def test_permission_check_never_becomes_a_scan_when_request_expires(self):
         """A delayed one-shot check must not fall through into a full disk walk."""

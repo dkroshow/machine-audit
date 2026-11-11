@@ -461,6 +461,20 @@ class RootPublicationTests(unittest.TestCase):
         self.assertEqual(row, expected)
         self.assertNotIn('absent synthetic identity', repr(result))
 
+    def test_a_failure_that_leaves_a_statement_open_is_still_recorded(self):
+        # Big Mac's first physical walks died in sharing with the run left 'running':
+        # the failure's open statement pinned the WAL, so recording it failed too.
+        def pinned_failure(store, *args):
+            pinned = store.db.execute('SELECT * FROM nodes')
+            next(pinned)
+            raise RuntimeError('synthetic failure')
+        with patch.object(MapStore, '_sharing', pinned_failure), \
+             patch('machine_audit.scanner.runner.time.time_ns', return_value=86500*10**9):
+            result, status = self.scan([self.volume])
+        self.assertEqual((status, result['failure_recorded'], result['stage']), ('unexpected_error_RuntimeError', True, 'sharing'))
+        self.assertIn('test_open:pinned_failure', ' '.join(result['at']))
+        self.assertNotIn('synthetic failure', repr(result))
+
     def test_failed_volume_retries_requested_full_before_successful_map_cooldown(self):
         with sqlite3.connect(self.data/'scanner.sqlite') as db:
             db.execute("UPDATE volumes SET status='invalid_scan_state'")

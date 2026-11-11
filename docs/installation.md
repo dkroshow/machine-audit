@@ -51,6 +51,11 @@ The collector job sets `ExitTimeOut` to 60 s; launchd's own wait before SIGKILL
 was 5 s on Big Mac and cut a stop short. This reduces that early-kill risk but is
 not a no-loss guarantee: a periodic save already running at the stop has no
 deadline. A job loaded from an older definition keeps its old wait until reloaded.
+The scanner job writes its output to `scanner.log` in the data directory. Each run
+prints one line of codes: its result, or for a failure its exception type and this
+program's own code locations, never error text or paths. A run starts the log again
+once it passes 1 MiB, and it counts inside the shared storage cap. A job loaded from
+an older definition has no log until its definition is replaced and reloaded.
 
 Setup records the GPU reader choice; starting jobs never changes it. Doctor shows
 when a saved choice needs a restart. Scheduled scans preserve the last explicit

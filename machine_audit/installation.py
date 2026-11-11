@@ -83,7 +83,7 @@ def plan(config: Config) -> dict:
     return {'schema_version': 1, 'source': str(source), 'revision': revision,
             'release': str(root / 'releases' / revision), 'root': str(root),
             'python': str(Path(sys.executable).resolve()), 'python_home': sys.base_prefix,
-            'config': str(config.path), 'scanner': str(scanner_executable(root)),
+            'config': str(config.path), 'data': str(config.root), 'scanner': str(scanner_executable(root)),
             'cli': str(Path.home() / '.local' / 'bin' / 'machine-audit'),
             'jobs': [COLLECTOR, SCANNER], 'starts_services': False,
             'permission_status': 'unchecked', 'helper': 'not_installed',
@@ -146,6 +146,9 @@ def _snapshot(candidate: dict) -> None:
                 _write(destination, files.extractfile(member).read())
 
 
+SCANNER_LOG = 'scanner.log'
+
+
 def job_plists(candidate: dict) -> dict[str, dict]:
     bootstrap = str(Path(candidate['release']) / 'machine_audit' / 'bootstrap.py')
     return {
@@ -153,9 +156,12 @@ def job_plists(candidate: dict) -> dict[str, dict]:
                     'ProgramArguments': [candidate['python'], '-I', bootstrap, '--config', candidate['config'], 'run'],
                     'RunAtLoad': True, 'KeepAlive': True, 'Disabled': True,
                     'ThrottleInterval': 30, 'ExitTimeOut': COLLECTOR_EXIT_GRACE_S, 'Umask': 0o077},
+        # The scanner prints one code-only line a run; its entry keeps the log under 1 MiB.
         SCANNER: {'Label': SCANNER, 'ProgramArguments': [candidate['scanner']],
                   'StartInterval': 3600, 'ProcessType': 'Background', 'LowPriorityIO': True,
-                  'Disabled': True, 'Nice': 10, 'Umask': 0o077},
+                  'Disabled': True, 'Nice': 10, 'Umask': 0o077,
+                  'StandardOutPath': str(Path(candidate['data']) / SCANNER_LOG),
+                  'StandardErrorPath': str(Path(candidate['data']) / SCANNER_LOG)},
     }
 
 
