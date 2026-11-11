@@ -228,6 +228,77 @@ class RelistTests(unittest.TestCase):
         self.assertTrue(valid,'an update with deferred folders marked the map invalid')
         self.assertIn('reconciliation_deferred',gaps)
 
+    def fresh_physical(self):
+        """Physical space of the volume root from a fresh full walk of the same tree."""
+        data=Path(tempfile.mkdtemp(dir=self.root))
+        store=MapStore(data/'scanner.sqlite',Budget(data,limit_bytes=256*1024**2,free_margin_bytes=0))
+        store.prepare(self.volume);walker=Walker(self.volume,self.policy,store);walker.walk()
+        store.finish_volume(self.volume,None,walker.gaps,full=True,lean=True)
+        try:return store.db.execute('SELECT physical FROM nodes WHERE generation=? AND parent IS NULL',(store.generation,)).fetchone()[0]
+        finally:store.close()
+
+    def published_physical(self):
+        return self.store.db.execute('''SELECT n.physical FROM volumes v JOIN nodes n ON n.generation=v.generation AND n.volume=v.key
+            AND n.parent IS NULL WHERE v.id='v' ''').fetchone()[0]
+
+    def test_a_file_hard_linked_after_its_folder_was_listed_counts_once(self):
+        # Big Mac's 1 TB volume, Nov 11: 133 files gained a second link in a re-listed
+        # folder while the folder of the first link kept counting them as plain files;
+        # 10 GB counted twice, growing each hour, and the map went invalid.
+        first=self.tree/'first';second=self.tree/'second';first.mkdir();second.mkdir()
+        (first/'linked').write_bytes(b'z'*256*1024)
+        self.baseline()
+        os.link(first/'linked',second/'linked')
+        self.reconciled(10*GB,second)  # Only the new link's folder has an event.
+        self.assertEqual(self.published_physical(),self.fresh_physical())
+
+    def test_an_update_repairs_a_map_that_counted_a_hard_link_twice(self):
+        # The map an earlier release left: the old link's folder still counts the file.
+        first=self.tree/'first';second=self.tree/'second';first.mkdir();second.mkdir()
+        (first/'linked').write_bytes(b'z'*256*1024)
+        self.baseline()
+        os.link(first/'linked',second/'linked')
+        with patch.object(MapStore,'plain_links',return_value=[]):
+            self.assertFalse(self.reconciled(-2*GB,second)[0])
+        self.assertGreater(self.published_physical(),self.fresh_physical())
+        # The next update of an invalid map checks every hard link and re-lists the
+        # folder that counts it as a plain file; the map reconciles again.
+        (second/'other').write_bytes(b'o')
+        valid,_=self.reconciled(10*GB,second)
+        self.assertTrue(valid)
+        self.assertEqual(self.published_physical(),self.fresh_physical())
+
+    def test_moves_and_dropped_deferrals_leave_no_rows_behind(self):
+        # The checker's other suspects for the over-count: a re-list that replaces rows,
+        # and a stale deferral dropped for a folder gone from the map.
+        source=self.tree/'source';target=self.tree/'target';gone=self.tree/'gone'
+        for folder in (source,target,gone):folder.mkdir()
+        (source/'moved').write_bytes(b'm'*8192);(gone/'f').write_bytes(b'g')
+        self.baseline()
+        self.store.defer(str(gone.stat().st_ino),0,False)
+        (source/'moved').rename(target/'moved')
+        (gone/'f').unlink();gone.rmdir()  # Disposable synthetic files.
+        walker=Walker(self.volume,self.policy,self.store)
+        relist(self.store,walker,self.policy,self.volume,0,[(str(source),False),(str(target),False),(str(self.tree),False)])
+        self.store.finish_volume(self.volume,None,walker.gaps,full=False,lean=True)
+        rows=self.store.db.execute("SELECT label FROM files WHERE generation=? ORDER BY label",(self.store.generation,)).fetchall()
+        self.assertEqual([r[0] for r in rows],['moved'])
+        self.assertEqual(self.published_physical(),self.fresh_physical())
+        # The next update drops the deferral of the folder now gone from the map.
+        self.store.prepare(self.volume,full=False);self.update(self.tree/'target')
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM dirty').fetchone()[0],0)
+
+    def test_a_folder_deferred_every_hour_does_not_keep_a_map_invalid(self):
+        # Big Mac's 13.7 TB volume, Nov 11: a large folder deferred every hour kept its
+        # old invalid verdict though the listing was 1.84 GB under used space.
+        (self.tree/'changed').mkdir();(self.tree/'large').mkdir()
+        self.baseline()
+        self.assertFalse(self.reconciled(-2*GB,self.tree/'changed')[0])
+        self.store.defer(str((self.tree/'large').stat().st_ino),10**18,False)
+        valid,gaps=self.reconciled(10*GB,self.tree/'changed')
+        self.assertTrue(valid,'a standing deferral kept a map that reconciles invalid')
+        self.assertNotIn('reconciliation_deferred',gaps)
+
     def test_a_denied_folders_hourly_retry_does_not_hold_the_judgment_back(self):
         # Big Mac's startup volume keeps denied folders queued for an hourly retry: had
         # they counted, its updates would never be judged until a full walk.

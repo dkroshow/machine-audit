@@ -178,21 +178,23 @@ def reconcile(volume_used, physical, *, supported=True, complete=True, previousl
     used space by up to max(1 GB, the change in used space during the walk); beyond
     that the folder figures are withheld, never rescaled.
 
-    An update that left folders deferred is not judged: data moved from a deferred
-    folder into a re-listed one counts twice until the deferred one is re-listed. The
-    map keeps its last verdict meanwhile. An update with nothing deferred judges again,
-    so it can also clear an earlier invalid verdict."""
+    Deferred folders can hold back only an over-count. Data moved from a deferred
+    folder into a re-listed one counts twice until the deferred folder is re-listed,
+    so an update that left folders deferred and exceeds the tolerance is not judged:
+    the map keeps its last verdict (`deferred` in the result). Within the tolerance
+    it is judged as any update, so a folder deferred every hour (one too large to
+    re-list more than daily) cannot keep a map invalid, and nothing deferred can make
+    one invalid. An invalid map is judged again by every update."""
     tolerance = max(GB, abs(used_change or 0))
     if not supported:
         return {'valid': False, 'physical': None, 'not_placed': None, 'tolerance': None, 'status': 'unavailable'}
     if volume_used is None or physical is None or physical < 0:
         return {'valid': False, 'physical': None, 'not_placed': None, 'tolerance': tolerance, 'status': 'invalid'}
-    if deferred and not full:
-        if previously_invalid:
-            return {'valid': False, 'physical': None, 'not_placed': None, 'tolerance': tolerance, 'status': 'invalid'}
-        return {'valid': True, 'physical': physical, 'not_placed': volume_used - physical, 'tolerance': tolerance,
-                'status': 'partial'}
     if physical > volume_used + tolerance:
-        return {'valid': False, 'physical': None, 'not_placed': None, 'tolerance': tolerance, 'status': 'invalid'}
+        if deferred and not full and not previously_invalid:
+            return {'valid': True, 'physical': physical, 'not_placed': volume_used - physical, 'tolerance': tolerance,
+                    'status': 'partial', 'deferred': True}
+        return {'valid': False, 'physical': None, 'not_placed': None, 'tolerance': tolerance, 'status': 'invalid',
+                'deferred': bool(deferred and not full)}
     return {'valid': True, 'physical': physical, 'not_placed': volume_used - physical, 'tolerance': tolerance,
             'status': 'observed' if complete else 'partial'}

@@ -532,6 +532,32 @@ class MapStore:
             due_ns=min(due_ns,excluded.due_ns),recursive=max(coalesce(recursive,1),excluded.recursive)''',
             (self.volume,identity,due_ns,int(recursive)))
 
+    def plain_links(self):
+        """Folders of the published map that hold a hard-linked file as a plain file,
+        not yet re-listed by this update: listed before the file gained its other link.
+        Hard links are holders whose stream is their own inode with no APFS private
+        size. Only the links this update staged that are new to the map; all of them
+        when the published map is invalid, which repairs a map an earlier release left
+        counting a link twice. The map has no index of files by inode, so this reads
+        the volume's file rows once per 500 links, only when there are any."""
+        self.flush()
+        if not self.db.execute('SELECT valid FROM volumes WHERE id=?',(self.volume,)).fetchone()[0]:
+            links=[r[0] for r in self.db.execute('''SELECT DISTINCT file_id FROM holders WHERE generation IN (?,?) AND volume=?
+                AND stream=file_id AND private IS NULL''',(self.base_gen,self.generation,self.vid))]
+        else:
+            links=[r[0] for r in self.db.execute('''SELECT DISTINCT h.file_id FROM holders h WHERE h.generation=? AND h.volume=?
+                AND h.stream=h.file_id AND h.private IS NULL AND NOT EXISTS(SELECT 1 FROM holders b INDEXED BY holder_file
+                WHERE b.generation=? AND b.volume=? AND b.file_id=h.file_id)''',(self.generation,self.vid,self.base_gen,self.vid))]
+        folders=set()
+        for first in range(0,len(links),500):
+            part=links[first:first+500];marks=','.join('?'*len(part))
+            folders.update(r[0] for r in self.db.execute(f'''SELECT DISTINCT f.parent FROM files f WHERE f.generation=? AND f.volume=?
+                AND f.id IN ({marks})
+                AND NOT EXISTS(SELECT 1 FROM holders h WHERE h.generation IN (?,?) AND h.volume=f.volume AND h.dir=f.parent AND h.file_id=f.id)
+                AND NOT EXISTS(SELECT 1 FROM reset_dirs r WHERE r.generation=? AND r.volume=f.volume AND r.id=f.parent)''',
+                (self.base_gen,self.vid,*part,self.base_gen,self.generation,self.generation)))
+        return [found for folder in sorted(folders,key=str) if (found:=self.known_directory(source_id(folder))) is not None]
+
     def forget_deferred(self,identities):
         """Drop deferred refreshes of folders no longer in the map: nothing can re-list
         them, and the listing that removed them already covers their changes."""
@@ -997,7 +1023,7 @@ class MapStore:
             result=reconcile(volume.used,total,supported=volume.fs in ('apfs','hfs'),complete=complete,
                              previously_invalid=bool(old['generation'] and not old['valid']),full=full,used_change=used_change,
                              deferred=deferred)
-            if deferred:gaps.add('reconciliation_deferred')
+            if result.get('deferred'):gaps.add('reconciliation_deferred')
         else:
             # No extents provider (Linux): each inode counts once per folder; no residual is claimed.
             result={'valid':True,'physical':total,'not_placed':None,'tolerance':None,'status':'observed' if complete else 'partial'}

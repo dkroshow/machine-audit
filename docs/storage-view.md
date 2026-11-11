@@ -156,14 +156,23 @@ file-system records and areas the scanner cannot read. Folders may exceed used
 space by up to the larger of 1 GB and the change in used space during the walk
 (for a paced walk, every move of used space while it ran), because files change
 while the walk runs; beyond that the folder figures are withheld, never
-rescaled, until an update with nothing deferred reconciles again or the next
-full scan. An hourly update that left folders deferred is not judged
-(`reconciliation_deferred`): data moved from a deferred folder into a re-listed
-one counts twice until the deferred folder is re-listed, so the map keeps its
-last verdict meanwhile. Folders the map holds as denied do not count: they have
-no measured size, and they are still retried hourly. If the folders then exceed
-used space, the tab shows "not placed" as pending ("folders exceed used space by
-X until N deferred folders are re-listed"), never a negative figure. Rows on one page can add to more
+rescaled, until an update reconciles again or the next full scan. Deferred
+folders can hold back only an over-count: data moved from a deferred folder
+into a re-listed one counts twice until the deferred folder is re-listed, so an
+update that left folders deferred and exceeds the tolerance is not judged
+(`reconciliation_deferred`) and the map keeps its last verdict. Within the
+tolerance it is judged, so a large folder deferred every hour cannot keep a map
+invalid. Folders the map holds as denied do not count as deferred: they have no
+measured size, and they are still retried hourly. While the verdict waits, the
+tab shows "not placed" as pending ("folders exceed used space by X until N
+deferred folders are re-listed"), never a negative figure.
+
+A file hard-linked after a folder holding it was listed is a plain file in that
+folder and a holder in the re-listed one, so an update also re-lists the folders
+that still hold a newly linked file as a plain file; every link is then a holder
+and the file counts once. When the published map is invalid, the update checks
+every hard link this way, which repairs a map an earlier release left counting
+links twice. Rows on one page can add to more
 than their folder when they share blocks with each other; the page states that
 amount ("shared between the rows") when it is at least 1 GB, so rows, that
 line and not placed add up. On Ubuntu used and listed are shown side by side

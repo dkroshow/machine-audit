@@ -152,6 +152,18 @@ def relist(store,walker,policy,volume,now,changes,pace=None):
             continue
         if recursive:store.clear_subtree(previous['id'])
         if not walker.walk(path,live_parent(store,walker,volume,path,previous['parent']),previous['kind']=='private',recursive=recursive):complete=False
+    # A file hard-linked since a folder holding it was listed is a plain file there and
+    # a holder in the re-listed folder, so its bytes would count twice. Re-list the
+    # folders that still hold it as a plain file: every link is then a holder and the
+    # file counts once.
+    for previous in store.plain_links():
+        path=previous['path'] or walker.path_of(previous['id'])
+        if not path or path in chosen:continue
+        if pace is not None and pace.exhausted():
+            store.defer(previous['id'],now,False);walker.gaps.add('update_deferred');continue
+        if walker.directory_identity(path) is None:
+            store.defer(previous['id'],now+3600*10**9,False);continue
+        if not walker.walk(path,live_parent(store,walker,volume,path,previous['parent']),previous['kind']=='private',recursive=False):complete=False
     return complete
 
 
