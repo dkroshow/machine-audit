@@ -142,7 +142,7 @@ class MergePending(RuntimeError):
     """The update is published, but merging its delta into the base did not finish.
     The delta stays published; the next run merges it before any scan."""
     def __init__(self,cause):
-        code=(f'blocked_{cause.code}' if isinstance(cause,BudgetExceeded) else
+        code=(cause if isinstance(cause,str) else f'blocked_{cause.code}' if isinstance(cause,BudgetExceeded) else
               getattr(cause,'sqlite_errorname','sqlite_error').lower() if isinstance(cause,sqlite3.Error) else type(cause).__name__)
         super().__init__(code);self.code=code
 
@@ -517,6 +517,12 @@ class MapStore:
         with self.write(rows=1):self.db.execute('''INSERT INTO dirty VALUES(?,?,?,?) ON CONFLICT(volume,id) DO UPDATE SET
             due_ns=min(due_ns,excluded.due_ns),recursive=max(coalesce(recursive,1),excluded.recursive)''',
             (self.volume,identity,due_ns,int(recursive)))
+
+    def forget_deferred(self,identities):
+        """Drop deferred refreshes of folders no longer in the map: nothing can re-list
+        them, and the listing that removed them already covers their changes."""
+        with self.write(rows=len(identities)):
+            self.db.executemany('DELETE FROM dirty WHERE volume=? AND id=?',((self.volume,identity) for identity in identities))
 
     def directory(self,node):
         identity=inode_key(node.id)
@@ -946,10 +952,11 @@ class MapStore:
         return self._sharing(reader,True)[1]
 
     def finish_volume(self,volume,reader,gaps,*,full,lean,bookmark=None,event_uuid=None,complete=True,physical=True,
-                      event_progress=None,used_before=None,shared=False):
+                      event_progress=None,used_before=None,shared=False,stop=None):
         """Place shared blocks, total every folder and publish. `volume` is read after the
         walk; `used_before` is its used space before it, for the reconciliation's tolerance.
-        `shared`: a paced walk's earlier piece already placed the shared blocks."""
+        `shared`: a paced walk's earlier piece already placed the shared blocks. `stop`
+        ends an update's merge early (see merge_delta)."""
         self.flush();old=self.db.execute('SELECT * FROM volumes WHERE id=?',(self.volume,)).fetchone()
         if shared:affected,sharing_gaps=set(),set()
         else:
@@ -1036,7 +1043,8 @@ class MapStore:
             exc.publication=dict(receipt,shortfall_bytes=exc.shortfall_bytes);raise
         self.generation=published;self.base_gen=None;self.walk=None
         if delta is not None:
-            try:self.merge_delta(self.volume)
+            try:self.merge_delta(self.volume,stop)
+            except MergePending:raise
             except Exception as exc:raise MergePending(exc) from exc
         return result
 
@@ -1045,28 +1053,30 @@ class MapStore:
         return self.db.execute(f'''SELECT * FROM nodes n WHERE n.generation IN (:g,:d) AND n.volume=:v AND n.id=:id
             AND {published('nodes','n',':g',':v',':d')}''',dict(g=base,d=delta,v=self.vid,id=key)).fetchone()
 
-    def finish_merges(self):
+    def finish_merges(self,stop=None):
         """Merge every published delta, before any scan this run. Returns, by volume id,
         a MergePending for each delta still pending."""
         pending={}
         for volume_id, in self.db.execute('SELECT id FROM volumes WHERE delta_generation IS NOT NULL').fetchall():
-            try:self.merge_delta(volume_id)
-            except Exception as exc:pending[volume_id]=MergePending(exc)
+            try:self.merge_delta(volume_id,stop)
+            except Exception as exc:pending[volume_id]=exc if isinstance(exc,MergePending) else MergePending(exc)
         return pending
 
-    def merge_delta(self,volume_id):
+    def merge_delta(self,volume_id,stop=None):
         """Apply a volume's published delta to its base in bounded batches, then clear it.
 
         The delta still overlays every row a batch writes, so each committed batch leaves
         the published map as it was. The work is the base rows the delta replaces or hides,
-        plus the delta itself. A refusal or crash keeps the delta; merging again resumes."""
+        plus the delta itself. A refusal or crash keeps the delta; merging again resumes.
+        `stop`, asked before each batch, ends the merge when the run's allowance is spent
+        (MergePending 'allowance_spent'): the next run resumes it before scanning."""
         row=self.db.execute('SELECT key,generation,delta_generation FROM volumes WHERE id=?',(volume_id,)).fetchone()
         if row is None or row['delta_generation'] is None:return
         self.phase('merge')
         names=dict(g=row['generation'],v=row['key'],d=row['delta_generation'])
         for table in MAP_TABLES:
-            self._merge_removals(table,names)
-            self._merge_rows(table,names)
+            self._merge_removals(table,names,stop)
+            self._merge_rows(table,names,stop)
         with self.write(rows=2):
             self.db.execute('UPDATE volumes SET delta_generation=NULL WHERE key=?',(names['v'],))
             # The merged delta is only staging now, pruned like any other.
@@ -1084,36 +1094,40 @@ class MapStore:
             if len(batch)==MERGE_ROWS:yield batch;batch=[]
         if batch:yield batch
 
-    def _merge_removals(self,table,names):
+    def _merge_removals(self,table,names,stop=None):
         """Delete base rows the delta removes, or re-lists without a replacement. Each
-        marker table is joined to the base rows it hides, a page at a time by key, so a
-        marker that hides more than one page keeps its place and a re-listed subtree
-        costs one query a page, not one a folder."""
-        primary=PRIMARY[table]
+        marker table is read in order and joined to the base rows it hides, a page at a
+        time, so a marker that hides more than one page keeps its place and a re-listed
+        subtree costs one query a page, not one a folder. The markers drive the join
+        (CROSS JOIN fixes the order): driven by the base's key order, SQLite read the
+        whole base table to find a small delta's rows."""
+        primary=PRIMARY[table];key,within=primary[0],primary[1:]
         markers=[m for m in (REMOVED[table],RESET.get(table)) if m]
-        keys=','.join('b.'+c for c in primary)
+        keys=','.join(['m.id']+['b.'+c for c in within])
         replaced=' AND '.join(f'r.{c}=b.{c}' for c in primary)
+        after=f"({','.join('b.'+c for c in within)})>({','.join(':s'+str(i) for i in range(len(within)))})" if within else '0'
         def doomed():
             for marker in markers:
                 last=None
                 while True:
-                    seek=f" AND ({keys})>({','.join(':s'+str(i) for i in range(len(primary)))})" if last else ''
+                    seek=f' AND m.id>=:k AND (m.id>:k OR {after})' if last else ''
                     # A delta row with this key replaces the base row instead.
                     rows=self.db.execute(f'''SELECT {keys},{self._payload(table,'b')} FROM {marker} m
-                        JOIN {table} b ON b.generation=:g AND b.volume=:v AND b.{primary[0]}=m.id
+                        CROSS JOIN {table} b ON b.generation=:g AND b.volume=:v AND b.{key}=m.id
                         WHERE m.generation=:d AND m.volume=:v{seek}
                         AND NOT EXISTS(SELECT 1 FROM {table} r WHERE r.generation=:d AND r.volume=:v AND {replaced}
                             AND {published(table,'r',':g',':v',':d')})
-                        ORDER BY {keys} LIMIT :n''',dict(names,n=MERGE_ROWS,**{f's{i}':v for i,v in enumerate(last or ())})).fetchall()
+                        ORDER BY {keys} LIMIT :n''',dict(names,n=MERGE_ROWS,**({'k':last[0],**{f's{i}':v for i,v in enumerate(last[1:])}} if last else {}))).fetchall()
                     yield from rows
                     if len(rows)<MERGE_ROWS:break
                     last=tuple(rows[-1])[:len(primary)]
         for batch in self._chunks(doomed()):
+            if stop is not None and stop():raise MergePending('allowance_spent')
             with self.write(rows=len(batch),payload_bytes=sum(r[-1] for r in batch)):
                 self.db.executemany(f'DELETE FROM {table} WHERE generation=? AND volume=? AND {" AND ".join(c+"=?" for c in primary)}',
                                     ((names['g'],names['v'],*tuple(r)[:-1]) for r in batch))
 
-    def _merge_rows(self,table,names):
+    def _merge_rows(self,table,names,stop=None):
         """Write the delta rows that differ into the base, one insert-or-update each,
         walking the delta by primary key."""
         columns=[r['name'] for r in self.db.execute(f'PRAGMA table_info({table})')]
@@ -1130,6 +1144,7 @@ class MapStore:
                 AND NOT EXISTS(SELECT 1 FROM {table} o WHERE o.generation=:g AND {same})
                 ORDER BY {keys} LIMIT :n''',dict(names,n=MERGE_ROWS,**{f's{i}':v for i,v in enumerate(last or ())})).fetchall()
             if not found:return
+            if stop is not None and stop():raise MergePending('allowance_spent')
             with self.write(rows=len(found),payload_bytes=sum(r[-1] for r in found)):
                 self.db.executemany(f'''INSERT INTO {table} SELECT ?,{",".join(columns[1:])} FROM {table}
                     WHERE generation=? AND volume=? AND {" AND ".join(c+"=?" for c in primary)}

@@ -73,14 +73,19 @@ def relist(store,walker,policy,volume,now,changes,pace=None):
     roots_to_update={}
     recursive_roots=set()
     due_paths={}
-    for due,recursive in store.db.execute('SELECT id,recursive FROM dirty WHERE volume=? AND due_ns<=?',(volume.id,now)).fetchall():
+    due_at={};gone=[]
+    for due,recursive,due_ns in store.db.execute('SELECT id,recursive,due_ns FROM dirty WHERE volume=? AND due_ns<=?',(volume.id,now)).fetchall():
         saved=store.known_directory(due)
+        if saved is None:
+            # No longer in the map: removed with its parent's listing, which covers it.
+            gone.append(due);continue
         # A name-withheld folder has no stored path; its inode finds it, in memory.
         path=saved and (saved['path'] or walker.path_of(due))
         if path:
             roots_to_update[path]=saved
-            due_paths[saved['id']]=path
+            due_paths[saved['id']]=path;due_at[path]=due_ns
             if recursive is None or recursive:recursive_roots.add(path)
+    if gone:store.forget_deferred(gone)
     for path,recursive in changes:
         if os.path.commonpath([path,volume.mount])!=volume.mount:
             continue
@@ -108,7 +113,10 @@ def relist(store,walker,policy,volume,now,changes,pace=None):
             roots_to_update[path]=found
             if recursive:recursive_roots.add(path)
     # The deepest event under an already selected ancestor needs no second walk.
-    paths=sorted(roots_to_update,key=len)
+    # Deferred folders first, oldest first, so a backlog drains even when each run's
+    # allowance covers little more than the new changes; then by depth, so an
+    # ancestor covers its subtree.
+    paths=sorted(roots_to_update,key=lambda path:(path not in due_at,due_at.get(path,0),len(path)))
     chosen=[]
     complete=True
     for path in paths:
@@ -263,7 +271,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
             store.process_start=str(native.process(os.getpid()).proc_start_abstime)
             store.start('requested_full' if full else 'scheduled')
             # A published delta is merged before any scan, so nothing stages over it.
-            pending=store.finish_merges()
+            pending=store.finish_merges(pace.exhausted)
             store.phase('discover')
             volumes=list(fs.volumes())
             if roots:
@@ -276,7 +284,8 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
             for volume in volumes:
                 if volume.id in pending:
                     # Its update is published; it is not scanned until its delta merges.
-                    root_failed=True;published+=1  # its map stands, the run is partial
+                    # Its map stands. A merge the allowance paused is not a failure.
+                    published+=1;root_failed|=pending[volume.id].code!='allowance_spent'
                     store.phase('complete',volume_id=volume.id,action='wait',trigger='merge_pending')
                     status=store.db.execute('SELECT status FROM volumes WHERE id=?',(volume.id,)).fetchone()[0]
                     results.append({'volume_id':volume.id,'status':status,'action':'wait','trigger':'merge_pending',
@@ -399,7 +408,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     reader=(lambda inode,device=volume.device:fs.extents(device,int(inode))) if volume.fs=='apfs' else None
                     store.finish_volume(after,reader,walker.gaps,full=False,lean=not full_disk_access,used_before=volume.used,
                         bookmark=bookmark,event_uuid=event_uuid,complete=walker.sharing_complete and not replay.interrupted,
-                        event_progress=None if not replay.paths else bookmark!=old['bookmark'])
+                        event_progress=None if not replay.paths else bookmark!=old['bookmark'],stop=pace.exhausted)
                 except BudgetExceeded as exc:
                     # Only this attempt is dropped: its pending writes now, its
                     # staged generation at the next preparation. Other volumes go on.
@@ -414,7 +423,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     continue
                 except MergePending as exc:
                     # Published; the next run merges the delta before scanning anything.
-                    root_failed=True;published+=1;processed+=walker.entries
+                    root_failed|=exc.code!='allowance_spent';published+=1;processed+=walker.entries
                     status=store.db.execute('SELECT status FROM volumes WHERE id=?',(volume.id,)).fetchone()[0]
                     results.append({'volume_id':volume.id,'status':status,'action':action,'trigger':trigger,
                                     'entries':walker.entries,'gaps':sorted(walker.gaps),'merge':exc.code})

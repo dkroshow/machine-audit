@@ -263,9 +263,13 @@ the base map overlaid by that delta: delta rows not removed, and base rows that 
 delta row replaces, not removed and, for files and holders, not under a re-listed
 folder. Bounded batches then merge the delta into the base, and a last write clears
 it; every committed batch leaves the same visible map. Unchanged files are neither
-copied nor rewritten, including those a re-listed folder staged again.
+copied nor rewritten, including those a re-listed folder staged again. Removals are
+found from the delta's markers, joined to the base rows they hide: driven by the
+base's key order instead, a small update's merge read the whole base table (76-100 s
+an hour on Big Mac, Nov 11; 0.5-1 s now). A merge stops between batches when the
+run's allowance is spent, and the next run finishes it before scanning.
 Moves update both old and new ancestor chains. Retired full generations are
-reclaimed before the next full build, not by scanning the active map each hour.
+reclaimed within later runs' allowances, not by scanning the active map each hour.
 Sharing and ancestor totals commit only to the unpublished staging generation
 in bounded batches. Publication and each merge batch count their own rows and
 variable payload for the shared DB/WAL/SHM reservation; neither reserves a second

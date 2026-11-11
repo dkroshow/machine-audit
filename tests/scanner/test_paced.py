@@ -50,14 +50,16 @@ class PacedWalkTests(unittest.TestCase):
                              100 * 10**9, 50 * 10**9, 50 * 10**9, 40 * 10**9)
         self.now = 1_000 * HOUR
 
-    def scan(self, data, *, force=False, full=False, events=None, ticks=None, floor=40 * SECOND, fs=None):
-        """One scanner run. Each read of the allowance clock costs a second."""
+    def scan(self, data, *, force=False, full=False, events=None, ticks=None, floor=40 * SECOND, fs=None, clock=None):
+        """One scanner run. Each read of the allowance clock costs a second, unless
+        `clock` gives the CPU spent instead."""
         data.mkdir(exist_ok=True)
         native = SimpleNamespace(process=lambda pid: SimpleNamespace(proc_start_abstime=1, diskio_byteswritten=0))
         filesystem = fs or SimpleNamespace(volumes=lambda: [self.volume], sharing=lambda *args: None)
         events = events or SimpleNamespace(uuid=lambda device: 'events', current_id=lambda: 20,
                                            replay=lambda device, since: Replay(up_to=20))
         ticks = ticks or count()
+        clock = clock or (lambda: next(ticks) * SECOND)
         with patch('machine_audit.scanner.runner.Darwin', return_value=native), \
              patch('machine_audit.scanner.runner.MacFilesystem', return_value=filesystem), \
              patch('machine_audit.scanner.runner.IOKit'), \
@@ -66,7 +68,7 @@ class PacedWalkTests(unittest.TestCase):
              patch('machine_audit.scanner.runner.Budget', lambda root: Budget(root, free_margin_bytes=0)), \
              patch('machine_audit.scanner.runner.Policy', return_value=Policy(home=str(self.base), homes=[])), \
              patch('machine_audit.scanner.runner.time.time_ns', return_value=self.now), \
-             patch.object(pace.Allowance, 'clock', staticmethod(lambda: next(ticks) * SECOND)), \
+             patch.object(pace.Allowance, 'clock', staticmethod(clock)), \
              patch.object(pace, 'FLOOR_NS', floor), patch.object(pace, 'WALK_FLOOR_NS', floor // 2):
             result = run_scan(data, full=full, force=force)
         self.now += HOUR
@@ -175,6 +177,73 @@ class PacedWalkTests(unittest.TestCase):
         with self.db(data) as db:
             # It publishes with its own start bookmark: the next update replays every change since.
             self.assertEqual(db.execute("SELECT bookmark FROM volumes WHERE id='v'").fetchone()[0], 20)
+
+    def updating_store(self):
+        """A published map of the tree, with an hourly update due."""
+        data = self.base / 'merging'
+        self.assertEqual(self.scan(data, force=True)['status'], 'observed')
+        return data
+
+    def events(self, folders, up_to):
+        return SimpleNamespace(uuid=lambda device: 'events', current_id=lambda: up_to,
+                               replay=lambda device, since: Replay(paths={'/' + str(p.relative_to(self.tree)): False for p in folders}, up_to=up_to))
+
+    def test_an_update_merge_stops_at_the_allowance_and_resumes_with_the_map_valid(self):
+        # Live, Nov 11: every update's merge ran unpaced after listing filled the
+        # allowance, 76-100 s over a 120 s floor.
+        data = self.updating_store()
+        changed = self.tree / 'folder2' / 'sub3'
+        (changed / 'file0').unlink()  # Disposable synthetic file: a removal for the merge.
+        (changed / 'added').write_bytes(b'y' * 8192)
+        merging = []
+        original = MapStore.merge_delta
+        def merge(store, *args, **kwargs):
+            merging.append(True)
+            try:return original(store, *args, **kwargs)
+            finally:merging.pop()
+        # The CPU clock jumps once the merge starts: listing fitted, the merge does not.
+        with patch.object(MapStore, 'merge_delta', merge):
+            result = self.scan(data, events=self.events([changed], 21), clock=lambda: (10**6 if merging else 0) * SECOND)
+        self.assertEqual(result['status'], 'observed', 'a paused merge is not a failure')
+        self.assertEqual(result['volumes'][0]['merge'], 'allowance_spent')
+        with self.db(data) as db:
+            self.assertIsNotNone(db.execute("SELECT delta_generation FROM volumes WHERE id='v'").fetchone()[0])
+        def labels():
+            query = MapQuery(data / 'scanner.sqlite')
+            folder = next(r for r in query.query('children', volume_id='v')['rows'] if r['label'] == 'folder2')
+            sub = next(r for r in query.query('children', volume_id='v', parent_id=folder['id'])['rows'] if r['label'] == 'sub3')
+            return sorted(r['label'] for r in query.query('children', volume_id='v', parent_id=sub['id'])['rows'])
+        self.assertEqual(labels(), ['added', 'file1', 'file2'], 'the published map shows the update while it merges')
+        result = self.scan(data, events=self.events([], 22), clock=lambda: 0)
+        with self.db(data) as db:
+            self.assertIsNone(db.execute("SELECT delta_generation FROM volumes WHERE id='v'").fetchone()[0])
+        self.assertEqual(labels(), ['added', 'file1', 'file2'])
+
+    def test_a_run_at_the_floor_drains_deferred_folders_before_new_changes(self):
+        # Live, Nov 11: the deferred backlog did not drain. New shallow changes, re-listed
+        # first, took each run's allowance; deferred deeper folders waited.
+        data = self.updating_store()
+        deferred = [self.tree / f'folder{a}' / f'sub{b}' for a in range(5) for b in range(2)]
+        store = MapStore(data / 'scanner.sqlite', Budget(data, free_margin_bytes=0))
+        store.volume = 'v'
+        for folder in deferred:store.defer(str(folder.stat().st_ino), 0, False)
+        store.close()
+        listed = [0]  # Folders listed: the run's CPU clock, 10 s each.
+        original = MapStore.listed
+        def counted(store, *args):
+            listed[0] += 1
+            return original(store, *args)
+        backlog = []
+        with patch.object(MapStore, 'listed', counted):
+            for run in range(6):
+                # Every run brings three new changes: more than its allowance re-lists.
+                shallow = [self.tree / f'folder{(run + i) % 5}' for i in range(3)]
+                self.scan(data, events=self.events(shallow, 30 + run), floor=25 * SECOND, clock=lambda: listed[0] * 10 * SECOND)
+                with self.db(data) as db:
+                    waiting = {r[0] for r in db.execute("SELECT id FROM dirty WHERE volume='v'")}
+                backlog.append(sum(1 for folder in deferred if str(folder.stat().st_ino) in waiting))
+        self.assertEqual(backlog[-1], 0, backlog)
+        self.assertTrue(all(b < a for a, b in zip(backlog, backlog[1:]) if a), backlog)
 
     def test_a_name_withheld_folder_resumes_by_inode_with_no_name_or_path_stored(self):
         private = self.tree / 'Album.musiclibrary'

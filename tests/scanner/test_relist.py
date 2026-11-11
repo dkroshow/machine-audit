@@ -174,6 +174,37 @@ class RelistTests(unittest.TestCase):
             self.store.prepare(self.volume,full=False)
         self.assertLessEqual(statements['large'],statements['small']+20,statements)
 
+    def test_merging_a_small_update_does_not_read_the_whole_base(self):
+        # Live, Nov 11: an hourly update's merge cost 76-100 s. Ordered by the base's
+        # key, the removal merge read every base row to find a few re-listed folders.
+        work={}
+        for name,unrelated in (('small',200),('large',4000)):
+            tree=self.root/name;(tree/'bulk').mkdir(parents=True);(tree/'changed').mkdir()
+            for i in range(unrelated):(tree/'bulk'/str(i)).write_bytes(b'x')
+            for i in range(5):(tree/'changed'/f'c{i}').write_bytes(b'x')
+            data=self.root/(name+'-data');data.mkdir()
+            store=MapStore(data/'scanner.sqlite',Budget(data,limit_bytes=256*1024**2,free_margin_bytes=0))
+            volume=replace(self.volume,mount=str(tree))
+            store.prepare(volume);walker=Walker(volume,self.policy,store);walker.walk()
+            store.finish_volume(volume,None,walker.gaps,full=True,lean=True)
+            store.prepare(volume,full=False)
+            (tree/'changed'/'c0').unlink()  # Disposable synthetic file: a removal to merge.
+            walker=Walker(volume,self.policy,store)
+            relist(store,walker,self.policy,volume,0,[(str(tree/'changed'),False)])
+            steps=[0]
+            def step():
+                steps[0]+=1
+            original=store.merge_delta
+            def merge(*args,**kwargs):
+                store.db.set_progress_handler(step,100)
+                try:return original(*args,**kwargs)
+                finally:store.db.set_progress_handler(None,0)
+            with patch.object(store,'merge_delta',merge):
+                store.finish_volume(volume,None,walker.gaps,full=False,lean=True)
+            self.assertEqual(store.db.execute("SELECT count(*) FROM files WHERE generation=? AND label='c0'",(store.generation,)).fetchone()[0],0)
+            work[name]=steps[0];store.close()
+        self.assertLess(work['large'],2*work['small'],work)
+
     def test_repeated_directory_reset_does_not_restore_deleted_staged_files(self):
         (self.tree/'kept').write_bytes(b'kept')
         self.baseline()
@@ -185,12 +216,17 @@ class RelistTests(unittest.TestCase):
         self.assertEqual([r[0] for r in self.store.db.execute('SELECT label FROM files WHERE generation=?',(self.store.generation,))],['kept'])
 
     def test_failed_publication_keeps_dirty_refresh_until_successful_retry(self):
-        (self.tree/'kept').write_bytes(b'kept')
+        (self.tree/'kept').write_bytes(b'kept');(self.tree/'later').mkdir()
         self.baseline()
         identity=str(self.tree.stat().st_ino)
-        self.store.defer(identity,0,True)
+        self.store.defer(identity,0,False)  # Shallow: 'later' is not listed again.
+        later=str((self.tree/'later').stat().st_ino)
+        self.store.defer(later,10**18,True)  # Not yet due: no listing fulfils it.
+        # A refresh of a folder gone from the map can never run: it is dropped, so a
+        # backlog can drain to nothing.
         self.store.defer('not-observed',0,True)
         walker=self.update(self.tree)
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM dirty WHERE id='not-observed'").fetchone()[0],0)
         def pending():
             return self.store.db.execute('SELECT id FROM dirty WHERE volume=? AND id=?',(self.volume.id,identity)).fetchall()
         self.assertEqual([r[0] for r in pending()],[identity], 'a relist is not a published refresh')
@@ -200,7 +236,7 @@ class RelistTests(unittest.TestCase):
         self.assertEqual([r[0] for r in pending()],[identity], 'rollback lost the deferred refresh')
         self.store.finish_volume(self.volume, None,walker.gaps,full=False,lean=True)
         self.assertEqual(pending(),[])
-        self.assertEqual(self.store.db.execute('SELECT id FROM dirty').fetchone()[0],'not-observed')
+        self.assertEqual(self.store.db.execute('SELECT id FROM dirty').fetchone()[0],later)
 
     def test_deferred_large_folder_keeps_its_event_scope(self):
         # Big Mac re-walked ~1M entries per attempt: a deferred large folder was
