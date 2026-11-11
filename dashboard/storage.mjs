@@ -118,6 +118,13 @@ export async function storageView(api, interval, abort) {
           }
           blocks.push(bar);
         }
+      } else if (volume.valid === true && volume.reconciliation_pending) {
+        // Not judged yet: no equation, so no negative 'not placed' and no earlier figure in it.
+        const pending = volume.reconciliation_pending, count = pending.deferred_folders;
+        blocks.push(el('div', {class:'banner'},
+          el('p', {}, `Physical space in folders ${format(volume.physical,'bytes')}; used ${format(volume.volume_used,'bytes')}; not placed in a folder: pending`),
+          el('p', {class:'sub'}, `Folders exceed used space by ${format(pending.over_used,'bytes')} until ${format(count)} deferred folder${count === 1 ? '' : 's'} ${count === 1 ? 'is' : 'are'} re-listed. ` +
+            'The last update left them for a later hour, and data moved out of them can count twice until then.')));
       } else if (volume.valid !== true) {
         blocks.push(el('p', {class:'notice'},
           volume.status === 'invalid' ? 'Reconciliation is invalid. Folder sizes are withheld; they have not been scaled to fit the volume.' :

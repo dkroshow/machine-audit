@@ -176,7 +176,9 @@ and `global_growth_complete=false`, including after the final page.
 
 Volume rows include `id,label,observed_ns,full_scan_ns,listed,physical,volume_used,
 not_placed,tolerance,unplaced_shared,capacity,free,available,available_important,purgeable,
-capacity_source,capacity_observed_ns,valid,status,mounted,gaps,walk`. `walk` is null unless a
+capacity_source,capacity_observed_ns,valid,status,mounted,gaps,walk,reconciliation_pending`.
+`reconciliation_pending` is null unless an update left folders deferred and the folders
+exceed used space: then `over_used` and `deferred_folders`, and `not_placed` is null. `walk` is null unless a
 paced full walk is under way: then its `phase`, `entries`, `expected` (the previous walk's
 entries, or null), `started_ns`, `runs` and `cpu_ns`. Capacity, free and available
 come from the collector's newest minute reading when it is newer than the map

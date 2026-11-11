@@ -228,6 +228,23 @@ class RelistTests(unittest.TestCase):
         self.assertTrue(valid,'an update with deferred folders marked the map invalid')
         self.assertIn('reconciliation_deferred',gaps)
 
+    def test_a_denied_folders_hourly_retry_does_not_hold_the_judgment_back(self):
+        # Big Mac's startup volume keeps denied folders queued for an hourly retry: had
+        # they counted, its updates would never be judged until a full walk.
+        (self.tree/'changed').mkdir();denied=self.tree/'denied';denied.mkdir()
+        denied.chmod(0)
+        try:
+            self.baseline()
+            self.store.defer(str(denied.stat().st_ino),0,False)
+            valid,gaps=self.reconciled(-2*GB,self.tree/'changed')  # Its retry is denied again.
+        finally:denied.chmod(0o755)
+        status=self.store.db.execute("SELECT status FROM nodes WHERE id=inode_key(?)",(str(denied.stat().st_ino),)).fetchone()
+        self.assertEqual(tuple(status),('denied',))
+        self.assertFalse(valid,'a denied folder held the judgment back')
+        self.assertNotIn('reconciliation_deferred',gaps)
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM dirty WHERE id=?",(str(denied.stat().st_ino),)).fetchone()[0],1,
+                         'the denied folder is still retried')
+
     def test_an_update_with_nothing_deferred_judges_and_can_clear_an_invalid_map(self):
         (self.tree/'changed').mkdir()
         self.baseline()

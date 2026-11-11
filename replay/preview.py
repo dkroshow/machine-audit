@@ -45,7 +45,7 @@ def main():
     parser.add_argument("--port", type=int, default=0, help="Unused loopback port; 0 chooses one")
     parser.add_argument("--ready-file", type=Path, required=True,
                         help="Private scratch file for the test browser's temporary URL")
-    parser.add_argument("--storage-state", choices=("shared", "invalid", "unsupported", "paged", "growth"), default="shared")
+    parser.add_argument("--storage-state", choices=("shared", "invalid", "unsupported", "paged", "growth", "pending"), default="shared")
     parser.add_argument("--dashboard-state", choices=("normal", "crowded"), default="normal")
     args = parser.parse_args()
     root = Path(os.environ.get("MACHINE_AUDIT_TEST_ROOT", Path(__file__).parent / ".scratch"))

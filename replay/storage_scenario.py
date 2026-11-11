@@ -68,6 +68,14 @@ def seed_storage(directory, end_ns=BASE_NS + 60*SECOND, state="shared", start_ns
         write_snapshot(store, replace(volume, used=5*GB), end_ns-10*SECOND, growth=GB)
     elif state == "unsupported":
         write_snapshot(store, replace(volume, fs="ext4", used=11*GB), end_ns-10*SECOND, growth=GB)
+    elif state == "pending":
+        # An hourly update that left a folder deferred, with used space now below the
+        # folders: it is not judged, and 'not placed' waits for that folder.
+        store.prepare(volume, full=False, lean=True)
+        store.defer("4", end_ns + 3600*SECOND, False)
+        low = replace(volume, used=5*GB, free=15*GB, available=15*GB)
+        with patch("machine_audit.scanner.store.time.time_ns", return_value=end_ns-10*SECOND):
+            store.finish_volume(low, None, [], full=False, lean=True, used_before=low.used)
     else:
         # A paced full walk under way: the tab says how far along it is.
         with patch("machine_audit.scanner.store.time.time_ns", return_value=end_ns-10*SECOND):

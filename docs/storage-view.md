@@ -160,7 +160,10 @@ rescaled, until an update with nothing deferred reconciles again or the next
 full scan. An hourly update that left folders deferred is not judged
 (`reconciliation_deferred`): data moved from a deferred folder into a re-listed
 one counts twice until the deferred folder is re-listed, so the map keeps its
-last verdict meanwhile. Rows on one page can add to more
+last verdict meanwhile. Folders the map holds as denied do not count: they have
+no measured size, and they are still retried hourly. If the folders then exceed
+used space, the tab shows "not placed" as pending ("folders exceed used space by
+X until N deferred folders are re-listed"), never a negative figure. Rows on one page can add to more
 than their folder when they share blocks with each other; the page states that
 amount ("shared between the rows") when it is at least 1 GB, so rows, that
 line and not placed add up. On Ubuntu used and listed are shown side by side

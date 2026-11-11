@@ -138,6 +138,20 @@ def published(table,alias,base,volume,delta):
             f' AND NOT EXISTS(SELECT 1 FROM {table} o WHERE o.generation={delta} AND o.volume={volume} AND {same})))')
 
 
+def standing_deferrals(db,volume_id,vkey,generations,listed=None):
+    """Deferred folders that hold an update's reconciliation back: the volume's
+    deferral rows, except folders the map holds as denied (no measured size, so
+    nothing can move out of them; they are still retried hourly) and, with `listed`,
+    folders that generation's own listings re-listed."""
+    marks=','.join('?'*len(generations))
+    fulfilled=('AND NOT EXISTS(SELECT 1 FROM listings l WHERE l.generation=? AND l.volume=? AND l.id=inode_key(d.id))'
+               if listed is not None else '')
+    return db.execute(f'''SELECT count(*) FROM dirty d WHERE d.volume=? {fulfilled}
+        AND NOT EXISTS(SELECT 1 FROM nodes n WHERE n.generation IN ({marks}) AND n.volume=? AND n.id=inode_key(d.id)
+            AND n.status='denied')''',
+        (volume_id,*((listed,vkey) if listed is not None else ()),*generations,vkey)).fetchone()[0]
+
+
 class MergePending(RuntimeError):
     """The update is published, but merging its delta into the base did not finish.
     The delta stays published; the next run merges it before any scan."""
@@ -978,9 +992,7 @@ class MapStore:
         unplaced=sum(row['unplaced'] for row in self._rows('streams','unplaced>0'))
         if unplaced:gaps.add('shared_copy_placed_at_full_walk')
         # Folders still deferred after this update: those its own listings do not fulfil.
-        deferred=not full and self.db.execute('''SELECT 1 FROM dirty WHERE volume=? AND NOT EXISTS(SELECT 1 FROM listings l
-            WHERE l.generation=? AND l.volume=? AND l.id=inode_key(dirty.id)) LIMIT 1''',
-            (self.volume,self.generation,self.vid)).fetchone() is not None
+        deferred=not full and standing_deferrals(self.db,self.volume,self.vid,(self.base_gen,self.generation),listed=self.generation)>0
         if physical:
             result=reconcile(volume.used,total,supported=volume.fs in ('apfs','hfs'),complete=complete,
                              previously_invalid=bool(old['generation'] and not old['valid']),full=full,used_change=used_change,
@@ -1289,6 +1301,7 @@ class MapQuery:
         cursor=_cursor(params.get('cursor'))
         db = sqlite3.connect(self.path.as_uri()+'?mode=ro',uri=True,timeout=2)
         db.row_factory = sqlite3.Row
+        db.create_function('inode_key',1,inode_key,deterministic=True)
         try:
             db.execute('BEGIN')
             version=db.execute('PRAGMA user_version').fetchone()[0]
@@ -1327,14 +1340,23 @@ class MapQuery:
                     root = next(iter(map_rows('nodes',v,'x.parent IS NULL','LIMIT 1')),None)
                     listed,physical=(root['listed'],root['physical']) if root else (None,None)
                     valid = bool(v['valid']) and physical is not None
-                    placed=valid and v['volume_used'] is not None and 'physical_residual_not_computed' not in json.loads(v['gaps'])
+                    gaps=json.loads(v['gaps'])
+                    placed=valid and v['volume_used'] is not None and 'physical_residual_not_computed' not in gaps
+                    # An update left folders deferred and was not judged: folders above used
+                    # space wait for those folders, and 'not placed' is pending, never negative.
+                    pending=None
+                    if placed and 'reconciliation_deferred' in gaps and physical>v['volume_used']:
+                        delta=v['delta_generation'] if 'delta_generation' in v.keys() else None
+                        pending=dict(over_used=physical-v['volume_used'],deferred_folders=standing_deferrals(
+                            db,v['id'],v['key'],tuple(g for g in (v['generation'],delta) if g is not None)))
                     rows.append(dict(id=v['id'],label=v['label'],observed_ns=v['observed_ns'],full_scan_ns=v['full_ns'],
                                      listed=listed,physical=physical if valid else None,volume_used=v['volume_used'],
-                                     not_placed=v['volume_used']-physical if placed else None,
+                                     not_placed=v['volume_used']-physical if placed and not pending else None,
+                                     reconciliation_pending=pending,
                                      tolerance=max(accounting.GB,abs(v['used_change'] or 0)) if placed else None,
                                      unplaced_shared=v['unplaced_shared'] or 0,
                                      capacity=v['capacity'],free=v['free'],available=v['available'],valid=valid,status=v['status'],
-                                     mounted=bool(v['mounted']),gaps=json.loads(v['gaps']),walk=walks.get(v['id'])))
+                                     mounted=bool(v['mounted']),gaps=gaps,walk=walks.get(v['id'])))
                 truncated=len(rows)>limit
             elif volume and action == 'children':
                 parent = params.get('parent_id')

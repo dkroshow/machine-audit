@@ -207,6 +207,18 @@ test('all dashboard views render real stored replay without leaked tokens or fak
   await until(()=>run("document.querySelector('#view').innerText"),text=>text.includes('Growth page 2'),'Growth cursor did not reach page two');
   await run("[...document.querySelectorAll('button')].find(button=>button.textContent==='Previous growth page').click()");
   await until(()=>run("document.querySelector('#view').innerText"),text=>text.includes('Growth page 1'),'Growth cursor did not return to page one');
+  // An update not judged because a folder is deferred: no negative 'not placed', no equation.
+  const pendingReady=join(directory,'pending-ready.json');
+  const pendingPreview=spawn(python,['-m','replay.preview','--ready-file',pendingReady,'--storage-state','pending'],{cwd:root,env:{...process.env,MACHINE_AUDIT_TEST_ROOT:directory},stdio:'ignore'});
+  t.after(()=>stop(pendingPreview));
+  const pending=await until(()=>{try{return JSON.parse(readFileSync(pendingReady,'utf8'));}catch{return null;}},Boolean,'Pending-reconciliation replay did not start');
+  await send('Page.navigate',{url:`${pending.origin}/#token=${encodeURIComponent(pending.token)}`});await settled();
+  await run("location.hash='#storage'");await pause(100);await settled();
+  const pendingText=await run("document.querySelector('#view').innerText");
+  assert.match(pendingText,/not placed in a folder: pending/);
+  assert.match(pendingText,/Folders exceed used space by 2 GB until 1 deferred folder is re-listed/);
+  assert.doesNotMatch(pendingText,/−\d|= used/);
+  assert.equal(await run("document.querySelectorAll('.storage-bar').length"),0);
   const invalidReady=join(directory,'invalid-ready.json');
   const invalidPreview=spawn(python,['-m','replay.preview','--ready-file',invalidReady,'--storage-state','invalid'],{cwd:root,env:{...process.env,MACHINE_AUDIT_TEST_ROOT:directory},stdio:'ignore'});
   t.after(()=>stop(invalidPreview));
