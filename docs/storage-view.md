@@ -155,8 +155,12 @@ the volume's used space read after the walk. Not placed covers snapshots,
 file-system records and areas the scanner cannot read. Folders may exceed used
 space by up to the larger of 1 GB and the change in used space during the walk
 (for a paced walk, every move of used space while it ran), because files change
-while the walk runs; beyond that the folder figures are withheld
-until the next full scan, never rescaled. Rows on one page can add to more
+while the walk runs; beyond that the folder figures are withheld, never
+rescaled, until an update with nothing deferred reconciles again or the next
+full scan. An hourly update that left folders deferred is not judged
+(`reconciliation_deferred`): data moved from a deferred folder into a re-listed
+one counts twice until the deferred folder is re-listed, so the map keeps its
+last verdict meanwhile. Rows on one page can add to more
 than their folder when they share blocks with each other; the page states that
 amount ("shared between the rows") when it is at least 1 GB, so rows, that
 line and not placed add up. On Ubuntu used and listed are shown side by side

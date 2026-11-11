@@ -977,9 +977,15 @@ class MapStore:
         else:used_change=volume.used-used_before if volume.used is not None and used_before is not None else 0
         unplaced=sum(row['unplaced'] for row in self._rows('streams','unplaced>0'))
         if unplaced:gaps.add('shared_copy_placed_at_full_walk')
+        # Folders still deferred after this update: those its own listings do not fulfil.
+        deferred=not full and self.db.execute('''SELECT 1 FROM dirty WHERE volume=? AND NOT EXISTS(SELECT 1 FROM listings l
+            WHERE l.generation=? AND l.volume=? AND l.id=inode_key(dirty.id)) LIMIT 1''',
+            (self.volume,self.generation,self.vid)).fetchone() is not None
         if physical:
             result=reconcile(volume.used,total,supported=volume.fs in ('apfs','hfs'),complete=complete,
-                             previously_invalid=bool(old['generation'] and not old['valid']),full=full,used_change=used_change)
+                             previously_invalid=bool(old['generation'] and not old['valid']),full=full,used_change=used_change,
+                             deferred=deferred)
+            if deferred:gaps.add('reconciliation_deferred')
         else:
             # No extents provider (Linux): each inode counts once per folder; no residual is claimed.
             result={'valid':True,'physical':total,'not_placed':None,'tolerance':None,'status':'observed' if complete else 'partial'}

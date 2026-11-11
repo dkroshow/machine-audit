@@ -171,16 +171,28 @@ def asterisk(physical, listed, frees):
     return note or None
 
 
-def reconcile(volume_used, physical, *, supported=True, complete=True, previously_invalid=False, full=True, used_change=0):
+def reconcile(volume_used, physical, *, supported=True, complete=True, previously_invalid=False, full=True, used_change=0,
+              deferred=False):
     """Folders' physical space plus 'not placed in a folder' equals the volume's used
     space. The walk takes time while the volume changes, so the folders may exceed
     used space by up to max(1 GB, the change in used space during the walk); beyond
-    that the folder figures are withheld, never rescaled."""
+    that the folder figures are withheld, never rescaled.
+
+    An update that left folders deferred is not judged: data moved from a deferred
+    folder into a re-listed one counts twice until the deferred one is re-listed. The
+    map keeps its last verdict meanwhile. An update with nothing deferred judges again,
+    so it can also clear an earlier invalid verdict."""
     tolerance = max(GB, abs(used_change or 0))
     if not supported:
         return {'valid': False, 'physical': None, 'not_placed': None, 'tolerance': None, 'status': 'unavailable'}
-    if (volume_used is None or physical is None or physical < 0 or physical > volume_used + tolerance
-            or (previously_invalid and not full)):
+    if volume_used is None or physical is None or physical < 0:
+        return {'valid': False, 'physical': None, 'not_placed': None, 'tolerance': tolerance, 'status': 'invalid'}
+    if deferred and not full:
+        if previously_invalid:
+            return {'valid': False, 'physical': None, 'not_placed': None, 'tolerance': tolerance, 'status': 'invalid'}
+        return {'valid': True, 'physical': physical, 'not_placed': volume_used - physical, 'tolerance': tolerance,
+                'status': 'partial'}
+    if physical > volume_used + tolerance:
         return {'valid': False, 'physical': None, 'not_placed': None, 'tolerance': tolerance, 'status': 'invalid'}
     return {'valid': True, 'physical': physical, 'not_placed': volume_used - physical, 'tolerance': tolerance,
             'status': 'observed' if complete else 'partial'}

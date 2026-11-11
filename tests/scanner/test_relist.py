@@ -1,5 +1,6 @@
 """Event replay must not turn ordinary missing paths into subtree walks."""
 import errno
+import json
 import os
 from pathlib import Path
 from dataclasses import replace
@@ -7,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from machine_audit.budget import Budget
+from machine_audit.budget import Budget, GB
 from machine_audit.scanner.native import Volume
 from machine_audit.scanner.policy import Policy
 from machine_audit.scanner.runner import relist
@@ -204,6 +205,38 @@ class RelistTests(unittest.TestCase):
             self.assertEqual(store.db.execute("SELECT count(*) FROM files WHERE generation=? AND label='c0'",(store.generation,)).fetchone()[0],0)
             work[name]=steps[0];store.close()
         self.assertLess(work['large'],2*work['small'],work)
+
+    def reconciled(self,used,changed):
+        """Re-list `changed`, publish against `used` bytes of used space, and return
+        the volume's verdict and gaps. The next update is prepared."""
+        walker=self.update(changed)
+        volume=replace(self.volume,used=used)
+        self.store.finish_volume(volume,None,walker.gaps,full=False,lean=True,used_before=used)
+        valid,gaps=self.store.db.execute("SELECT valid,gaps FROM volumes WHERE id='v'").fetchone()
+        self.store.prepare(self.volume,full=False)
+        return bool(valid),json.loads(gaps)
+
+    def test_an_update_that_left_folders_deferred_does_not_judge_reconciliation(self):
+        # Big Mac's 13.7 TB volume, Nov 11 12:27 PM PT: data moved from a deferred folder
+        # into a re-listed one counted twice, the folders exceeded used space by 1.7 GB,
+        # and the map went invalid until a full walk now paced over days.
+        (self.tree/'moved-to').mkdir();(self.tree/'deferred').mkdir()
+        self.baseline()
+        self.store.defer(str((self.tree/'deferred').stat().st_ino),10**18,False)
+        # Used space 2 GB below the folders: beyond the 1 GB tolerance.
+        valid,gaps=self.reconciled(-2*GB,self.tree/'moved-to')
+        self.assertTrue(valid,'an update with deferred folders marked the map invalid')
+        self.assertIn('reconciliation_deferred',gaps)
+
+    def test_an_update_with_nothing_deferred_judges_and_can_clear_an_invalid_map(self):
+        (self.tree/'changed').mkdir()
+        self.baseline()
+        # As before: with nothing deferred, folders beyond the tolerance are invalid.
+        self.assertFalse(self.reconciled(-2*GB,self.tree/'changed')[0])
+        # A later update that reconciles clears it; it was kept until the next full walk.
+        valid,gaps=self.reconciled(10*GB,self.tree/'changed')
+        self.assertTrue(valid,'a reconciling update left the map invalid')
+        self.assertNotIn('reconciliation_deferred',gaps)
 
     def test_repeated_directory_reset_does_not_restore_deleted_staged_files(self):
         (self.tree/'kept').write_bytes(b'kept')
