@@ -172,7 +172,10 @@ folder and a holder in the re-listed one, so an update also re-lists the folders
 that still hold a newly linked file as a plain file; every link is then a holder
 and the file counts once. When the published map is invalid, the update checks
 every hard link this way, which repairs a map an earlier release left counting
-links twice. Rows on one page can add to more
+links twice. Finding those folders reads the volume's file rows once, however many
+links there are: about 17 s on Big Mac's startup volume (11.9 M file rows), and only
+in an update that meets new links or repairs an invalid map. The re-lists it finds
+are paced like any other listing; those past the allowance are deferred. Rows on one page can add to more
 than their folder when they share blocks with each other; the page states that
 amount ("shared between the rows") when it is at least 1 GB, so rows, that
 line and not placed add up. On Ubuntu used and listed are shown side by side

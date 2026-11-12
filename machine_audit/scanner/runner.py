@@ -117,6 +117,7 @@ def relist(store,walker,policy,volume,now,changes,pace=None):
     # allowance covers little more than the new changes; then by depth, so an
     # ancestor covers its subtree.
     paths=sorted(roots_to_update,key=lambda path:(path not in due_at,due_at.get(path,0),len(path)))
+    later=[]  # Left for the next run: the hour's allowance is spent.
     chosen=[]
     complete=True
     for path in paths:
@@ -127,7 +128,7 @@ def relist(store,walker,policy,volume,now,changes,pace=None):
         recursive=path in recursive_roots
         if pace is not None and pace.exhausted():
             # The hour's allowance is spent: the next run re-lists it first.
-            store.defer(previous['id'],now,recursive);walker.gaps.add('update_deferred');continue
+            later.append((previous['id'],now,recursive));continue
         # Open it before anything is cleared: a walk lists nothing when the open is
         # denied, and a cleared, unwalked directory orphans whatever is staged beneath.
         if walker.directory_identity(path) is None:
@@ -156,14 +157,17 @@ def relist(store,walker,policy,volume,now,changes,pace=None):
     # a holder in the re-listed folder, so its bytes would count twice. Re-list the
     # folders that still hold it as a plain file: every link is then a holder and the
     # file counts once.
-    for previous in store.plain_links():
-        path=previous['path'] or walker.path_of(previous['id'])
-        if not path or path in chosen:continue
+    # They are paced like any listing: the rest are deferred to the next run.
+    for folder in store.plain_links():
         if pace is not None and pace.exhausted():
-            store.defer(previous['id'],now,False);walker.gaps.add('update_deferred');continue
+            later.append((folder,now,False));continue
+        previous=store.known_directory(folder)
+        path=previous and (previous['path'] or walker.path_of(folder))
+        if not path or path in chosen:continue
         if walker.directory_identity(path) is None:
             store.defer(previous['id'],now+3600*10**9,False);continue
         if not walker.walk(path,live_parent(store,walker,volume,path,previous['parent']),previous['kind']=='private',recursive=False):complete=False
+    if later:store.defer_all(later);walker.gaps.add('update_deferred')
     return complete
 
 

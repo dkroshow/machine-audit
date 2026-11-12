@@ -5,6 +5,7 @@ is a counter, so how much a run gets through is fixed, not timing-dependent."""
 from dataclasses import replace
 from itertools import count
 import json
+import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -244,6 +245,38 @@ class PacedWalkTests(unittest.TestCase):
                 backlog.append(sum(1 for folder in deferred if str(folder.stat().st_ino) in waiting))
         self.assertEqual(backlog[-1], 0, backlog)
         self.assertTrue(all(b < a for a, b in zip(backlog, backlog[1:]) if a), backlog)
+
+    def test_new_hard_links_re_list_their_other_folders_within_the_allowance(self):
+        # Live, Nov 11 4:19-6:30 PM PT: updates overran by up to 77 s in listing after
+        # many files gained hard links; finding and re-listing the folders that held
+        # them as plain files was not paced.
+        data = self.updating_store()
+        linked = self.tree / 'linked';linked.mkdir()
+        for a in range(5):
+            for b in range(2):os.link(self.tree / f'folder{a}' / f'sub{b}' / 'file0', linked / f'{a}-{b}')
+        expected = self.reference()
+        listed = [0]  # Folders listed: the run's CPU clock, 10 s each.
+        original = MapStore.listed
+        def counted(store, *args):
+            listed[0] += 1
+            return original(store, *args)
+        runs = []
+        with patch.object(MapStore, 'listed', counted):
+            for run in range(8):
+                before = listed[0]
+                result = self.scan(data, events=self.events([linked] if run == 0 else [], 40 + run), floor=25 * SECOND,
+                                   clock=lambda: listed[0] * 10 * SECOND)
+                runs.append((listed[0] - before, result['volumes'][0]['gaps']))
+                self.assertEqual(MapQuery(data / 'scanner.sqlite').query('volumes')['rows'][0]['valid'], True)
+                with self.db(data) as db:
+                    if not db.execute('''SELECT (SELECT count(*) FROM dirty WHERE volume='v')+
+                            (SELECT count(delta_generation) FROM volumes WHERE id='v')''').fetchone()[0]:break
+        # Each run lists at most what its 25 s allowance covers, plus the one folder
+        # under way when it ran out; the rest carry over until every link counts once.
+        self.assertTrue(all(count <= 3 for count, _ in runs), runs)
+        self.assertIn('update_deferred', runs[0][1])
+        self.assertGreater(len(runs), 2, runs)
+        self.assertEqual(self.published_map(data), expected)
 
     def test_a_name_withheld_folder_resumes_by_inode_with_no_name_or_path_stored(self):
         private = self.tree / 'Album.musiclibrary'

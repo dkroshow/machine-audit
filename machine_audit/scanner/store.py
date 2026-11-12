@@ -526,37 +526,47 @@ class MapStore:
                     (self.generation,self.vid,inode_key(identity),time.time_ns(),count))
 
     def defer(self,identity,due_ns,recursive):
-        # A pending refresh keeps its earliest due time and is never narrowed
-        # by a later shallow event.
-        with self.write(rows=1):self.db.execute('''INSERT INTO dirty VALUES(?,?,?,?) ON CONFLICT(volume,id) DO UPDATE SET
+        self.defer_all([(identity,due_ns,recursive)])
+
+    def defer_all(self,refreshes):
+        """Queue (folder, due, recursive) refreshes in one write. A pending refresh keeps
+        its earliest due time and is never narrowed by a later shallow event."""
+        if not refreshes:return
+        with self.write(rows=len(refreshes)):self.db.executemany('''INSERT INTO dirty VALUES(?,?,?,?) ON CONFLICT(volume,id) DO UPDATE SET
             due_ns=min(due_ns,excluded.due_ns),recursive=max(coalesce(recursive,1),excluded.recursive)''',
-            (self.volume,identity,due_ns,int(recursive)))
+            ((self.volume,identity,due_ns,int(recursive)) for identity,due_ns,recursive in refreshes))
 
     def plain_links(self):
-        """Folders of the published map that hold a hard-linked file as a plain file,
+        """The ids of folders of the published map that hold a hard-linked file as a plain file,
         not yet re-listed by this update: listed before the file gained its other link.
         Hard links are holders whose stream is their own inode with no APFS private
         size. Only the links this update staged that are new to the map; all of them
         when the published map is invalid, which repairs a map an earlier release left
-        counting a link twice. The map has no index of files by inode, so this reads
-        the volume's file rows once per 500 links, only when there are any."""
+        counting a link twice. The map has no index of files by inode, so the links go
+        in a temporary table and the volume's file rows are read once, however many
+        links there are: about 3 s for Big Mac's 11.9 M file rows. The re-lists it
+        finds are paced by the caller."""
         self.flush()
         if not self.db.execute('SELECT valid FROM volumes WHERE id=?',(self.volume,)).fetchone()[0]:
-            links=[r[0] for r in self.db.execute('''SELECT DISTINCT file_id FROM holders WHERE generation IN (?,?) AND volume=?
-                AND stream=file_id AND private IS NULL''',(self.base_gen,self.generation,self.vid))]
+            links=self.db.execute('''SELECT DISTINCT file_id FROM holders WHERE generation IN (?,?) AND volume=?
+                AND stream=file_id AND private IS NULL''',(self.base_gen,self.generation,self.vid)).fetchall()
         else:
-            links=[r[0] for r in self.db.execute('''SELECT DISTINCT h.file_id FROM holders h WHERE h.generation=? AND h.volume=?
+            links=self.db.execute('''SELECT DISTINCT h.file_id FROM holders h WHERE h.generation=? AND h.volume=?
                 AND h.stream=h.file_id AND h.private IS NULL AND NOT EXISTS(SELECT 1 FROM holders b INDEXED BY holder_file
-                WHERE b.generation=? AND b.volume=? AND b.file_id=h.file_id)''',(self.generation,self.vid,self.base_gen,self.vid))]
-        folders=set()
-        for first in range(0,len(links),500):
-            part=links[first:first+500];marks=','.join('?'*len(part))
-            folders.update(r[0] for r in self.db.execute(f'''SELECT DISTINCT f.parent FROM files f WHERE f.generation=? AND f.volume=?
-                AND f.id IN ({marks})
+                WHERE b.generation=? AND b.volume=? AND b.file_id=h.file_id)''',(self.generation,self.vid,self.base_gen,self.vid)).fetchall()
+        if not links:return []
+        # Typed, so each file row probes the key; untyped, SQLite scanned every link
+        # for every file row. Not a rowid: test identities can be text.
+        self.db.execute('CREATE TEMP TABLE IF NOT EXISTS link_check(id INTEGER PRIMARY KEY) WITHOUT ROWID')
+        try:
+            self.db.executemany('INSERT OR IGNORE INTO temp.link_check VALUES(?)',links)
+            folders={r[0] for r in self.db.execute('''SELECT DISTINCT f.parent FROM files f CROSS JOIN temp.link_check t
+                WHERE f.generation=? AND f.volume=? AND t.id=f.id
                 AND NOT EXISTS(SELECT 1 FROM holders h WHERE h.generation IN (?,?) AND h.volume=f.volume AND h.dir=f.parent AND h.file_id=f.id)
                 AND NOT EXISTS(SELECT 1 FROM reset_dirs r WHERE r.generation=? AND r.volume=f.volume AND r.id=f.parent)''',
-                (self.base_gen,self.vid,*part,self.base_gen,self.generation,self.generation)))
-        return [found for folder in sorted(folders,key=str) if (found:=self.known_directory(source_id(folder))) is not None]
+                (self.base_gen,self.vid,self.base_gen,self.generation,self.generation)).fetchall()}
+        finally:self.db.execute('DELETE FROM temp.link_check')
+        return [source_id(folder) for folder in sorted(folders,key=str)]
 
     def forget_deferred(self,identities):
         """Drop deferred refreshes of folders no longer in the map: nothing can re-list

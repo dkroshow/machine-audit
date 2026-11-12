@@ -252,6 +252,50 @@ class RelistTests(unittest.TestCase):
         self.reconciled(10*GB,second)  # Only the new link's folder has an event.
         self.assertEqual(self.published_physical(),self.fresh_physical())
 
+    def test_checking_new_hard_links_reads_the_file_rows_once_however_many(self):
+        # Big Mac's startup volume has 11.9 M file rows: read once per 500 links, a batch
+        # of new links cost 1.5 s a batch, unpaced, and overran the hour's allowance.
+        first=self.tree/'first';second=self.tree/'second';first.mkdir();second.mkdir()
+        for i in range(1200):(first/str(i)).write_bytes(b'z')
+        self.baseline()
+        for i in range(1200):os.link(first/str(i),second/str(i))
+        walker=Walker(self.volume,self.policy,self.store)
+        seen=[]
+        original=self.store.plain_links
+        def traced():
+            self.store.db.set_trace_callback(seen.append)
+            try:return original()
+            finally:self.store.db.set_trace_callback(None)
+        with patch.object(self.store,'plain_links',traced):
+            relist(self.store,walker,self.policy,self.volume,0,[(str(second),False)])
+        self.assertEqual(sum(1 for statement in seen if 'FROM files f' in statement),1)
+        self.store.finish_volume(self.volume,None,walker.gaps,full=False,lean=True)
+        self.assertEqual(self.published_physical(),self.fresh_physical())
+
+    def test_checking_new_hard_links_costs_no_more_for_more_links(self):
+        # With an untyped key SQLite scanned every link for every file row: 5,000 new
+        # links on Big Mac's startup volume ran for more than ten minutes.
+        work={}
+        for name,links in (('few',100),('many',2000)):
+            tree=self.root/name;(tree/'first').mkdir(parents=True);(tree/'second').mkdir()
+            for i in range(2000):(tree/'first'/str(i)).write_bytes(b'z')
+            data=self.root/(name+'-data');data.mkdir()
+            store=MapStore(data/'scanner.sqlite',Budget(data,limit_bytes=256*1024**2,free_margin_bytes=0))
+            volume=replace(self.volume,mount=str(tree))
+            store.prepare(volume);walker=Walker(volume,self.policy,store);walker.walk()
+            store.finish_volume(volume,None,walker.gaps,full=True,lean=True)
+            store.prepare(volume,full=False)
+            for i in range(links):os.link(tree/'first'/str(i),tree/'second'/str(i))
+            walker=Walker(volume,self.policy,store);walker.walk(str(tree/'second'),str((tree).stat().st_ino),False,recursive=False)
+            steps=[0]
+            def step():
+                steps[0]+=1
+            store.db.set_progress_handler(step,1000)
+            try:self.assertEqual(len(store.plain_links()),1)
+            finally:store.db.set_progress_handler(None,0)
+            work[name]=steps[0];store.close()
+        self.assertLess(work['many'],3*work['few'],work)
+
     def test_an_update_repairs_a_map_that_counted_a_hard_link_twice(self):
         # The map an earlier release left: the old link's folder still counts the file.
         first=self.tree/'first';second=self.tree/'second';first.mkdir();second.mkdir()
