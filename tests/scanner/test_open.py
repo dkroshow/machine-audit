@@ -258,9 +258,13 @@ class RootPublicationTests(unittest.TestCase):
         self.assertEqual((status, outcome), (volume('status'),)*2)
         collector.unlink()  # Synthetic file created by this test.
         status, results, outcome = run(day+6*hour)
-        self.assertEqual((status, results['v']['action'], results['v']['status']), ('complete', 'full', 'observed'))
+        # The refused walk resumes from its checkpoint and publishes; its volume's hourly
+        # update runs beside it.
+        self.assertEqual((status, results['v']['walk']['state'], results['v']['status']), ('complete', 'published', 'observed'))
         self.assertIsNone(volume('budget_retry_bytes'))
-        status, results, outcome = run(day+7*hour)
+        # A minute past the hour: that run published the update and then the walk, whose
+        # observation time is kept 1 ns later, and this frozen clock would land 1 ns short.
+        status, results, outcome = run(day+7*hour+60*10**9)
         self.assertEqual((results['v']['action'], results['v']['trigger'], results['v']['status']),
                          ('update', 'hourly_update', 'observed'))
 
@@ -315,7 +319,6 @@ class RootPublicationTests(unittest.TestCase):
         with sqlite3.connect(self.data/'scanner.sqlite') as db:
             start = db.execute('SELECT max(observed_ns) FROM volumes').fetchone()[0]
         phase, finish = MapStore.phase, MapStore.finish_volume
-        labels = {'dirty'}  # Map rows reach the base through the bounded merge, after publication.
         for hours, refused in ((1, 'publication'), (2, 'progress')):
             def refusing(store, stage, **kwargs):
                 full = lambda:setattr(store.budget,'limit_bytes',store.budget.usage()['bytes'])  # nothing more fits
@@ -333,19 +336,21 @@ class RootPublicationTests(unittest.TestCase):
             self.assertTrue(outcome['v']['status'].startswith('budget_blocked_'))
             with sqlite3.connect(self.data/'scanner.sqlite') as db:
                 stored = {r['volume_id']:r for r in json.loads(db.execute('SELECT volumes FROM runs ORDER BY started_ns DESC LIMIT 1').fetchone()[0])}
-                staging = db.execute("SELECT count(*) FROM generations g JOIN volumes v ON v.key=g.volume WHERE v.id='v' AND g.status='building'").fetchone()[0]
-            self.assertEqual(staging, 0, "the next volume's preparation prunes the refused staging; the receipt must not depend on it")
+                staging = db.execute('''SELECT count(*) FROM generations g JOIN volumes v ON v.key=g.volume WHERE v.id='v'
+                    AND g.status='building' AND g.id NOT IN (SELECT generation FROM walks)''').fetchone()[0]
+            # A refused walk keeps its generation with its checkpoint; any other refused
+            # staging is pruned, and the receipt must not depend on it.
+            self.assertEqual(staging, 0, "the refused staging was not pruned")
             if refused=='progress':
                 self.assertNotIn('publication', stored['v'], 'a refused progress write was reported as the publication')
                 continue
             receipt = stored['v']['publication']
-            self.assertEqual(set(receipt), {'plan','changed','point_candidates','hierarchy_candidates','tracked','rows',
+            self.assertEqual(set(receipt), {'changed','point_candidates','hierarchy_candidates','tracked','rows',
                                             'payload_bytes','existing_pages','freelist_pages','shortfall_bytes'})
-            self.assertEqual(set(receipt['plan']), labels)
-            numbers = [v for k,v in receipt.items() if k!='plan']+[n for pair in receipt['plan'].values() for n in pair]
-            self.assertTrue(all(type(n) is int and n>=0 for n in numbers), 'the receipt holds counts and bytes only')
+            self.assertTrue(all(type(n) is int and n>=0 for n in receipt.values()), 'the receipt holds counts and bytes only')
             self.assertGreater(receipt['changed'], 0)
-            self.assertEqual(receipt['rows'], sum(n for n,_ in receipt['plan'].values())+2*receipt['point_candidates']
+            # Fulfilled deferrals are deleted after publication, in bounded batches.
+            self.assertEqual(receipt['rows'], 2*receipt['point_candidates']
                              +receipt['hierarchy_candidates']+2*receipt['tracked']+5+1)  # +1: the delta's own status
 
     def test_a_refused_merge_keeps_its_publication_and_merges_before_any_scan(self):

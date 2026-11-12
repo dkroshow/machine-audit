@@ -486,8 +486,12 @@ primary key, counted as one row. An update reserves
 point and hierarchy rows only for changed identities `_points` writes for: one
 with a point already, or at least 1 GB. Every re-listed folder had reserved three
 such rows. A refused publication keeps its counted terms in that volume's
-`runs.volumes` entry: rows and payload per fixed plan label, changed and point and
-hierarchy candidates, tracked, totals, existing and free pages, and the shortfall.
+`runs.volumes` entry: changed and point and hierarchy candidates, tracked, totals,
+existing and free pages, and the shortfall. The deferred refreshes a publication's
+listings fulfil are deleted after it, in bounded batches (a run that drained 12 k of
+Big Mac's backlog had declared a 9.95 GB peak inside it); a row a crash leaves costs
+one more re-list. Deferrals are written only when new, in batches of 1,024, and a walk
+the cap refuses keeps its checkpoint and waits at the retry gate.
 Big Mac's first trial refused a main update that declared at least 846,874 dirty
 pages, the whole file, derived from its stored retry level (about 52,926 rows if
 its payload was negligible); its staging was pruned, so the parts are unknown. A disposable regression re-lists 600 unchanged folders on a 15,475-page

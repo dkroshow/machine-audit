@@ -112,6 +112,7 @@ REMOVED={'nodes':'removed','files':'removed','holders':'removed','listings':'rem
 # ...and one that hides only the base's rows, which the delta restates in full.
 RESET={'files':'reset_dirs','holders':'reset_dirs','terms':'reset_groups'}
 MERGE_ROWS=4096
+DIRTY_BATCH=1024
 NODE_INSERT='INSERT OR REPLACE INTO nodes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)'
 # Re-read at most this many streams' extents in one hourly update.
 SHARING_REREADS=20_000
@@ -464,11 +465,12 @@ class MapStore:
                 AND volume=? AND id IN ({marks})''',(self.base_gen,self.vid,*part)))
         return total
 
-    def last_entries(self):
-        """Each volume's entries in the last run that recorded them: the update order's key."""
+    def last_outcomes(self):
+        """Each volume's outcome in the last run that recorded them: its entries order
+        the updates; its walk state says whether the cap refused or held its walk."""
         row=self.db.execute('SELECT volumes FROM runs WHERE id!=? AND volumes IS NOT NULL ORDER BY started_ns DESC LIMIT 1',
                             (self.run,)).fetchone()
-        return {v['volume_id']:v.get('entries') or 0 for v in json.loads(row[0])} if row else {}
+        return {v['volume_id']:v for v in json.loads(row[0])} if row else {}
 
     def large_folders(self,entries):
         """Folders the volume's published map lists with more than `entries` direct
@@ -557,10 +559,12 @@ class MapStore:
     def defer_all(self,refreshes):
         """Queue (folder, due, recursive) refreshes in one write. A pending refresh keeps
         its earliest due time and is never narrowed by a later shallow event."""
-        if not refreshes:return
-        with self.write(rows=len(refreshes)):self.db.executemany('''INSERT INTO dirty VALUES(?,?,?,?) ON CONFLICT(volume,id) DO UPDATE SET
-            due_ns=min(due_ns,excluded.due_ns),recursive=max(coalesce(recursive,1),excluded.recursive)''',
-            ((self.volume,identity,due_ns,int(recursive)) for identity,due_ns,recursive in refreshes))
+        # Bounded batches: admission reserves 16 pages a row, so one write of a large
+        # backlog (Big Mac: 28 k rows, about 1.8 GB) is refused beside a 10 GB cap.
+        for first in range(0,len(refreshes),DIRTY_BATCH):
+            with self.write(rows=len(refreshes[first:first+DIRTY_BATCH])):self.db.executemany('''INSERT INTO dirty VALUES(?,?,?,?)
+                ON CONFLICT(volume,id) DO UPDATE SET due_ns=min(due_ns,excluded.due_ns),recursive=max(coalesce(recursive,1),excluded.recursive)''',
+                ((self.volume,identity,due_ns,int(recursive)) for identity,due_ns,recursive in refreshes[first:first+DIRTY_BATCH]))
 
     def plain_links(self):
         """The ids of folders of the published map that hold a hard-linked file as a plain file,
@@ -597,8 +601,10 @@ class MapStore:
     def forget_deferred(self,identities):
         """Drop deferred refreshes of folders no longer in the map: nothing can re-list
         them, and the listing that removed them already covers their changes."""
-        with self.write(rows=len(identities)):
-            self.db.executemany('DELETE FROM dirty WHERE volume=? AND id=?',((self.volume,identity) for identity in identities))
+        for first in range(0,len(identities),DIRTY_BATCH):
+            part=identities[first:first+DIRTY_BATCH]
+            with self.write(rows=len(part)):
+                self.db.executemany('DELETE FROM dirty WHERE volume=? AND id=?',((self.volume,identity) for identity in part))
 
     def directory(self,node):
         identity=inode_key(node.id)
@@ -1011,16 +1017,18 @@ class MapStore:
             # Parents must see the committed staged totals of their children.
             self.flush()
 
-    def _publication_changes(self):
-        """The publication's own map statement: the deferred refreshes its listings
-        fulfil, counted. Map rows reach the base through the bounded merge."""
-        # Only a committed listing fulfills a deferred refresh. Probe its
-        # primary key from the small dirty set, never scan the complete map.
-        where='''volume=? AND EXISTS(SELECT 1 FROM listings l
-            WHERE l.generation=? AND l.volume=? AND l.id=inode_key(dirty.id))'''
-        args=(self.volume,self.generation,self.vid)
-        count,payload=self._row_size('dirty',where,args)
-        return [(f'DELETE FROM dirty WHERE {where}',args,count,payload,'dirty')]
+    def _forget_fulfilled(self,generation):
+        """Delete the deferred refreshes `generation`'s committed listings fulfilled, in
+        bounded batches after its publication: inside it, a run that drained 12 k of
+        Big Mac's backlog declared a 9.95 GB peak beside the 10 GB cap. A row a crash
+        leaves only costs one more re-list. Probes the small dirty set, never the map."""
+        while True:
+            ids=[r[0] for r in self.db.execute('''SELECT id FROM dirty WHERE volume=? AND EXISTS(SELECT 1 FROM listings l
+                WHERE l.generation=? AND l.volume=? AND l.id=inode_key(dirty.id)) LIMIT ?''',
+                (self.volume,generation,self.vid,DIRTY_BATCH))]
+            if not ids:return
+            if self.run_context['stage']!='deferrals':self.phase('deferrals')
+            self.forget_deferred(ids)
 
     def place_sharing(self,reader):
         """A paced walk's sharing piece: it needs every extent in one process."""
@@ -1064,7 +1072,6 @@ class MapStore:
             # No extents provider (Linux): each inode counts once per folder; no residual is claimed.
             result={'valid':True,'physical':total,'not_placed':None,'tolerance':None,'status':'observed' if complete else 'partial'}
             gaps=set(gaps)|{'physical_residual_not_computed'}
-        plan=self._publication_changes()
         metric='physical' if result['valid'] else 'listed'
         where='generation=? AND volume=?'
         params=(self.generation,self.vid)
@@ -1082,8 +1089,8 @@ class MapStore:
         # Reserve two writes per candidate and a terminal point per old identity.
         # Hierarchy: at most old+new identities, plus one epoch. An update also marks
         # its staged generation as the published delta.
-        rows=sum(p[2] for p in plan)+2*point_candidates+hierarchy_candidates+2*tracked+5+(self.base_gen is not None)
-        payload=3*payload+3*tracked_payload+sum(p[3] for p in plan)
+        rows=2*point_candidates+hierarchy_candidates+2*tracked+5+(self.base_gen is not None)
+        payload=3*payload+3*tracked_payload
         payload+=(candidates+tracked)*(len(self.volume.encode())+64)  # volume and hierarchy version
         payload+=self.db.execute('''SELECT coalesce(sum(length(CAST(p.label AS BLOB))),0)
             FROM tracked t JOIN points p ON p.volume=t.volume AND p.id=t.id
@@ -1094,7 +1101,7 @@ class MapStore:
         no_progress=0 if full or event_progress is True else old['no_progress']+1 if event_progress is False else old['no_progress']
         # Counts only, with fixed labels: what a refused publication declared, so a
         # run record can say which part was too large.
-        receipt=dict(plan={label:[count,size] for _,_,count,size,label in plan},changed=len(self.changed),
+        receipt=dict(changed=len(self.changed),
                      point_candidates=point_candidates,hierarchy_candidates=hierarchy_candidates,
                      tracked=tracked,rows=rows,payload_bytes=payload)
         self.phase('publication')
@@ -1102,10 +1109,11 @@ class MapStore:
                        freelist_pages=self.db.execute('PRAGMA freelist_count').fetchone()[0])
         try:
             with self.write(rows=rows,payload_bytes=payload):
-                for sql,args,_,_,_ in plan:self.db.execute(sql,args)
                 # An update publishes its staged generation as a delta over the base.
                 published,delta=(self.generation,None) if self.base_gen is None else (self.base_gen,self.generation)
-                now=time.time_ns()
+                # A volume's observation times never repeat: points and hierarchy epochs
+                # are keyed by them, and an update and a walk can publish in one run.
+                now=max(time.time_ns(),(old['observed_ns'] or 0)+1)
                 self._points(published,now,result['valid'],full,delta)
                 save_hierarchy(self.db,published,self.volume,now,volume_key=self.vid,delta=delta)
                 self.db.execute('''UPDATE volumes SET label=?,mount=?,generation=?,observed_ns=?,full_ns=?,volume_used=?,capacity=?,free=?,available=?,
@@ -1122,6 +1130,8 @@ class MapStore:
         except BudgetExceeded as exc:
             exc.publication=dict(receipt,shortfall_bytes=exc.shortfall_bytes);raise
         self.generation=published;self.base_gen=None;self.walk=None
+        try:self._forget_fulfilled(delta if delta is not None else published)
+        except BudgetExceeded:pass  # The rows stay, and the next publication deletes them.
         if delta is not None:
             try:self.merge_delta(self.volume,stop)
             except MergePending:raise

@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from machine_audit.budget import Budget
+from machine_audit.budget import Budget, BudgetExceeded
 from machine_audit.scanner import pace
 from machine_audit.scanner.events import Replay
 from machine_audit.scanner.native import Volume
@@ -51,7 +51,7 @@ class PacedWalkTests(unittest.TestCase):
                              100 * 10**9, 50 * 10**9, 50 * 10**9, 40 * 10**9)
         self.now = 1_000 * HOUR
 
-    def scan(self, data, *, force=False, full=False, events=None, ticks=None, floor=40 * SECOND, fs=None, clock=None):
+    def scan(self, data, *, force=False, full=False, events=None, ticks=None, floor=40 * SECOND, fs=None, clock=None, limit=None):
         """One scanner run. Each read of the allowance clock costs a second, unless
         `clock` gives the CPU spent instead."""
         data.mkdir(exist_ok=True)
@@ -66,7 +66,7 @@ class PacedWalkTests(unittest.TestCase):
              patch('machine_audit.scanner.runner.IOKit'), \
              patch('machine_audit.scanner.runner.FSEvents', return_value=events), \
              patch('machine_audit.scanner.runner.os.nice'), \
-             patch('machine_audit.scanner.runner.Budget', lambda root: Budget(root, free_margin_bytes=0)), \
+             patch('machine_audit.scanner.runner.Budget', lambda root: Budget(root, free_margin_bytes=0, **({'limit_bytes': limit} if limit else {}))), \
              patch('machine_audit.scanner.runner.Policy', return_value=Policy(home=str(self.base), homes=[])), \
              patch('machine_audit.scanner.runner.time.time_ns', return_value=self.now), \
              patch.object(pace.Allowance, 'clock', staticmethod(clock)), \
@@ -409,6 +409,59 @@ class PacedWalkTests(unittest.TestCase):
                         AND f.generation IN (v.generation,v.delta_generation) WHERE v.id='w' AND f.parent=?''', (inner,))}
                 self.assertEqual(waiting, 0, f'run {run + 1}: the quiet volume deferred its only change')
                 self.assertIn(f'new{run}', labels, f'run {run + 1}: the quiet volume re-listed nothing')
+
+    def test_an_update_beside_a_staged_walk_is_admitted_near_the_stores_real_size(self):
+        # Big Mac, Nov 12 5:56 AM PT: re-queuing 28 k deferred folders in one write
+        # reserved 16 pages a row, 1.8 GB beside 7.7 GB managed, and the cap refused the
+        # walking volume's update; it then had no update until its walk would publish.
+        for i in range(1200):(self.tree / 'many' / str(i)).mkdir(parents=True)
+        data = self.updating_store()
+        with self.db(data) as db:
+            db.execute('UPDATE volumes SET full_ns=?', (self.now - 8 * 24 * HOUR,))
+        self.scan(data)  # The walk starts and pauses: its staged generation stands.
+        self.assertIsNotNone(self.walk_row(data))
+        store = MapStore(data / 'scanner.sqlite', Budget(data, free_margin_bytes=0))
+        store.volume = 'v'
+        store.defer_all([(str((self.tree / 'many' / str(i)).stat().st_ino), self.now, False) for i in range(1200)])
+        # A store larger than the write declares, as Big Mac's 4 GB one is: admission
+        # then reserves the declared pages, not the whole file.
+        with store.write(rows=2, payload_bytes=96 * 1024**2):
+            store.db.execute('CREATE TABLE padding(value BLOB)')
+            store.db.execute('INSERT INTO padding VALUES(zeroblob(?))', (96 * 1024**2,))
+        store.close()
+        limit = Budget(data).usage()['bytes'] + 40 * 1024**2  # Room for counted writes, not a 79 MB one.
+        # A share that covers none of them: every deferred folder waits again.
+        result = self.scan(data, events=self.events([], 90), floor=10**6, limit=limit)
+        update = result['volumes'][0]
+        self.assertEqual((update['action'], update['status']), ('update', 'observed'))
+        self.assertIn('update_deferred', update['gaps'])
+        with self.db(data) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM dirty WHERE volume='v'").fetchone()[0], 1200)
+
+    def test_a_refused_walk_write_keeps_the_checkpoint_and_resumes(self):
+        # A walk dropped on a refusal restarts days of walking (criteria 1 and 2).
+        expected = self.reference()
+        data = self.base / 'refused'
+        original = MapStore.checkpoint
+        calls = []
+        def checkpoint(store, *args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:  # The second checkpoint is refused.
+                refusal = BudgetExceeded('sqlite_checkpoint_headroom', 1)
+                refusal.retry_bytes = 10**12  # Storage is back under the level by the next run.
+                raise refusal
+            return original(store, *args, **kwargs)
+        with patch.object(MapStore, 'checkpoint', checkpoint):
+            while len(calls) < 2:result = self.scan(data, floor=12 * SECOND)
+        self.assertEqual(result['volumes'][0]['walk']['state'], 'failed')
+        walk = self.walk_row(data)
+        self.assertIsNotNone(walk, 'the refused walk was dropped')
+        for run in range(30):
+            self.scan(data, floor=12 * SECOND)
+            after = self.walk_row(data)
+            if after is None:break
+            self.assertEqual(after['generation'], walk['generation'], 'the walk restarted')
+        self.assertEqual(self.published_map(data), expected)
 
     def test_a_name_withheld_folder_resumes_by_inode_with_no_name_or_path_stored(self):
         private = self.tree / 'Album.musiclibrary'

@@ -144,7 +144,9 @@ def relist(store,walker,policy,volume,now,changes,pace=None):
         recursive=path in recursive_roots
         if not fits(previous['id'],recursive,path):
             # Its share cannot cover it: a later run re-lists it first.
-            later.append((previous['id'],now,recursive));continue
+            # One already queued keeps its row; only a new deferral is written.
+            if path not in due_at:later.append((previous['id'],now,recursive))
+            walker.gaps.add('update_deferred');continue
         # Open it before anything is cleared: a walk lists nothing when the open is
         # denied, and a cleared, unwalked directory orphans whatever is staged beneath.
         if walker.directory_identity(path) is None:
@@ -179,11 +181,11 @@ def relist(store,walker,policy,volume,now,changes,pace=None):
         path=previous and (previous['path'] or walker.path_of(folder))
         if not path or path in chosen:continue
         if not fits(folder,False,path):
-            later.append((folder,now,False));continue
+            later.append((folder,now,False));walker.gaps.add('update_deferred');continue
         if walker.directory_identity(path) is None:
             store.defer(previous['id'],now+3600*10**9,False);continue
         if not walker.walk(path,live_parent(store,walker,volume,path,previous['parent']),previous['kind']=='private',recursive=False):complete=False
-    if later:store.defer_all(later);walker.gaps.add('update_deferred')
+    if later:store.defer_all(later)
     return complete
 
 
@@ -244,7 +246,8 @@ def paced_walk(store,events,fs,policy,grain,volume,trigger,event_uuid,pace,*,lea
                 later=0
                 if pace.clock()-mark>=CHECKPOINT_NS:save(pending=pending());mark=pace.clock()
                 return 'go'
-            walker.walk(resume=None if fresh else store.pending(),pace=ticker)
+            # A walk refused before its first checkpoint starts again from its root.
+            walker.walk(resume=None if fresh or walk['pending'] is None else store.pending(),pace=ticker)
             if walker.paused:return state()
             if not store.walk_root_listed():
                 # The root could not be listed: nothing was walked, nothing is kept.
@@ -269,10 +272,8 @@ def paced_walk(store,events,fs,policy,grain,volume,trigger,event_uuid,pace,*,lea
                             complete=walker.sharing_complete,shared=True)
         return dict(result,state='published',phase='published',result=dict(gaps=sorted(walker.gaps)))
     except BudgetExceeded as exc:
-        # The checkpoint and its rows stand. A refusal for want of managed storage
-        # drops the walk: its staged rows are what the cap lacks. The recovery rules
-        # then decide the next attempt, as for any refused full walk.
-        if exc.code in CAPACITY_REFUSALS:store.drop_walk(volume.id)
+        # The walk pauses: its checkpoint and the rows it describes stand, and the next
+        # run retries the refused write. Dropping it would restart days of walking.
         blocked=f'budget_blocked_{exc.code}'
         store.mark_failed(blocked,end_run=False,retry_bytes=exc.retry_bytes)
         return dict(state='failed',failure=blocked,listed=walker.entries if walker else 0,
@@ -327,7 +328,8 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
             # Updates go smallest first by their last run's entries, each with an even
             # share of what is left, so one volume's churn cannot starve the others.
             # Walks go one volume at a time: one under way first, then in that order.
-            last=store.last_entries()
+            outcomes=store.last_outcomes()
+            last={volume_id:outcome.get('entries') or 0 for volume_id,outcome in outcomes.items()}
             listed_order={v.id:i for i,v in enumerate(volumes)}  # Results are reported in volume order.
             volumes=sorted(volumes,key=lambda v:last.get(v.id,0))
             walking=[]  # (volume, trigger, event uuid): paced walk work, after every update
@@ -383,18 +385,22 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                 # to its retry level, or, when the refusal could not say how much
                 # it lacked, for good; only an operator's forced scan skips that.
                 capacity=old and old['status'].removeprefix('budget_blocked_') in CAPACITY_REFUSALS
+                retry=old['budget_retry_bytes'] if capacity else None
+                gate=capacity and failed_full and not force and (retry is None or not budget.retry_level_reached(retry))
                 if capacity and action!='wait':
-                    retry=old['budget_retry_bytes']
-                    if failed_full and not force and (retry is None or not budget.retry_level_reached(retry)):
-                        action,trigger='wait','budget_retry_gate'
-                    else:action,trigger='full','budget_recovery'
+                    action,trigger=('wait','budget_retry_gate') if gate else ('full','budget_recovery')
                 walk=walks.get(volume.id)
-                if action=='wait' and not walk:
+                # A walk the cap refused keeps its checkpoint and waits at the same gate;
+                # one that only paused at its allowance goes on, or recovery could not finish.
+                refused=((outcomes.get(volume.id) or {}).get('walk') or {}).get('state') in ('failed','gated')
+                if walk and gate and refused and action!='wait':action,trigger='wait','budget_retry_gate'
+                if action=='wait' and (not walk or (gate and refused)):
                     store.phase('complete',action=action,trigger=trigger)
                     status=old['status'] if capacity or trigger=='failed_full_retry_cooldown' else 'current'
                     if capacity:  # Blocked, not up to date, whichever wait held it.
                         root_failed=True;blocked=status
-                    results.append({'volume_id':volume.id,'status':status,'action':action,'trigger':trigger})
+                    results.append({'volume_id':volume.id,'status':status,'action':action,'trigger':trigger,
+                                    **({'walk':{'state':'gated'}} if walk else {})})
                     continue
                 # A full walk is paced: it runs after every volume's update, in this
                 # run's allowance, one volume's walk at a time. Until it
@@ -402,12 +408,15 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                 # the hourly update keeps the published map current whenever its events
                 # can (a weekly or requested walk). Only the walk starting now skips it.
                 walk_trigger=walk['trigger'] if walk else None
+                if walk and trigger=='budget_recovery':walk_trigger=trigger  # Reported as the recovery it is.
                 if action=='full':
                     if not walk:walk_trigger=trigger
                     starts_now=not walk and not walk_ahead
                     walk_ahead=True
+                    # A refused update's recovery is the walk under way: its volume
+                    # keeps the hourly update meanwhile.
                     update_due=(not force and not starts_now and has_root and old['bookmark'] is not None
-                                and trigger in ('weekly_full','requested_full')
+                                and trigger in ('weekly_full','requested_full','budget_recovery')
                                 and (old['observed_ns'] is None or now-old['observed_ns']>=3600*10**9))
                     action,trigger=('update','hourly_update') if update_due else ('wait',trigger)
                 store.phase('events',action=action,trigger=trigger)
