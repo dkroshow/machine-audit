@@ -453,6 +453,23 @@ class MapStore:
         self.flush()
         return self.db.execute(f'SELECT count(*) FROM {table} WHERE generation=? AND volume=?',(self.generation,self.vid)).fetchone()[0]
 
+    def mapped_entries(self,identity,recursive):
+        """How many entries the map last listed in a folder, or in its whole subtree:
+        what re-listing it will cost."""
+        keys=self._subtree(inode_key(identity)) if recursive else {inode_key(identity)}
+        total=0;keys=list(keys)
+        for first in range(0,len(keys),500):
+            part=keys[first:first+500];marks=','.join('?'*len(part))
+            total+=sum(row[0] or 0 for row in self.db.execute(f'''SELECT count FROM listings WHERE generation=?
+                AND volume=? AND id IN ({marks})''',(self.base_gen,self.vid,*part)))
+        return total
+
+    def last_entries(self):
+        """Each volume's entries in the last run that recorded them: the update order's key."""
+        row=self.db.execute('SELECT volumes FROM runs WHERE id!=? AND volumes IS NOT NULL ORDER BY started_ns DESC LIMIT 1',
+                            (self.run,)).fetchone()
+        return {v['volume_id']:v.get('entries') or 0 for v in json.loads(row[0])} if row else {}
+
     def large_folders(self,entries):
         """Folders the volume's published map lists with more than `entries` direct
         entries, by inode, with their count: the walk's estimate of their cost. One read

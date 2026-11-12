@@ -275,25 +275,25 @@ class RootPublicationTests(unittest.TestCase):
         with sqlite3.connect(self.data/'scanner.sqlite') as db:
             start = db.execute('SELECT max(observed_ns) FROM volumes').fetchone()[0]
         original = MapStore.prune_generations
-        def refuse_on(call):
-            calls = []
+        def refuse_on(volume_id):
+            # Refuse the first prune made for that volume, whatever order the run
+            # takes its volumes in (smallest update first, walks after updates).
+            refused = []
             def prune(store, full=True, pace=None):
-                calls.append(full)
-                if len(calls)==call:
-                    refused = BudgetExceeded('sqlite_checkpoint_headroom', 1)
-                    refused.retry_bytes = 1
-                    raise refused
+                if store.volume == volume_id and not refused:
+                    refused.append(True)
+                    refusal = BudgetExceeded('sqlite_checkpoint_headroom', 1)
+                    refusal.retry_bytes = 1
+                    raise refusal
                 return original(store, full, pace)
             return prune
         def stored():
             with sqlite3.connect(self.data/'scanner.sqlite') as db:
                 return dict((r[0], r[1:]) for r in db.execute('SELECT id,status,budget_retry_bytes FROM volumes'))
         blocked = ('budget_blocked_sqlite_checkpoint_headroom', 1)
-        # Updates run before paced walks: in the second run the recovery walk of 'w'
-        # prunes after 'v' prepares its update.
-        for hours, order, call, expected in ((1, [self.volume, second], 2, {'v':('observed', None), 'w':blocked}),
-                                             (2, [second, self.volume], 2, {'v':('observed', None), 'w':blocked})):
-            with patch.object(MapStore, 'prune_generations', refuse_on(call)), \
+        for hours, order, expected in ((1, [self.volume, second], {'v':('observed', None), 'w':blocked}),
+                                       (2, [second, self.volume], {'v':('observed', None), 'w':blocked})):
+            with patch.object(MapStore, 'prune_generations', refuse_on('w')), \
                  patch('machine_audit.scanner.runner.time.time_ns', return_value=start+hours*3600*10**9):
                 result, status = self.scan(order, events=events, full=False)
             self.assertEqual(stored(), expected)

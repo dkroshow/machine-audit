@@ -538,9 +538,17 @@ Deferred name-withheld folders are found the same way. A failed attempt (an exce
 the scanner catches) does not resume: its checkpoint is dropped and the retry rules
 decide the next walk. So does a change of the volume's event UUID or name access.
 
-**Volumes walk one at a time,** in volume order. Every volume keeps its hourly update
-while its walk is under way or queued behind another's; only the walk starting in a run
-skips that run's update.
+**Each volume's update gets its share.** Updates go smallest first, by their last
+run's entries, and each may spend what is left of the allowance divided by the volumes
+still to update, so one volume's churn cannot starve the others and what a volume leaves
+unused flows to the next. Before re-listing a folder, or a subtree when the re-list is
+recursive, an update compares its size in the map (about 200 µs an entry) with what is
+left of its share; one that does not fit is deferred, never longer than a day, since a
+single listing cannot pause part-way.
+
+**Volumes walk one at a time:** a walk under way goes on first. Every volume keeps its
+hourly update while its walk is under way or queued behind another's; only the walk
+starting in a run skips that run's update.
 
 **Phases.** Listing pauses between folders, so a folder is the unit of work. A folder the
 previous map lists with more than 20,000 entries is listed only in a run whose remaining

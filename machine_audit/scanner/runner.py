@@ -20,7 +20,7 @@ from .native import MacFilesystem
 from .events import FSEvents, next_decision
 from .errors import ScanError
 from .pace import (LARGE_FOLDER_ENTRIES, LIST_NS_PER_ENTRY, PIECE_WAIT_NS, SHARING_NS_PER_HOLDER,
-                   TOTALS_NS_PER_FOLDER, allowance)
+                   TOTALS_NS_PER_FOLDER, Share, allowance)
 from .policy import Policy
 from .store import MapStore, MergePending
 from .walker import Walker, shown_path
@@ -70,7 +70,13 @@ def live_parent(store,walker,volume,path,stored):
 
 def relist(store,walker,policy,volume,now,changes,pace=None):
     """Re-list changed folders, given as (absolute path, recursive), plus deferred ones now due.
-    Folders left when `pace` is spent are deferred to the next run."""
+    `pace` is the volume's share of the run: a folder, or a recursive subtree, whose size
+    in the map exceeds what is left of it is deferred to a later run, never more than
+    a day; a single listing cannot pause part-way."""
+    def fits(identity,recursive,path):
+        if pace is None:return True
+        if path in due_at and now-due_at[path]>=PIECE_WAIT_NS:return True
+        return pace.covers(store.mapped_entries(identity,recursive)*LIST_NS_PER_ENTRY)
     roots_to_update={}
     recursive_roots=set()
     due_paths={}
@@ -127,8 +133,8 @@ def relist(store,walker,policy,volume,now,changes,pace=None):
         chosen.append(path)
         previous=roots_to_update[path]
         recursive=path in recursive_roots
-        if pace is not None and pace.exhausted():
-            # The hour's allowance is spent: the next run re-lists it first.
+        if not fits(previous['id'],recursive,path):
+            # Its share cannot cover it: a later run re-lists it first.
             later.append((previous['id'],now,recursive));continue
         # Open it before anything is cleared: a walk lists nothing when the open is
         # denied, and a cleared, unwalked directory orphans whatever is staged beneath.
@@ -160,11 +166,11 @@ def relist(store,walker,policy,volume,now,changes,pace=None):
     # file counts once.
     # They are paced like any listing: the rest are deferred to the next run.
     for folder in store.plain_links():
-        if pace is not None and pace.exhausted():
-            later.append((folder,now,False));continue
         previous=store.known_directory(folder)
         path=previous and (previous['path'] or walker.path_of(folder))
         if not path or path in chosen:continue
+        if not fits(folder,False,path):
+            later.append((folder,now,False));continue
         if walker.directory_identity(path) is None:
             store.defer(previous['id'],now+3600*10**9,False);continue
         if not walker.walk(path,live_parent(store,walker,volume,path,previous['parent']),previous['kind']=='private',recursive=False):complete=False
@@ -309,9 +315,15 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     raise ValueError('only_discovered_volume_roots_are_allowed')
                 volumes=selected
             walks=store.walks()
+            # Updates go smallest first by their last run's entries, each with an even
+            # share of what is left, so one volume's churn cannot starve the others.
+            # Walks go one volume at a time: one under way first, then in that order.
+            last=store.last_entries()
+            listed_order={v.id:i for i,v in enumerate(volumes)}  # Results are reported in volume order.
+            volumes=sorted(volumes,key=lambda v:last.get(v.id,0))
             walking=[]  # (volume, trigger, event uuid): paced walk work, after every update
             walk_ahead=bool(walks)  # A walk under way, or queued earlier in this run.
-            for volume in volumes:
+            for position,volume in enumerate(volumes):
                 if volume.id in pending:
                     # Its update is published; it is not scanned until its delta merges.
                     # Its map stands. A merge the allowance paused is not a failure.
@@ -376,7 +388,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     results.append({'volume_id':volume.id,'status':status,'action':action,'trigger':trigger})
                     continue
                 # A full walk is paced: it runs after every volume's update, in this
-                # run's allowance, one volume's walk at a time in volume order. Until it
+                # run's allowance, one volume's walk at a time. Until it
                 # publishes, whether under way or queued behind another volume's walk,
                 # the hourly update keeps the published map current whenever its events
                 # can (a weekly or requested walk). Only the walk starting now skips it.
@@ -427,9 +439,10 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     store.prepare(volume,full=False,lean=not full_disk_access)
                     walker=Walker(volume,policy,store,fs,grain)
                     store.phase('walk')
+                    share=Share(pace,len(volumes)-position)
                     complete=relist(store,walker,policy,volume,now,
                            ((os.path.normpath(os.path.join(volume.mount,relative.lstrip('/'))),recursive)
-                            for relative,recursive in replay.paths.items()),pace)
+                            for relative,recursive in replay.paths.items()),share)
                     if not complete:
                         root_failed=True
                         processed+=walker.entries
@@ -443,7 +456,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     reader=(lambda inode,device=volume.device:fs.extents(device,int(inode))) if volume.fs=='apfs' else None
                     store.finish_volume(after,reader,walker.gaps,full=False,lean=not full_disk_access,used_before=volume.used,
                         bookmark=bookmark,event_uuid=event_uuid,complete=walker.sharing_complete and not replay.interrupted,
-                        event_progress=None if not replay.paths else bookmark!=old['bookmark'],stop=pace.exhausted)
+                        event_progress=None if not replay.paths else bookmark!=old['bookmark'],stop=share.exhausted)
                 except BudgetExceeded as exc:
                     # Only this attempt is dropped: its pending writes now, its
                     # staged generation at the next preparation. Other volumes go on.
@@ -468,6 +481,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                 store.progress(processed)
                 results.append({'volume_id':volume.id,'status':'observed','action':action,'trigger':trigger,'entries':walker.entries,
                                 'gaps':sorted(walker.gaps)})
+            walking.sort(key=lambda item:item[0].id not in walks)
             for volume,trigger,event_uuid in walking:
                 outcome=paced_walk(store,events,fs,policy,grain,volume,trigger,event_uuid,pace,lean=not full_disk_access)
                 store.walk=None  # Ended for this run; a later failure is not this walk's.
@@ -497,6 +511,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     store.db.executemany('UPDATE volumes SET mounted=0 WHERE id=?',((identity,) for identity in missing))
             run_status=('partial' if published else blocked or 'root_unreadable') if root_failed else 'complete'
             store.phase('complete')
+            results.sort(key=lambda r:listed_order[r['volume_id']])
             store.record_volumes(results)
             store.progress(processed,run_status)
             return {'status':run_status if root_failed else 'observed','volumes':results,'entries':processed,**store.run_context}

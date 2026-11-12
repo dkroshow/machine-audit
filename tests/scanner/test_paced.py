@@ -359,6 +359,57 @@ class PacedWalkTests(unittest.TestCase):
         self.assertIsNone(self.walk_row(data), 'the walk never finished')
         self.assertEqual(self.published_map(data), expected)
 
+    def test_an_update_defers_a_folder_its_share_cannot_cover(self):
+        # Big Mac, Nov 12 12:15 and 1:22 AM PT: the startup volume's update overran its
+        # allowance every run (231.3 s of 126.9); a due unit was listed whatever its size.
+        big = self.tree / 'big';big.mkdir()
+        for i in range(40):(big / str(i)).write_bytes(b'b')
+        data = self.updating_store()
+        small = [self.tree / 'folder0' / 'sub0', self.tree / 'folder1' / 'sub1']
+        spent, counting = self.listing_clock(SECOND)
+        def listed_ns(folder):
+            with self.db(data) as db:
+                # The published map: its base, overlaid by a delta still merging.
+                return db.execute('''SELECT max(l.listed_ns) FROM listings l JOIN volumes v ON l.volume=v.key
+                    AND l.generation IN (v.generation,v.delta_generation) WHERE l.id=?''', (folder.stat().st_ino,)).fetchone()[0]
+        with counting, patch('machine_audit.scanner.runner.LIST_NS_PER_ENTRY', SECOND):
+            before = spent[0];big_before = listed_ns(big)
+            result = self.scan(data, events=self.events([big] + small, 70), floor=25 * SECOND, clock=lambda: spent[0])
+            self.assertIn('update_deferred', result['volumes'][0]['gaps'])
+            self.assertEqual(listed_ns(big), big_before, 'a 40 s folder was listed in a 25 s share')
+            self.assertLessEqual(spent[0] - before, 25 * SECOND)
+            self.assertTrue(all(listed_ns(folder) > big_before for folder in small))
+            # Never more than a day: then it is listed even though no share covers it.
+            with self.db(data) as db:
+                db.execute('UPDATE dirty SET due_ns=due_ns-?', (25 * HOUR,))
+            self.scan(data, events=self.events([], 71), floor=25 * SECOND, clock=lambda: spent[0])
+            self.assertGreater(listed_ns(big), big_before)
+
+    def test_a_churning_volume_does_not_starve_another_volumes_update(self):
+        # Big Mac, Nov 12: the startup volume's churn took every run's allowance and the
+        # other volumes' updates re-listed nothing.
+        other = self.base / 'other';(other / 'inner').mkdir(parents=True);(other / 'inner' / 'f').write_bytes(b'o')
+        second = replace(self.volume, id='w', label='Second', mount=str(other), device=-2)
+        filesystem = SimpleNamespace(volumes=lambda: [self.volume, second], sharing=lambda *args: None)
+        data = self.base / 'churn'
+        self.assertEqual(self.scan(data, force=True, fs=filesystem)['status'], 'observed')
+        churning = ['/' + str(p.relative_to(self.tree)) for p in [self.tree / f'folder{a}' / f'sub{b}' for a in range(5) for b in range(2)]]
+        def events(up_to):
+            return SimpleNamespace(uuid=lambda device: 'events', current_id=lambda: up_to,
+                replay=lambda device, since: Replay(paths=dict.fromkeys(['/inner'] if device == -2 else churning, False), up_to=up_to))
+        spent, counting = self.listing_clock(2 * SECOND)
+        inner = (other / 'inner').stat().st_ino
+        with counting, patch('machine_audit.scanner.runner.LIST_NS_PER_ENTRY', 2 * SECOND):
+            for run in range(3):
+                (other / 'inner' / f'new{run}').write_bytes(b'n')
+                self.scan(data, events=events(80 + run), fs=filesystem, floor=25 * SECOND, clock=lambda: spent[0])
+                with self.db(data) as db:
+                    waiting = db.execute("SELECT count(*) FROM dirty WHERE volume='w'").fetchone()[0]
+                    labels = {r[0] for r in db.execute('''SELECT f.label FROM files f JOIN volumes v ON f.volume=v.key
+                        AND f.generation IN (v.generation,v.delta_generation) WHERE v.id='w' AND f.parent=?''', (inner,))}
+                self.assertEqual(waiting, 0, f'run {run + 1}: the quiet volume deferred its only change')
+                self.assertIn(f'new{run}', labels, f'run {run + 1}: the quiet volume re-listed nothing')
+
     def test_a_name_withheld_folder_resumes_by_inode_with_no_name_or_path_stored(self):
         private = self.tree / 'Album.musiclibrary'
         for b in range(8):

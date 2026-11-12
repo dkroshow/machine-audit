@@ -99,6 +99,25 @@ class Allowance:
         return limit is None or limit-self.spent()>=cost_ns
 
 
+class Share:
+    """The part of a run's allowance one volume's update may spend: what is left,
+    divided among the volumes still to update, so one volume's churn cannot starve
+    the others and what a volume leaves unused flows to the next."""
+    def __init__(self, allowance, volumes_left):
+        self.allowance = allowance
+        self.start = allowance.spent()
+        self.limit = None if allowance.limit is None else max(0, allowance.limit - self.start) // max(1, volumes_left)
+
+    def remaining(self):
+        return None if self.limit is None else self.limit - (self.allowance.spent() - self.start)
+
+    def exhausted(self):
+        return self.limit is not None and self.remaining() <= 0
+
+    def covers(self, cost_ns):
+        return self.limit is None or self.remaining() >= cost_ns
+
+
 def allowance(root, *, force, now_ns=None):
     if force:return Allowance(None)
     room=room_ns(root,now_ns or time.time_ns())
