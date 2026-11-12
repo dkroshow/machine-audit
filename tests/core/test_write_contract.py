@@ -7,7 +7,7 @@ import unittest
 
 from machine_audit.budget import Budget
 from machine_audit.scanner.native import Volume
-from machine_audit.scanner.store import MapStore
+from machine_audit.scanner.store import MapStore, WRITE_ROWS
 from machine_audit.scanner.walker import Node
 from machine_audit.store import Store
 from test_scale import process_records
@@ -69,8 +69,8 @@ class WriteContractTests(unittest.TestCase):
                 store.directory(Node(str(n+1),None if n==0 else '1',str(n),'directory',1,1,'observed',None,0))
             for n in range(4096):store.holder(n+10000,'1',n+10000,1,None,False)
             store.finish_volume(volume, None,[],full=True,lean=True)
-            self.assertIn(8192,[r[0] for r in self.budget.samples])
-            self.assertIn(4096,[r[0] for r in self.budget.samples])
+            # The largest batches a full walk writes are its WRITE_ROWS flushes and totals.
+            self.assertEqual(max(r[0] for r in self.budget.samples),WRITE_ROWS)
             self.assert_bounds()
         finally:store.close()
 

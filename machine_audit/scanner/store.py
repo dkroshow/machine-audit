@@ -112,6 +112,10 @@ REMOVED={'nodes':'removed','files':'removed','holders':'removed','listings':'rem
 # ...and one that hides only the base's rows, which the delta restates in full.
 RESET={'files':'reset_dirs','holders':'reset_dirs','terms':'reset_groups'}
 MERGE_ROWS=4096
+# Rows a staging flush or a totals batch writes at most. Admission reserves 16 pages a
+# row, and at publication Big Mac's 4.8 GB store leaves about 1 GB under the 10 GB cap:
+# 8,192 rows reserved 0.54 GB there, 4,096 rows 0.27 GB.
+WRITE_ROWS=4096
 DIRTY_BATCH=1024
 NODE_INSERT='INSERT OR REPLACE INTO nodes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)'
 # Re-read at most this many streams' extents in one hourly update.
@@ -531,7 +535,7 @@ class MapStore:
     def _queue(self,query,args):
         self.buffer.append((query,args))
         self.buffer_bytes+=sum(len(x.encode()) if isinstance(x,str) else 8 for x in args)
-        if len(self.buffer)>=8192 or self.buffer_bytes>=2*1024**2:self.flush()
+        if len(self.buffer)>=WRITE_ROWS or self.buffer_bytes>=2*1024**2:self.flush()
 
     def flush(self):
         if self.buffer:self._flush()
@@ -966,10 +970,10 @@ class MapStore:
                 if not remaining[parent]:ready.append(parent)
         if visited!=len(keys):raise ScanError('cyclic_directory_ancestry')
         self.progress()
-        for first in range(0,len(keys),8192):
-            with self.write(rows=min(8192,len(keys)-first)):
+        for first in range(0,len(keys),WRITE_ROWS):
+            with self.write(rows=min(WRITE_ROWS,len(keys)-first)):
                 self.db.executemany('UPDATE nodes SET listed=?,physical=?,frees=? WHERE generation=? AND volume=? AND id=?',
-                    ((listed[i],physical[i],frees[i],self.generation,self.vid,keys[i]) for i in range(first,min(first+8192,len(keys)))))
+                    ((listed[i],physical[i],frees[i],self.generation,self.vid,keys[i]) for i in range(first,min(first+WRITE_ROWS,len(keys)))))
             self.progress()
 
     def _aggregate(self,affected):

@@ -463,6 +463,20 @@ class PacedWalkTests(unittest.TestCase):
             self.assertEqual(after['generation'], walk['generation'], 'the walk restarted')
         self.assertEqual(self.published_map(data), expected)
 
+    def test_a_walks_writes_declare_at_most_4096_rows(self):
+        # At publication Big Mac's store leaves about 1 GB under the 10 GB cap; a write
+        # of 8,192 rows reserved 0.54 GB of it, at 16 pages a row.
+        for i in range(9000):(self.tree / 'folder0' / 'sub0' / f'many{i}').write_bytes(b'')
+        for i in range(4500):(self.tree / 'deep' / str(i)).mkdir(parents=True)
+        declared = []
+        original = Budget.sqlite_write
+        def counted(budget, *args, rows=None, **kwargs):
+            declared.append(rows or 0)
+            return original(budget, *args, rows=rows, **kwargs)
+        with patch.object(Budget, 'sqlite_write', counted):
+            self.assertEqual(self.scan(self.base / 'rows', force=True)['status'], 'observed')
+        self.assertLessEqual(max(declared), 4096 + 1, 'a staging flush or totals batch declared more')  # +1: the checkpoint's own row
+
     def test_a_name_withheld_folder_resumes_by_inode_with_no_name_or_path_stored(self):
         private = self.tree / 'Album.musiclibrary'
         for b in range(8):

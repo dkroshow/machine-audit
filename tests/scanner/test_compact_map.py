@@ -9,7 +9,7 @@ from unittest.mock import patch
 from machine_audit.budget import Budget, BudgetExceeded
 from machine_audit.scanner.encoding import inode_key, source_id
 from machine_audit.scanner.native import Volume
-from machine_audit.scanner.store import MapStore, MapQuery
+from machine_audit.scanner.store import MapStore, MapQuery, WRITE_ROWS
 from machine_audit.scanner.walker import Node
 
 SCRATCH=Path(__file__).parent/'.tmp'
@@ -300,8 +300,8 @@ class CompactMapTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     self.store.finish_volume(self.volume, None,[],full=True,lean=True)
         finally:self.store.db.set_trace_callback(None)
-        # A stream row and a term row per holder, in buffered batches of 8,192.
-        self.assertEqual(batches,[8192,2])
+        # A stream row and a term row per holder, in buffered batches of WRITE_ROWS.
+        self.assertEqual(batches,[WRITE_ROWS,WRITE_ROWS,2])
         self.assertEqual(MapQuery(self.store.path).query(),before)
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM streams WHERE generation=?',
                                               (self.store.generation,)).fetchone()[0],4097)
