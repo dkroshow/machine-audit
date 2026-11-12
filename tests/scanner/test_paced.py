@@ -372,7 +372,7 @@ class PacedWalkTests(unittest.TestCase):
                 # The published map: its base, overlaid by a delta still merging.
                 return db.execute('''SELECT max(l.listed_ns) FROM listings l JOIN volumes v ON l.volume=v.key
                     AND l.generation IN (v.generation,v.delta_generation) WHERE l.id=?''', (folder.stat().st_ino,)).fetchone()[0]
-        with counting, patch('machine_audit.scanner.runner.LIST_NS_PER_ENTRY', SECOND):
+        with counting, patch('machine_audit.scanner.runner.RELIST_NS_PER_ENTRY', SECOND):
             before = spent[0];big_before = listed_ns(big)
             result = self.scan(data, events=self.events([big] + small, 70), floor=25 * SECOND, clock=lambda: spent[0])
             self.assertIn('update_deferred', result['volumes'][0]['gaps'])
@@ -399,7 +399,7 @@ class PacedWalkTests(unittest.TestCase):
                 replay=lambda device, since: Replay(paths=dict.fromkeys(['/inner'] if device == -2 else churning, False), up_to=up_to))
         spent, counting = self.listing_clock(2 * SECOND)
         inner = (other / 'inner').stat().st_ino
-        with counting, patch('machine_audit.scanner.runner.LIST_NS_PER_ENTRY', 2 * SECOND):
+        with counting, patch('machine_audit.scanner.runner.RELIST_NS_PER_ENTRY', 2 * SECOND):
             for run in range(3):
                 (other / 'inner' / f'new{run}').write_bytes(b'n')
                 self.scan(data, events=events(80 + run), fs=filesystem, floor=25 * SECOND, clock=lambda: spent[0])

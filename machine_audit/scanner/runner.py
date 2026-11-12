@@ -19,7 +19,7 @@ from machine_audit.sources.iokit import IOKit
 from .native import MacFilesystem
 from .events import FSEvents, next_decision
 from .errors import ScanError
-from .pace import (LARGE_FOLDER_ENTRIES, LIST_NS_PER_ENTRY, PIECE_WAIT_NS, SHARING_NS_PER_HOLDER,
+from .pace import (LARGE_FOLDER_ENTRIES, LIST_NS_PER_ENTRY, PIECE_WAIT_NS, RELIST_NS_PER_ENTRY, SHARING_NS_PER_HOLDER,
                    TOTALS_NS_PER_FOLDER, Share, allowance)
 from .policy import Policy
 from .store import MapStore, MergePending
@@ -76,7 +76,7 @@ def relist(store,walker,policy,volume,now,changes,pace=None):
     def fits(identity,recursive,path):
         if pace is None:return True
         if path in due_at and now-due_at[path]>=PIECE_WAIT_NS:return True
-        return pace.covers(store.mapped_entries(identity,recursive)*LIST_NS_PER_ENTRY)
+        return pace.covers(store.mapped_entries(identity,recursive)*RELIST_NS_PER_ENTRY)
     roots_to_update={}
     recursive_roots=set()
     due_paths={}
@@ -125,12 +125,21 @@ def relist(store,walker,policy,volume,now,changes,pace=None):
     # ancestor covers its subtree.
     paths=sorted(roots_to_update,key=lambda path:(path not in due_at,due_at.get(path,0),len(path)))
     later=[]  # Left for the next run: the hour's allowance is spent.
-    chosen=[]
+    # Chosen folders, and those of them re-listed recursively: a path is covered when
+    # chosen itself or below a recursive one, found by walking up its ancestors (the
+    # backlog makes thousands of paths, so not by comparing every pair).
+    chosen=set();covering=set()
+    def covered(path):
+        if path in chosen:return True
+        while (parent:=os.path.dirname(path))!=path:
+            if parent in covering:return True
+            path=parent
+        return False
     complete=True
     for path in paths:
-        if any(path==p or (p in recursive_roots and path.startswith(p+'/')) for p in chosen):
-            continue
-        chosen.append(path)
+        if covered(path):continue
+        chosen.add(path)
+        if path in recursive_roots:covering.add(path)
         previous=roots_to_update[path]
         recursive=path in recursive_roots
         if not fits(previous['id'],recursive,path):

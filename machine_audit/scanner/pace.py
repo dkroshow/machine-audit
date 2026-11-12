@@ -26,6 +26,9 @@ PIECE_WAIT_NS = 24 * HOUR_NS
 # pause part-way through one folder (Big Mac, Nov 11: one of 416 k entries took 80 s).
 LARGE_FOLDER_ENTRIES = 20_000
 LIST_NS_PER_ENTRY = 200_000
+# An update's re-list costs more an entry than the walk's listing: its staging and
+# lookups (240-470 µs on Big Mac's startup volume; the walk 150-190 µs).
+RELIST_NS_PER_ENTRY = 500_000
 
 
 def room_from(cpu, own, share):
@@ -99,10 +102,16 @@ class Allowance:
         return limit is None or limit-self.spent()>=cost_ns
 
 
+# Of a volume's share, what re-listing leaves for placing shared blocks, totalling
+# and publishing (about 10% on Big Mac, Nov 12).
+FINISH_RESERVE = 0.15
+
+
 class Share:
     """The part of a run's allowance one volume's update may spend: what is left,
     divided among the volumes still to update, so one volume's churn cannot starve
-    the others and what a volume leaves unused flows to the next."""
+    the others and what a volume leaves unused flows to the next. Re-listing stops
+    short of it by FINISH_RESERVE, kept for the update's finishing stages."""
     def __init__(self, allowance, volumes_left):
         self.allowance = allowance
         self.start = allowance.spent()
@@ -115,7 +124,8 @@ class Share:
         return self.limit is not None and self.remaining() <= 0
 
     def covers(self, cost_ns):
-        return self.limit is None or self.remaining() >= cost_ns
+        """Whether re-listing `cost_ns` more fits, with the finishing reserve kept."""
+        return self.limit is None or self.remaining() - FINISH_RESERVE * self.limit >= cost_ns
 
 
 def allowance(root, *, force, now_ns=None):

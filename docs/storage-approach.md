@@ -542,7 +542,8 @@ decide the next walk. So does a change of the volume's event UUID or name access
 run's entries, and each may spend what is left of the allowance divided by the volumes
 still to update, so one volume's churn cannot starve the others and what a volume leaves
 unused flows to the next. Before re-listing a folder, or a subtree when the re-list is
-recursive, an update compares its size in the map (about 200 µs an entry) with what is
+recursive, an update compares its size in the map (about 500 µs an entry: a re-list
+costs 240-470 µs an entry on Big Mac, against 150-190 µs for the walk) with what is
 left of its share; one that does not fit is deferred, never longer than a day, since a
 single listing cannot pause part-way.
 
