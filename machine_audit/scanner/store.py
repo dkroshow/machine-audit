@@ -453,6 +453,15 @@ class MapStore:
         self.flush()
         return self.db.execute(f'SELECT count(*) FROM {table} WHERE generation=? AND volume=?',(self.generation,self.vid)).fetchone()[0]
 
+    def large_folders(self,entries):
+        """Folders the volume's published map lists with more than `entries` direct
+        entries, by inode, with their count: the walk's estimate of their cost. One read
+        of the map's listings a run."""
+        base=self.db.execute('SELECT generation FROM volumes WHERE key=?',(self.vid,)).fetchone()[0]
+        if base is None:return {}
+        return {source_id(i):count for i,count in self.db.execute(
+            'SELECT id,count FROM listings WHERE generation=? AND volume=? AND count>?',(base,self.vid,entries))}
+
     def walk_root_listed(self):
         """Whether this walk listed its volume's root: a walk starts with one root,
         and a root that cannot be listed leaves nothing to publish."""

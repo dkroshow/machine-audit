@@ -78,7 +78,8 @@ class Walker:
     def walk(self, root=None, parent_id=None, inherited_private=False, recursive=True, resume=None, pace=None):
         """`resume` continues a paced walk: its checkpointed folders, as (inode, parent,
         name withheld). `pace` is asked before each folder, with a function giving the
-        folders left in that form; False pauses the walk and sets `paused`."""
+        folders left in that form and the folder's inode: 'go' lists it, 'later' moves it
+        behind the others, 'stop' pauses the walk and sets `paused`."""
         root = root or self.volume.mount
         self.paused = False
         try:
@@ -95,9 +96,15 @@ class Walker:
         stack = ([(None, parent, private, True, identity) for identity, parent, private in resume] if resume is not None
                  else [(root, parent_id, inherited_private, recursive, str(rootstat.st_ino))])
         while stack:
-            if pace is not None and not pace(lambda: [(identity, parent, private) for _, parent, private, _, identity in stack]):
-                self.paused = True
-                return root_listed
+            if pace is not None:
+                state = pace(lambda: [(identity, parent, private) for _, parent, private, _, identity in stack], stack[-1][4])
+                if state == 'stop':
+                    self.paused = True
+                    return root_listed
+                if state == 'later':
+                    # Not now: to the bottom of the stack, after every other folder.
+                    stack.insert(0, stack.pop())
+                    continue
             path, parent, hidden, descend_all, expected = stack.pop()
             if path is None:
                 path = self.path_of(expected)

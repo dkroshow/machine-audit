@@ -538,7 +538,15 @@ Deferred name-withheld folders are found the same way. A failed attempt (an exce
 the scanner catches) does not resume: its checkpoint is dropped and the retry rules
 decide the next walk. So does a change of the volume's event UUID or name access.
 
-**Phases.** Listing pauses between folders. Placing shared blocks needs every extent in
+**Volumes walk one at a time,** in volume order. Every volume keeps its hourly update
+while its walk is under way or queued behind another's; only the walk starting in a run
+skips that run's update.
+
+**Phases.** Listing pauses between folders, so a folder is the unit of work. A folder the
+previous map lists with more than 20,000 entries is listed only in a run whose remaining
+share covers it (about 200 µs an entry; one of 416 k entries took 80 s on Big Mac); until
+then the walk goes on with the other folders. When only such folders are left (phase
+`large`), each waits for a run that covers it, but never longer than a day. Placing shared blocks needs every extent in
 one process, and extents are never stored, so it runs whole; so does totalling folders.
 Each waits for a run whose allowance covers its estimate (about 120 µs a file that may
 share blocks, 30 µs a folder: 127 s and 47 s on Big Mac's startup volume), but never

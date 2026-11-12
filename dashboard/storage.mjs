@@ -22,7 +22,7 @@ function observation(bytes, measure, at) {
 
 // A paced full walk spans hours; the map shown meanwhile is the previous one, kept current.
 function walkProgress(walk) {
-  const phase = {listing:'listing folders', sharing:'placing shared blocks', totals:'totalling folders'}[walk.phase] ?? walk.phase;
+  const phase = {listing:'listing folders', large:'listing large folders', sharing:'placing shared blocks', totals:'totalling folders'}[walk.phase] ?? walk.phase;
   const listed = Math.min(walk.entries, walk.expected ?? Infinity);
   const share = finite(walk.expected) && walk.expected > 0 ?
     `${Math.floor(100 * listed / walk.expected)}% (${format(walk.entries)} of about ${format(walk.expected)} entries)` :

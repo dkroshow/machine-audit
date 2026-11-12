@@ -19,7 +19,8 @@ from machine_audit.sources.iokit import IOKit
 from .native import MacFilesystem
 from .events import FSEvents, next_decision
 from .errors import ScanError
-from .pace import PIECE_WAIT_NS, SHARING_NS_PER_HOLDER, TOTALS_NS_PER_FOLDER, allowance
+from .pace import (LARGE_FOLDER_ENTRIES, LIST_NS_PER_ENTRY, PIECE_WAIT_NS, SHARING_NS_PER_HOLDER,
+                   TOTALS_NS_PER_FOLDER, allowance)
 from .policy import Policy
 from .store import MapStore, MergePending
 from .walker import Walker, shown_path
@@ -106,7 +107,7 @@ def relist(store,walker,policy,volume,now,changes,pace=None):
             # discharges the deferral, so it must cover what the event needs.
             path=due_paths.get(found['id'],path)
             listing=store.listing(found['id'])
-            if path not in roots_to_update and listing and listing['count']>20_000 and now-listing['listed_ns']<86400*10**9:
+            if path not in roots_to_update and listing and listing['count']>LARGE_FOLDER_ENTRIES and now-listing['listed_ns']<86400*10**9:
                 store.defer(found['id'],listing['listed_ns']+86400*10**9,recursive)
                 walker.gaps.add('large_directory_deferred')
                 continue
@@ -206,16 +207,28 @@ def paced_walk(store,events,fs,policy,grain,volume,trigger,event_uuid,pace,*,lea
         def state():
             return dict(state='paused',phase=walk['phase'],entries=listed_before+walker.entries,expected=walk['expected'],
                         started_ns=walk['started_ns'],cpu_ns=walk['cpu_ns'],runs=walk['runs'],listed=walker.entries)
-        if walk['phase']=='listing':
+        if walk['phase'] in ('listing','large'):
             store.phase('walk')
-            mark=pace.clock()
-            def ticker(pending):
+            mark=pace.clock();later=0
+            # Folders the last map holds as large are listed only when the run's share
+            # covers them; meanwhile the walk goes on with the others. Once only large
+            # folders are left (phase 'large') each waits a day at most, as pieces do.
+            large=store.large_folders(LARGE_FOLDER_ENTRIES)
+            def ticker(pending,identity):
                 # Checkpoint every CHECKPOINT_NS of CPU, so a stop or crash loses little,
                 # and when the allowance is spent, which pauses the walk.
-                nonlocal mark
-                go=pace.walk_open()
-                if not go or pace.clock()-mark>=CHECKPOINT_NS:save(pending=pending());mark=pace.clock()
-                return go
+                nonlocal mark,later
+                if not pace.walk_open():
+                    save(pending=pending());return 'stop'
+                entries=large.get(identity)
+                waited=walk['phase']=='large' and time.time_ns()-walk['phase_ns']>=PIECE_WAIT_NS
+                if entries is not None and not waited and not pace.covers(entries*LIST_NS_PER_ENTRY):
+                    left=pending();later+=1
+                    if later<len(left):return 'later'
+                    save('large',left);return 'stop'
+                later=0
+                if pace.clock()-mark>=CHECKPOINT_NS:save(pending=pending());mark=pace.clock()
+                return 'go'
             walker.walk(resume=None if fresh else store.pending(),pace=ticker)
             if walker.paused:return state()
             if not store.walk_root_listed():
@@ -297,6 +310,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                 volumes=selected
             walks=store.walks()
             walking=[]  # (volume, trigger, event uuid): paced walk work, after every update
+            walk_ahead=bool(walks)  # A walk under way, or queued earlier in this run.
             for volume in volumes:
                 if volume.id in pending:
                     # Its update is published; it is not scanned until its delta merges.
@@ -362,12 +376,17 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     results.append({'volume_id':volume.id,'status':status,'action':action,'trigger':trigger})
                     continue
                 # A full walk is paced: it runs after every volume's update, in this
-                # run's allowance. While one goes on, an update keeps the published map
-                # current whenever its events can (a weekly or requested walk).
+                # run's allowance, one volume's walk at a time in volume order. Until it
+                # publishes, whether under way or queued behind another volume's walk,
+                # the hourly update keeps the published map current whenever its events
+                # can (a weekly or requested walk). Only the walk starting now skips it.
                 walk_trigger=walk['trigger'] if walk else None
                 if action=='full':
                     if not walk:walk_trigger=trigger
-                    update_due=(walk and not force and old['bookmark'] is not None and trigger in ('weekly_full','requested_full')
+                    starts_now=not walk and not walk_ahead
+                    walk_ahead=True
+                    update_due=(not force and not starts_now and has_root and old['bookmark'] is not None
+                                and trigger in ('weekly_full','requested_full')
                                 and (old['observed_ns'] is None or now-old['observed_ns']>=3600*10**9))
                     action,trigger=('update','hourly_update') if update_due else ('wait',trigger)
                 store.phase('events',action=action,trigger=trigger)

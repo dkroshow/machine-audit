@@ -278,6 +278,87 @@ class PacedWalkTests(unittest.TestCase):
         self.assertGreater(len(runs), 2, runs)
         self.assertEqual(self.published_map(data), expected)
 
+    def listing_clock(self, per_entry):
+        """A CPU clock driven by what the walker lists: `per_entry` a listed entry."""
+        spent = [0]
+        original = MapStore.listed
+        def counted(store, identity, entries):
+            spent[0] += max(entries, 1) * per_entry
+            return original(store, identity, entries)
+        return spent, patch.object(MapStore, 'listed', counted)
+
+    def test_a_volume_queued_for_a_walk_keeps_its_hourly_update(self):
+        # Big Mac, Nov 11 8:43 and 9:46 PM PT: while the startup volume walked, the
+        # other eight volumes waited their turn with no hourly update.
+        other = self.base / 'other';(other / 'inner').mkdir(parents=True);(other / 'inner' / 'f').write_bytes(b'o')
+        second = replace(self.volume, id='w', label='Second', mount=str(other))
+        filesystem = SimpleNamespace(volumes=lambda: [self.volume, second], sharing=lambda *args: None)
+        data = self.base / 'queued'
+        self.assertEqual(self.scan(data, force=True, fs=filesystem)['status'], 'observed')
+        with self.db(data) as db:
+            db.execute('UPDATE volumes SET full_ns=?', (self.now - 8 * 24 * HOUR,))  # Both walks are due.
+        spent, counting = self.listing_clock(10 * SECOND)
+        with counting:
+            for run in range(3):
+                with self.db(data) as db:
+                    before = db.execute("SELECT observed_ns FROM volumes WHERE id='w'").fetchone()[0]
+                self.scan(data, full=False, events=self.events([], 50 + run), fs=filesystem, floor=25 * SECOND,
+                          clock=lambda: spent[0])
+                with self.db(data) as db:
+                    after = db.execute("SELECT observed_ns FROM volumes WHERE id='w'").fetchone()[0]
+                    walking = {r[0] for r in db.execute('SELECT volume FROM walks')}
+                self.assertEqual(walking, {'v'}, 'the first volume walks; the second waits its turn')
+                self.assertGreater(after, before, f'run {run + 1}: the queued volume got no update')
+
+    def test_updates_that_spend_the_allowance_leave_the_walk_only_its_floor(self):
+        data = self.updating_store()
+        with self.db(data) as db:
+            db.execute('UPDATE volumes SET full_ns=?', (self.now - 8 * 24 * HOUR,))
+        spent, counting = self.listing_clock(10 * SECOND)
+        with counting:
+            self.scan(data, full=False, floor=25 * SECOND, clock=lambda: spent[0])  # The walk starts.
+            changed = [self.tree / f'folder{a}' / f'sub{b}' for a in range(5) for b in range(2)]
+            before = self.walk_row(data)['entries']
+            result = self.scan(data, full=False, events=self.events(changed, 60), floor=25 * SECOND, clock=lambda: spent[0])
+        self.assertIn('update_deferred', result['volumes'][0]['gaps'])
+        # The update reached the 25 s allowance; the walk got its 20 s floor: two folders
+        # of at most 6 entries each.
+        self.assertTrue(0 < self.walk_row(data)['entries'] - before <= 2 * 6, (before, self.walk_row(data)['entries']))
+
+    def test_a_large_folder_waits_for_a_share_that_covers_it(self):
+        # Big Mac, Nov 11 9:46 PM PT: the walk began a folder of 416 k entries with its
+        # share nearly spent, and that one listing ran 80 s past the run's allowance.
+        big = self.tree / 'big';big.mkdir()
+        for i in range(40):(big / str(i)).write_bytes(b'b')
+        expected = self.reference()
+        data = self.base / 'large'
+        self.assertEqual(self.scan(data, force=True)['status'], 'observed')
+        with self.db(data) as db:
+            db.execute('UPDATE volumes SET full_ns=?', (self.now - 8 * 24 * HOUR,))
+        spent, counting = self.listing_clock(SECOND)
+        big_listed = [];waited = False
+        with counting, patch('machine_audit.scanner.runner.LARGE_FOLDER_ENTRIES', 20, create=True), \
+             patch('machine_audit.scanner.runner.LIST_NS_PER_ENTRY', SECOND, create=True):
+            for run in range(12):
+                before = spent[0]
+                result = self.scan(data, full=False, floor=25 * SECOND, clock=lambda: spent[0])
+                if not waited:
+                    # Within the 25 s share, plus the one small folder under way (6 entries).
+                    self.assertLessEqual(spent[0] - before, 31 * SECOND, f'run {run + 1} overran its share')
+                walk = self.walk_row(data)
+                if walk is None:break
+                if walk['phase'] == 'large':
+                    self.assertFalse(big_listed, 'listed before its share covered it')
+                    with self.db(data) as db:  # A day passes with no hour that covers it.
+                        db.execute('UPDATE walks SET phase_ns=phase_ns-?', (25 * HOUR,))
+                    waited = True
+                with self.db(data) as db:
+                    big_listed = [1] if db.execute('SELECT 1 FROM listings WHERE generation=? AND id=?',
+                                                   (walk['generation'], big.stat().st_ino)).fetchone() else []
+                self.assertTrue(big_listed or walk['phase'] in ('listing', 'large'))
+        self.assertIsNone(self.walk_row(data), 'the walk never finished')
+        self.assertEqual(self.published_map(data), expected)
+
     def test_a_name_withheld_folder_resumes_by_inode_with_no_name_or_path_stored(self):
         private = self.tree / 'Album.musiclibrary'
         for b in range(8):

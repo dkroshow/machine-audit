@@ -21,6 +21,11 @@ WALK_FLOOR_NS = 20 * 10**9
 SHARING_NS_PER_HOLDER = 120_000
 TOTALS_NS_PER_FOLDER = 30_000
 PIECE_WAIT_NS = 24 * HOUR_NS
+# A folder with more direct entries than this is large: an update re-lists it at most
+# daily, and a paced walk lists it only in a run whose share covers it, for it cannot
+# pause part-way through one folder (Big Mac, Nov 11: one of 416 k entries took 80 s).
+LARGE_FOLDER_ENTRIES = 20_000
+LIST_NS_PER_ENTRY = 200_000
 
 
 def room_from(cpu, own, share):
