@@ -557,9 +557,13 @@ cannot cover is dropped rather than queued, and its queue is dropped when the wa
 under way. The run row counts them (`superseded`) with the gap `walk_supersedes`. A change
 its share does not cover reaches the published map at the walk's publication.
 
-**Volumes walk one at a time:** a walk under way goes on first. Every volume keeps its
-hourly update while its walk is under way or queued behind another's; only the walk
-starting in a run skips that run's update.
+**Walks take turns in a run:** a walk under way goes on first. When it stops early to
+wait (a large folder, or sharing or totals, that its share does not cover), the run's
+remaining allowance goes to the next volume's walk, so allowance is never left idle.
+Several walks can therefore be open at once, each with its own staged generation, and
+every staged write is admitted against the storage budget like any other. Every volume
+keeps its hourly update while its walk is under way or queued behind another's; only the
+walk starting in a run skips that run's update.
 
 **Phases.** Listing pauses between folders, so a folder is the unit of work. A folder the
 previous map lists with more than 20,000 entries is listed only in a run whose remaining

@@ -439,7 +439,8 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                                     **({'walk':{'state':'gated'}} if walk else {})})
                     continue
                 # A full walk is paced: it runs after every volume's update, in this
-                # run's allowance, one volume's walk at a time. Until it
+                # run's allowance, walks taking turns: one that stops to wait leaves
+                # the rest of the allowance to the next volume's walk. Until it
                 # publishes, whether under way or queued behind another volume's walk,
                 # the hourly update keeps the published map current whenever its events
                 # can (a weekly or requested walk). Only the walk starting now skips it.
