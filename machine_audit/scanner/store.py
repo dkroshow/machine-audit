@@ -602,6 +602,27 @@ class MapStore:
         finally:self.db.execute('DELETE FROM temp.link_check')
         return [source_id(folder) for folder in sorted(folders,key=str)]
 
+    def recently_written(self):
+        """Files a recent listing may have caught while still being written: modified
+        within the hour before their folder was listed, in folders listed since the
+        previous update (or, for the first updates after a full walk, since the walk
+        began). As (folder, file, allocated). Space reserved while a file is written is
+        released afterwards with no change to its folder, so no event reports it (Big
+        Mac, Nov 12: 269 such files counted 1.82 GB no longer allocated)."""
+        old=self.db.execute('SELECT observed_ns,full_ns,valid FROM volumes WHERE id=?',(self.volume,)).fetchone()
+        if old is None or old['observed_ns'] is None:return []
+        # Listings come before their publication: an hour's run, or a whole paced walk
+        # (whose full-scan time is its start), with an hour's slack. A map already
+        # invalid checks every listing since its full walk, which repairs it.
+        hour=3600*10**9
+        after_full=old['full_ns'] is not None and (old['observed_ns']-old['full_ns']<=2*hour or not old['valid'])
+        start=old['full_ns'] if after_full else old['observed_ns']
+        since=start-2*hour
+        return [tuple(row) for row in self.db.execute('''SELECT f.parent,f.id,f.allocated FROM listings l
+            JOIN files f ON f.generation=l.generation AND f.volume=l.volume AND f.parent=l.id
+            WHERE l.generation=? AND l.volume=? AND l.listed_ns>=? AND f.mtime>=l.listed_ns-3600000000000''',
+            (self.base_gen,self.vid,since))]
+
     def forget_deferred(self,identities):
         """Drop deferred refreshes of folders no longer in the map: nothing can re-list
         them, and the listing that removed them already covers their changes."""

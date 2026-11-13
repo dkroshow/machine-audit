@@ -18,6 +18,7 @@ from machine_audit.sources.native import Darwin
 from machine_audit.sources.iokit import IOKit
 from .native import MacFilesystem
 from .events import FSEvents, next_decision
+from .encoding import source_id
 from .errors import ScanError
 from .pace import (LARGE_FOLDER_ENTRIES, LIST_NS_PER_ENTRY, PIECE_WAIT_NS, RELIST_NS_PER_ENTRY, SHARING_NS_PER_HOLDER,
                    TOTALS_NS_PER_FOLDER, Share, allowance)
@@ -68,6 +69,27 @@ def live_parent(store,walker,volume,path,stored):
     return identity if identity is not None and identity!=stored and store.known_directory(identity) else stored
 
 
+def reallocated(store,walker):
+    """Folders to re-list because a file in them now has a different allocation than
+    when they were listed: it was still being written then, and the space it had
+    reserved was released later with no event. A file gone is left to its folder's
+    own change event."""
+    folders=set();changes=[]
+    for folder,identity,allocated in store.recently_written():
+        if folder in folders:continue
+        # Any one path of the file gives its allocation; each folder whose row holds the
+        # old one is re-listed (a hard-linked copy has a row in every folder linking it).
+        path=walker.path_of(source_id(identity))
+        try:info=os.stat(path,follow_symlinks=False) if path else None
+        except OSError:info=None
+        if info is None or str(info.st_ino)!=source_id(identity) or info.st_blocks*512==allocated:continue
+        folders.add(folder)
+        saved=store.known_directory(source_id(folder))
+        folder_path=saved and (saved['path'] or walker.path_of(source_id(folder)))
+        if folder_path:changes.append((folder_path,False))
+    return changes
+
+
 def relist(store,walker,policy,volume,now,changes,pace=None):
     """Re-list changed folders, given as (absolute path, recursive), plus deferred ones now due.
     `pace` is the volume's share of the run: a folder, or a recursive subtree, whose size
@@ -93,6 +115,7 @@ def relist(store,walker,policy,volume,now,changes,pace=None):
             due_paths[saved['id']]=path;due_at[path]=due_ns
             if recursive is None or recursive:recursive_roots.add(path)
     if gone:store.forget_deferred(gone)
+    changes=list(changes)+reallocated(store,walker)
     for path,recursive in changes:
         if os.path.commonpath([path,volume.mount])!=volume.mount:
             continue

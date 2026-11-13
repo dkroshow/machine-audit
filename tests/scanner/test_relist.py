@@ -296,6 +296,25 @@ class RelistTests(unittest.TestCase):
             work[name]=steps[0];store.close()
         self.assertLess(work['many'],3*work['few'],work)
 
+    def test_space_released_after_a_listing_is_found_by_the_next_update(self):
+        # Big Mac's 1 TB volume, Nov 12: a copy tool wrote and linked files; their folders
+        # were listed minutes after, while space was still reserved, and the space was
+        # released later with no change to the folder. No event reported it, 1.82 GB
+        # stayed counted, and the map stayed invalid.
+        written=self.tree/'written';linked=self.tree/'linked';written.mkdir();linked.mkdir()
+        for i in range(3):
+            (written/f'copy{i}').write_bytes(os.urandom(4*1024**2))
+        os.link(written/'copy0',linked/'copy0')
+        self.baseline()  # Listed while the copies hold 4 MB each.
+        for i in range(3):
+            info=(written/f'copy{i}').stat()
+            os.truncate(written/f'copy{i}',4096)  # Disposable synthetic file: its space released.
+            os.utime(written/f'copy{i}',ns=(info.st_atime_ns,info.st_mtime_ns))
+        walker=Walker(self.volume,self.policy,self.store)
+        relist(self.store,walker,self.policy,self.volume,0,[])  # No event reports it.
+        self.store.finish_volume(self.volume,None,walker.gaps,full=False,lean=True)
+        self.assertEqual(self.published_physical(),self.fresh_physical())
+
     def test_an_update_repairs_a_map_that_counted_a_hard_link_twice(self):
         # The map an earlier release left: the old link's folder still counts the file.
         first=self.tree/'first';second=self.tree/'second';first.mkdir();second.mkdir()
