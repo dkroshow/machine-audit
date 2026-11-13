@@ -98,8 +98,10 @@ class Allowance:
         return limit is None or self.spent()<limit
 
     def covers(self, cost_ns):
+        """Whether a walk piece of `cost_ns` fits. A run is bounded by the allowance plus
+        the walk floor, so a piece that ends within that bound fits."""
         limit=self._walk_limit()
-        return limit is None or limit-self.spent()>=cost_ns
+        return limit is None or max(limit,self.limit+WALK_FLOOR_NS)-self.spent()>=cost_ns
 
 
 # Of a volume's share, what re-listing leaves for placing shared blocks, totalling

@@ -240,6 +240,9 @@ def relist(store,walker,policy,volume,now,changes,pace=None,walking=False):
 
 
 CHECKPOINT_NS=30*10**9
+# Walks open at once: the one under way, and one listing while it waits for a piece.
+# A third waits its turn, which bounds the staged rows beside a walk's publication.
+OPEN_WALKS=2
 
 
 def paced_walk(store,events,fs,policy,grain,volume,trigger,event_uuid,pace,*,lean):
@@ -377,7 +380,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
             walks=store.walks()
             # Updates go smallest first by their last run's entries, each with an even
             # share of what is left, so one volume's churn cannot starve the others.
-            # Walks go one volume at a time: one under way first, then in that order.
+            # Walks take turns: those under way first, then in that order (OPEN_WALKS).
             outcomes=store.last_outcomes()
             # Each update's demand: what it re-listed last run and what is queued for it
             # now, at the re-list rate. A walking volume's queue is superseded by its walk.
@@ -559,7 +562,9 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                                 'gaps':sorted(walker.gaps),**({'superseded':store.superseded} if store.superseded else {})})
             walking.sort(key=lambda item:item[0].id not in walks)
             for volume,trigger,event_uuid in walking:
-                outcome=paced_walk(store,events,fs,policy,grain,volume,trigger,event_uuid,pace,lean=not full_disk_access)
+                open_walks=store.walks()
+                if volume.id not in open_walks and len(open_walks)>=OPEN_WALKS:outcome={'state':'waiting_turn'}
+                else:outcome=paced_walk(store,events,fs,policy,grain,volume,trigger,event_uuid,pace,lean=not full_disk_access)
                 store.walk=None  # Ended for this run; a later failure is not this walk's.
                 listed=outcome.pop('listed',0);processed+=listed
                 store.progress(processed)

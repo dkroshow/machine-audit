@@ -564,20 +564,23 @@ its share does not cover reaches the published map at the walk's publication.
 **Walks take turns in a run:** a walk under way goes on first. When it stops early to
 wait (a large folder, or sharing or totals, that its share does not cover), the run's
 remaining allowance goes to the next volume's walk, so allowance is never left idle.
-Several walks can therefore be open at once, each with its own staged generation, and
-every staged write is admitted against the storage budget like any other. Every volume
+A second walk can therefore be open, with its own staged generation; a third due walk
+waits its turn until one publishes. Two at most bounds the staged rows beside a walk's
+publication: on Big Mac, about 9.0 GB of the 10 GB cap at the startup volume's
+publication, against about 9.7 GB if every volume's walk were open (Nov 13). Every volume
 keeps its hourly update while its walk is under way or queued behind another's; only the
 walk starting in a run skips that run's update.
 
 **Phases.** Listing pauses between folders, so a folder is the unit of work. A folder the
 previous map lists with more than 20,000 entries is listed only in a run whose remaining
-share covers it (about 200 µs an entry; one of 416 k entries took 80 s on Big Mac); until
+allowance, plus the walk floor, covers it (about 200 µs an entry; one of 416 k entries took 80 s on Big Mac); until
 then the walk goes on with the other folders. When only such folders are left (phase
 `large`), each waits for a run that covers it, but never longer than a day. Placing shared blocks needs every extent in
 one process, and extents are never stored, so it runs whole; so does totalling folders.
-Each waits for a run whose allowance covers its estimate (about 120 µs a file that may
-share blocks, 30 µs a folder: 127 s and 47 s on Big Mac's startup volume), but never
-longer than a day.
+Each waits for a run whose allowance plus the walk floor covers its estimate (about
+120 µs a file that may share blocks, 30 µs a folder: 127 s and 47 s on Big Mac's startup
+volume), but never longer than a day. A run is bounded by the allowance plus the walk
+floor anyway, so a piece that ends within that bound adds no new overrun.
 
 **The map meanwhile.** The published map, the previous full walk plus hourly deltas,
 keeps serving and taking updates; the walk's generation is invisible to queries and

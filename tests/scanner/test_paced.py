@@ -51,7 +51,8 @@ class PacedWalkTests(unittest.TestCase):
                              100 * 10**9, 50 * 10**9, 50 * 10**9, 40 * 10**9)
         self.now = 1_000 * HOUR
 
-    def scan(self, data, *, force=False, full=False, events=None, ticks=None, floor=40 * SECOND, fs=None, clock=None, limit=None):
+    def scan(self, data, *, force=False, full=False, events=None, ticks=None, floor=40 * SECOND, fs=None, clock=None, limit=None,
+             walk_floor=None):
         """One scanner run. Each read of the allowance clock costs a second, unless
         `clock` gives the CPU spent instead."""
         data.mkdir(exist_ok=True)
@@ -70,7 +71,7 @@ class PacedWalkTests(unittest.TestCase):
              patch('machine_audit.scanner.runner.Policy', return_value=Policy(home=str(self.base), homes=[])), \
              patch('machine_audit.scanner.runner.time.time_ns', return_value=self.now), \
              patch.object(pace.Allowance, 'clock', staticmethod(clock)), \
-             patch.object(pace, 'FLOOR_NS', floor), patch.object(pace, 'WALK_FLOOR_NS', floor // 2):
+             patch.object(pace, 'FLOOR_NS', floor), patch.object(pace, 'WALK_FLOOR_NS', walk_floor or floor // 2):
             result = run_scan(data, full=full, force=force)
         self.now += HOUR
         return result
@@ -116,7 +117,8 @@ class PacedWalkTests(unittest.TestCase):
             with self.db(data) as db:
                 self.assertEqual(db.execute("SELECT status FROM generations WHERE id=?", (walk['generation'],)).fetchone(), ('building',))
             self.assertLess(len(runs), 30, 'the walk never finished')
-        self.assertGreater(len(runs), 2, 'the walk was not paced')
+        # The first run paused at its allowance; a later one published.
+        self.assertEqual(runs[0]['volumes'][0]['walk']['state'], 'paused', 'the walk was not paced')
         self.assertEqual(runs[-1]['volumes'][0]['walk']['state'], 'published')
         self.assertEqual(self.published_map(data), expected)
         with self.db(data) as db:
@@ -481,6 +483,53 @@ class PacedWalkTests(unittest.TestCase):
         self.assertIn('walk_supersedes', update['gaps'])
         with self.db(data) as db:
             self.assertEqual(db.execute("SELECT count(*) FROM dirty WHERE volume='v'").fetchone()[0], 0)
+
+    def test_a_third_due_walk_waits_while_two_are_open(self):
+        # Big Mac, Nov 13: a walk waiting for a piece left its allowance to the next
+        # volume's walk. With every volume's walk open beside the startup volume's
+        # publication, the peak was projected at 9.7 GB of the 10 GB cap.
+        mounts = {}
+        for name in ('w', 'x'):
+            mounts[name] = self.base / f'mount-{name}';(mounts[name] / 'inner').mkdir(parents=True)
+            (mounts[name] / 'inner' / 'f').write_bytes(b'o')
+        volumes = [self.volume] + [replace(self.volume, id=name, label=name, mount=str(mount)) for name, mount in mounts.items()]
+        filesystem = SimpleNamespace(volumes=lambda: volumes, sharing=lambda *args: None)
+        data = self.base / 'three'
+        self.assertEqual(self.scan(data, force=True, fs=filesystem)['status'], 'observed')
+        with self.db(data) as db:
+            db.execute('UPDATE volumes SET full_ns=?', (self.now - 8 * 24 * HOUR,))  # Every walk is due.
+        spent, counting = self.listing_clock(SECOND // 10)
+        # Totals never fit the allowance, so each walk waits a day for its last piece.
+        with counting, patch('machine_audit.scanner.runner.TOTALS_NS_PER_FOLDER', 10**15):
+            for run in range(2):
+                result = self.scan(data, events=self.events([], 50 + run), fs=filesystem, clock=lambda: spent[0])
+                with self.db(data) as db:
+                    open_walks = {r[0] for r in db.execute('SELECT volume FROM walks')}
+                self.assertEqual(len(open_walks), 2, f'run {run + 1}: {open_walks}')
+                third, = (v for v in result['volumes'] if v['volume_id'] not in open_walks)
+                self.assertEqual(third['walk'], {'state': 'waiting_turn'})
+            with self.db(data) as db:
+                db.execute('UPDATE walks SET phase_ns=phase_ns-?', (25 * HOUR,))  # A day passes.
+            self.scan(data, events=self.events([], 60), fs=filesystem, clock=lambda: spent[0])
+        with self.db(data) as db:
+            # The two published, and the third took its turn.
+            self.assertEqual({r[0] for r in db.execute('SELECT volume FROM walks')}, {third['volume_id']})
+
+    def test_a_walk_piece_runs_when_it_fits_the_allowance_plus_the_walk_floor(self):
+        # Big Mac, Nov 13: sharing (127 s) never fit a 120 s allowance and waited a day,
+        # though a run may spend the allowance plus the 20 s walk floor.
+        files = [p for p in self.tree.rglob('*') if p.is_file()]
+        filesystem = SimpleNamespace(volumes=lambda: [replace(self.volume, fs='apfs')],
+                                     sharing=lambda fd, name, st: (st.st_ino, None, False),
+                                     extents=lambda device, inode: [(inode * 4096, 4096)])
+        data = self.base / 'piece'
+        self.assertEqual(self.scan(data, force=True, fs=filesystem)['status'], 'observed')
+        with self.db(data) as db:
+            db.execute('UPDATE volumes SET full_ns=?', (self.now - 8 * 24 * HOUR,))
+        spent, counting = self.listing_clock(SECOND // 100)  # Listing the tree: about 1.3 s.
+        with counting, patch('machine_audit.scanner.runner.SHARING_NS_PER_HOLDER', 127 * SECOND // len(files)):
+            result = self.scan(data, fs=filesystem, floor=120 * SECOND, walk_floor=20 * SECOND, clock=lambda: spent[0])
+        self.assertEqual(result['volumes'][0]['walk']['state'], 'published', result['volumes'][0]['walk'])
 
     def test_a_refused_walk_write_keeps_the_checkpoint_and_resumes(self):
         # A walk dropped on a refusal restarts days of walking (criteria 1 and 2).
