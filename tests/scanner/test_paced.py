@@ -486,6 +486,22 @@ class PacedWalkTests(unittest.TestCase):
             self.assertEqual(self.scan(self.base / 'rows', force=True)['status'], 'observed')
         self.assertLessEqual(max(declared), 4096 + 1, 'a staging flush or totals batch declared more')  # +1: the checkpoint's own row
 
+    def test_a_run_with_room_spends_at_most_85_percent_of_it_plus_the_walk_floor(self):
+        # Big Mac, Nov 12 6-8 PM PT: the walk took the whole trailing hour's room and a
+        # falling hour went 1-3% over the bar.
+        data = self.base / 'room'
+        spent, counting = self.listing_clock(SECOND)
+        room = 100 * SECOND
+        with counting, patch.object(pace, 'room_ns', return_value=room):
+            for run in range(3):
+                before = spent[0]
+                self.scan(data, floor=SECOND, clock=lambda: spent[0])
+                # The walk ends its share between folders: at most one folder (6 entries) over.
+                self.assertLessEqual(spent[0] - before, 0.85 * room + pace.WALK_FLOOR_NS + 6 * SECOND)
+                with self.db(data) as db:
+                    self.assertEqual(db.execute('SELECT allowance_ns FROM runs ORDER BY started_ns DESC LIMIT 1').fetchone()[0],
+                                     int(0.85 * room))
+
     def test_a_name_withheld_folder_resumes_by_inode_with_no_name_or_path_stored(self):
         private = self.tree / 'Album.musiclibrary'
         for b in range(8):
@@ -541,7 +557,8 @@ class AllowanceTests(unittest.TestCase):
             (Path(root) / 'readings.sqlite').write_bytes(b'not a database')
             self.assertIsNone(pace.room_ns(root, 10 * HOUR))
             self.assertEqual(pace.allowance(root, force=False).limit, pace.FLOOR_NS)
-            for room, limit in ((300 * SECOND, 300 * SECOND), (-50 * SECOND, pace.FLOOR_NS)):
+            # A run spends at most 85% of the room: the margin for an hour whose load falls.
+            for room, limit in ((300 * SECOND, 255 * SECOND), (100 * SECOND, pace.FLOOR_NS), (-50 * SECOND, pace.FLOOR_NS)):
                 with patch.object(pace, 'room_ns', return_value=room):
                     self.assertEqual(pace.allowance(root, force=False).limit, limit)
         self.assertIsNone(pace.allowance('.', force=True).limit)

@@ -105,6 +105,9 @@ class Allowance:
 # Of a volume's share, what re-listing leaves for placing shared blocks, totalling
 # and publishing (about 10% on Big Mac, Nov 12).
 FINISH_RESERVE = 0.15
+# Of the room, what a run may spend: the margin for an hour whose load falls below the
+# trailing hour's the room was read from (Big Mac, Nov 12: 1-3% over the bar without it).
+ROOM_SHARE = 0.85
 
 
 # Every volume's update gets at least this, so one volume's churn cannot starve another.
@@ -136,4 +139,4 @@ class Share:
 def allowance(root, *, force, now_ns=None):
     if force:return Allowance(None)
     room=room_ns(root,now_ns or time.time_ns())
-    return Allowance(max(room or 0,FLOOR_NS),room)
+    return Allowance(max(int(ROOM_SHARE*(room or 0)),FLOOR_NS),room)

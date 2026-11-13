@@ -502,10 +502,12 @@ on Big Mac (Nov 10) a walk of all nine volumes cost 2,948 s of CPU in 65 minutes
 a bar of 134–146 s that hour. The weekly walk is now paced by a CPU allowance per run;
 the hourly schedule is the only scheduler.
 
-**The allowance.** Each scheduled run may spend `max(room, 120 s)` of CPU, counted from
-its start. Room is the bar for the trailing hour, 1% (`SHARE`) of the machine's process
+**The allowance.** Each scheduled run may spend `max(0.85 × room, 120 s)` of CPU, counted
+from its start. Room is the bar for the trailing hour, 1% (`SHARE`) of the machine's process
 CPU, minus the collector's own CPU in that hour, both read read-only from the collector's
-store (about 0.3 s). When that store cannot answer, the floor governs. The floor keeps
+store (about 0.3 s). The 15% left (`ROOM_SHARE`) is the margin for a clock hour whose load
+falls below the trailing hour's: spending the whole room went 1-3% over the bar in such
+hours on Big Mac (Nov 12). When that store cannot answer, the floor governs. The floor keeps
 hourly updates current in hours the collector alone fills: on Nov 7–10, 27–40% of hours
 were over the bar from the collector and the routine update before any walk. A run
 spends the allowance in this order:
