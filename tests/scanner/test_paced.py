@@ -388,6 +388,41 @@ class PacedWalkTests(unittest.TestCase):
         self.assertEqual(self.scan(data, force=True)['status'], 'observed')
         self.assertGreater(listed_ns(big), big_before)
 
+    def test_an_update_pauses_a_new_subtree_between_folders_at_its_share(self):
+        # Big Mac, Nov 13 8:16 AM PT: an update overran its 120 s allowance by 32 s. A
+        # folder new since the last map has no size to admit it by, and its whole
+        # subtree was listed with it.
+        data = self.updating_store()
+        new = self.tree / 'new'
+        for d in range(8):
+            (new / f'd{d}' / 'inner').mkdir(parents=True)
+            for f in range(5):(new / f'd{d}' / f'f{f}').write_bytes(b'n')
+            for f in range(3):(new / f'd{d}' / 'inner' / f'f{f}').write_bytes(b'n')
+        expected = self.reference()
+        spent, counting = self.listing_clock(SECOND)  # 80 s to list the new subtree.
+        runs = []
+        with counting:
+            for run in range(10):
+                before = spent[0]
+                result = self.scan(data, events=self.events([self.tree] if run == 0 else [], 90 + run), floor=25 * SECOND,
+                                   clock=lambda: spent[0])
+                runs.append((spent[0] - before) // SECOND)
+                self.assertEqual(MapQuery(data / 'scanner.sqlite').query('volumes')['rows'][0]['valid'], True)
+                with self.db(data) as db:
+                    stages = json.loads(db.execute('SELECT stage_cpu FROM runs ORDER BY started_ns DESC LIMIT 1').fetchone()[0])
+                    left = db.execute("""SELECT (SELECT count(*) FROM dirty WHERE volume='v')+
+                        (SELECT count(delta_generation) FROM volumes WHERE id='v')""").fetchone()[0]
+                if run == 0:
+                    self.assertIn('update_deferred', result['volumes'][0]['gaps'])
+                    # An update's listing is its own stage, apart from a walk's.
+                    self.assertIn('relist', stages);self.assertNotIn('walk', stages)
+                if not left:break
+        # Each run stops within its 25 s share plus the one folder under way (at most
+        # 8 entries); the folders left are listed by later runs, to the unpaced map.
+        self.assertTrue(all(cost <= 25 + 8 for cost in runs), runs)
+        self.assertGreater(len(runs), 2, runs)
+        self.assertEqual(self.published_map(data), expected)
+
     def test_a_churning_volume_does_not_starve_another_volumes_update(self):
         # Big Mac, Nov 12: the startup volume's churn took every run's allowance and the
         # other volumes' updates re-listed nothing.

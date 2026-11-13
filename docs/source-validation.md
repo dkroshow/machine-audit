@@ -474,8 +474,9 @@ operator's CLI `scan --full` retries regardless. A successful publication clears
 the level. Reader contention and the free-space margin keep their hourly retry.
 To resume a gated volume, free managed storage down to its level, or run
 `scan --full`, the only resume when no level is stored.
-A paced walk refused for want of managed storage drops its checkpoint: its staged
-rows are what the cap lacks. Other refusals keep it, and the walk resumes.
+A paced walk refused for want of managed storage pauses: its checkpoint and the
+staged rows it describes stand, and the next run retries the refused write rather
+than restart days of walking.
 The store gains nullable `volumes.budget_retry_bytes` and `dirty.recursive` on
 first open. A release before them inserted `dirty` rows positionally and fails
 on a migrated store; rolling back needs a release that names `dirty`'s columns,

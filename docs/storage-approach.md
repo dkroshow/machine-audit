@@ -526,8 +526,9 @@ spends the allowance in this order:
 3. Pruning a replaced map, in what is left.
 
 The operator's `scan --full` is unpaced. The run row records `allowance_ns`, `room_ns`
-(null when unknown), CPU by stage (`stage_cpu`, ns: `walk` is listing, `sharing`,
-`aggregate` is totals, `publication`, `merge`, `prune`) and `extent_reads`.
+(null when unknown), CPU by stage (`stage_cpu`, ns: `walk` is a full walk's listing,
+`relist` the updates' listing, `sharing`, `aggregate` is totals, `publication`, `merge`,
+`prune`) and `extent_reads`.
 
 **The checkpoint.** One `walks` row per volume holds the walk's staged generation, its
 phase, its start bookmark and event UUID, the entries listed and the folders still to
@@ -549,7 +550,10 @@ leaves unused flows to the next. Before re-listing a folder, or a subtree when t
 re-list is recursive, an update compares its size in the map with what is left of its
 share, less 15% kept for finishing; one that does not fit waits for a run whose share
 covers it, and the weekly walk lists what never fits. A single listing cannot pause
-part-way.
+part-way. A folder new since the last map has no size there, and its subtree is listed
+with it, so that listing pauses between folders once the share is spent: the folders
+whose new subfolders are left are queued for a shallow re-list, which finds those
+subfolders again. One listing is the most a run can overrun its share by.
 
 **A walking volume queues nothing.** Its walk lists every folder afresh, and the replay
 after it publishes re-lists every change since the walk began, so a folder its update

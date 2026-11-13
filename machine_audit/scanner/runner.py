@@ -102,6 +102,23 @@ def relist(store,walker,policy,volume,now,changes,pace=None,walking=False):
         return pace is None or pace.covers(store.mapped_entries(identity,recursive)*RELIST_NS_PER_ENTRY)
     def supersede(count=1):
         store.superseded+=count;walker.gaps.add('walk_supersedes')
+    unfinished=set()
+    def list_paced(path,parent,private,recursive):
+        # A new folder has no size in the map to admit it by, and its subtree is listed
+        # with it, so the listing pauses between folders once the share is spent. The
+        # parents of the folders left are re-listed by a later run, which finds them again.
+        if pace is None:return walker.walk(path,parent,private,recursive=recursive)
+        first=True;left=[]
+        def bound(pending,identity):
+            nonlocal first
+            if first or pace.covers(0):
+                first=False;return 'go'
+            left.extend(pending());return 'stop'
+        listed=walker.walk(path,parent,private,recursive=recursive,pace=bound)
+        parents={parent for _,parent,_ in left}
+        if parents and walking:supersede(len(parents))
+        elif parents:unfinished.update(parents);walker.gaps.add('update_deferred')
+        return listed
     if walking:
         dropped=store.drop_deferred()
         if dropped:supersede(dropped)
@@ -197,11 +214,11 @@ def relist(store,walker,policy,volume,now,changes,pace=None,walking=False):
             parent,above=resolve_mapped(store,walker,volume,os.path.dirname(path))
             # Each way this can fail names itself: the run record is the only evidence.
             if not above:walker.gaps.add('parent_unresolved');complete=False
-            elif not walker.walk(parent,live_parent(store,walker,volume,parent,above['parent']),above['kind']=='private',recursive=False):
+            elif not list_paced(parent,live_parent(store,walker,volume,parent,above['parent']),above['kind']=='private',False):
                 if os.path.lexists(parent):walker.gaps.add('parent_unlistable');complete=False
             continue
         if recursive:store.clear_subtree(previous['id'])
-        if not walker.walk(path,live_parent(store,walker,volume,path,previous['parent']),previous['kind']=='private',recursive=recursive):complete=False
+        if not list_paced(path,live_parent(store,walker,volume,path,previous['parent']),previous['kind']=='private',recursive):complete=False
     # A file hard-linked since a folder holding it was listed is a plain file there and
     # a holder in the re-listed folder, so its bytes would count twice. Re-list the
     # folders that still hold it as a plain file: every link is then a holder and the
@@ -216,8 +233,9 @@ def relist(store,walker,policy,volume,now,changes,pace=None,walking=False):
             later.append((folder,now,False));walker.gaps.add('update_deferred');continue
         if walker.directory_identity(path) is None:
             store.defer(previous['id'],now+3600*10**9,False);continue
-        if not walker.walk(path,live_parent(store,walker,volume,path,previous['parent']),previous['kind']=='private',recursive=False):complete=False
+        if not list_paced(path,live_parent(store,walker,volume,path,previous['parent']),previous['kind']=='private',False):complete=False
     if later:store.defer_all(later)
+    if unfinished:store.defer_unfinished(unfinished,now)
     return complete
 
 
@@ -493,7 +511,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     store.phase('prepare',action=action,trigger=trigger)
                     store.prepare(volume,full=False,lean=not full_disk_access)
                     walker=Walker(volume,policy,store,fs,grain)
-                    store.phase('walk')
+                    store.phase('relist')
                     share=Share(pace,last[volume.id],sum(last[v.id] for v in volumes[position:]))
                     store.superseded=0
                     complete=relist(store,walker,policy,volume,now,

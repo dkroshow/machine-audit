@@ -232,6 +232,7 @@ class MapStore:
         self.stage_cpu=defaultdict(int);self.stage_mark=None;self.extent_reads=0
         self.allowance_ns=self.room_ns=None
         self.superseded=0  # Refreshes the current volume's walk superseded this run.
+        self.unfinished=set()  # Folders this run listed whose new subfolders it left unlisted.
         self.walk=None
 
     def _configure(self):
@@ -354,6 +355,7 @@ class MapStore:
         # This attempt owns any failure from here on, including a refused prune,
         # and a full attempt is recorded before the cleanup that can refuse it.
         self.volume,self.generation,self.base_gen=volume.id,None,None
+        self.unfinished=set()
         with self.write(rows=2 if full else 1):
             self.db.execute('INSERT OR IGNORE INTO volumes(id,label,mount,status,lean) VALUES(?,?,?,?,?)',
                             (volume.id,volume.label,volume.mount,'building',int(lean)))
@@ -570,6 +572,17 @@ class MapStore:
             with self.write(rows=len(refreshes[first:first+DIRTY_BATCH])):self.db.executemany('''INSERT INTO dirty VALUES(?,?,?,?)
                 ON CONFLICT(volume,id) DO UPDATE SET due_ns=min(due_ns,excluded.due_ns),recursive=max(coalesce(recursive,1),excluded.recursive)''',
                 ((self.volume,identity,due_ns,int(recursive)) for identity,due_ns,recursive in refreshes[first:first+DIRTY_BATCH]))
+
+    def defer_unfinished(self,folders,due_ns):
+        """Queue folders listed this run whose new subfolders a paused listing left
+        unlisted. Those subfolders are not in the map, so a shallow re-list of each
+        folder finds them again. This run's listing does not discharge the row, and it
+        already did any wider refresh queued for the folder, so the row becomes shallow."""
+        self.unfinished|=set(folders);rows=sorted(folders)
+        for first in range(0,len(rows),DIRTY_BATCH):
+            with self.write(rows=len(rows[first:first+DIRTY_BATCH])):self.db.executemany('''INSERT INTO dirty VALUES(?,?,?,0)
+                ON CONFLICT(volume,id) DO UPDATE SET due_ns=excluded.due_ns,recursive=0''',
+                ((self.volume,identity,due_ns) for identity in rows[first:first+DIRTY_BATCH]))
 
     def plain_links(self):
         """The ids of folders of the published map that hold a hard-linked file as a plain file,
@@ -1066,8 +1079,9 @@ class MapStore:
         leaves only costs one more re-list. Probes the small dirty set, never the map."""
         while True:
             ids=[r[0] for r in self.db.execute('''SELECT id FROM dirty WHERE volume=? AND EXISTS(SELECT 1 FROM listings l
-                WHERE l.generation=? AND l.volume=? AND l.id=inode_key(dirty.id)) LIMIT ?''',
-                (self.volume,generation,self.vid,DIRTY_BATCH))]
+                WHERE l.generation=? AND l.volume=? AND l.id=inode_key(dirty.id))
+                AND id NOT IN (SELECT value FROM json_each(?)) LIMIT ?''',
+                (self.volume,generation,self.vid,json.dumps(sorted(self.unfinished)),DIRTY_BATCH))]
             if not ids:return
             if self.run_context['stage']!='deferrals':self.phase('deferrals')
             self.forget_deferred(ids)
