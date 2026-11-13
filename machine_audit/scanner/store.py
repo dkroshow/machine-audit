@@ -618,8 +618,10 @@ class MapStore:
         after_full=old['full_ns'] is not None and (old['observed_ns']-old['full_ns']<=2*hour or not old['valid'])
         start=old['full_ns'] if after_full else old['observed_ns']
         since=start-2*hour
+        # The listings drive the join (CROSS JOIN fixes the order): driven by the file
+        # rows it read all 11.9 M of Big Mac's startup volume, 8 s an update; now 0.1 s.
         return [tuple(row) for row in self.db.execute('''SELECT f.parent,f.id,f.allocated FROM listings l
-            JOIN files f ON f.generation=l.generation AND f.volume=l.volume AND f.parent=l.id
+            CROSS JOIN files f ON f.generation=l.generation AND f.volume=l.volume AND f.parent=l.id
             WHERE l.generation=? AND l.volume=? AND l.listed_ns>=? AND f.mtime>=l.listed_ns-3600000000000''',
             (self.base_gen,self.vid,since))]
 
