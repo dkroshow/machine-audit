@@ -116,7 +116,7 @@ MERGE_ROWS=4096
 # row, and at publication Big Mac's 4.8 GB store leaves about 1 GB under the 10 GB cap:
 # 8,192 rows reserved 0.54 GB there, 4,096 rows 0.27 GB.
 WRITE_ROWS=4096
-DIRTY_BATCH=1024
+DIRTY_BATCH=256  # 16 pages a row: about 17 MB reserved a write.
 NODE_INSERT='INSERT OR REPLACE INTO nodes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)'
 # Re-read at most this many streams' extents in one hourly update.
 SHARING_REREADS=20_000
@@ -231,6 +231,7 @@ class MapStore:
         # CPU by stage across this run, the extents it read, and its allowance.
         self.stage_cpu=defaultdict(int);self.stage_mark=None;self.extent_reads=0
         self.allowance_ns=self.room_ns=None
+        self.superseded=0  # Refreshes the current volume's walk superseded this run.
         self.walk=None
 
     def _configure(self):
@@ -624,6 +625,20 @@ class MapStore:
             CROSS JOIN files f ON f.generation=l.generation AND f.volume=l.volume AND f.parent=l.id
             WHERE l.generation=? AND l.volume=? AND l.listed_ns>=? AND f.mtime>=l.listed_ns-3600000000000''',
             (self.base_gen,self.vid,since))]
+
+    def queued_entries(self,volume_id,now):
+        """Entries in the folders queued for `volume_id` and due: part of its demand."""
+        return self.db.execute('''SELECT coalesce(sum(l.count),0) FROM dirty d JOIN volumes v ON v.id=d.volume
+            JOIN listings l ON l.generation=v.generation AND l.volume=v.key AND l.id=inode_key(d.id)
+            WHERE d.volume=? AND d.due_ns<=?''',(volume_id,now)).fetchone()[0]
+
+    def drop_deferred(self):
+        """Drop every refresh queued for this volume, superseded by its walk. Returns
+        how many."""
+        dropped=0
+        while ids:=[r[0] for r in self.db.execute('SELECT id FROM dirty WHERE volume=? LIMIT ?',(self.volume,DIRTY_BATCH))]:
+            self.forget_deferred(ids);dropped+=len(ids)
+        return dropped
 
     def forget_deferred(self,identities):
         """Drop deferred refreshes of folders no longer in the map: nothing can re-list

@@ -490,7 +490,7 @@ such rows. A refused publication keeps its counted terms in that volume's
 existing and free pages, and the shortfall. The deferred refreshes a publication's
 listings fulfil are deleted after it, in bounded batches (a run that drained 12 k of
 Big Mac's backlog had declared a 9.95 GB peak inside it); a row a crash leaves costs
-one more re-list. Deferrals are written only when new, in batches of 1,024, and a walk
+one more re-list. Deferrals are written only when new, in batches of 256, and a walk
 the cap refuses keeps its checkpoint and waits at the retry gate.
 Big Mac's first trial refused a main update that declared at least 846,874 dirty
 pages, the whole file, derived from its stored retry level (about 52,926 rows if

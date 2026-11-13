@@ -90,15 +90,21 @@ def reallocated(store,walker):
     return changes
 
 
-def relist(store,walker,policy,volume,now,changes,pace=None):
+def relist(store,walker,policy,volume,now,changes,pace=None,walking=False):
     """Re-list changed folders, given as (absolute path, recursive), plus deferred ones now due.
     `pace` is the volume's share of the run: a folder, or a recursive subtree, whose size
-    in the map exceeds what is left of it is deferred to a later run, never more than
-    a day; a single listing cannot pause part-way."""
-    def fits(identity,recursive,path):
-        if pace is None:return True
-        if path in due_at and now-due_at[path]>=PIECE_WAIT_NS:return True
-        return pace.covers(store.mapped_entries(identity,recursive)*RELIST_NS_PER_ENTRY)
+    in the map exceeds what is left of it waits for a run whose share covers it; a single
+    listing cannot pause part-way, and the weekly walk lists what never fits.
+    While the volume `walking`, nothing is queued: its walk lists every folder afresh, and
+    the replay after it publishes re-lists every change since it began, so what this
+    update leaves is superseded (counted in `store.superseded`, gap walk_supersedes)."""
+    def fits(identity,recursive):
+        return pace is None or pace.covers(store.mapped_entries(identity,recursive)*RELIST_NS_PER_ENTRY)
+    def supersede(count=1):
+        store.superseded+=count;walker.gaps.add('walk_supersedes')
+    if walking:
+        dropped=store.drop_deferred()
+        if dropped:supersede(dropped)
     roots_to_update={}
     recursive_roots=set()
     due_paths={}
@@ -137,6 +143,7 @@ def relist(store,walker,policy,volume,now,changes,pace=None):
             path=due_paths.get(found['id'],path)
             listing=store.listing(found['id'])
             if path not in roots_to_update and listing and listing['count']>LARGE_FOLDER_ENTRIES and now-listing['listed_ns']<86400*10**9:
+                if walking:supersede();continue
                 store.defer(found['id'],listing['listed_ns']+86400*10**9,recursive)
                 walker.gaps.add('large_directory_deferred')
                 continue
@@ -165,7 +172,8 @@ def relist(store,walker,policy,volume,now,changes,pace=None):
         if path in recursive_roots:covering.add(path)
         previous=roots_to_update[path]
         recursive=path in recursive_roots
-        if not fits(previous['id'],recursive,path):
+        if not fits(previous['id'],recursive):
+            if walking:supersede();continue
             # Its share cannot cover it: a later run re-lists it first.
             # One already queued keeps its row; only a new deferral is written.
             if path not in due_at:later.append((previous['id'],now,recursive))
@@ -203,7 +211,8 @@ def relist(store,walker,policy,volume,now,changes,pace=None):
         previous=store.known_directory(folder)
         path=previous and (previous['path'] or walker.path_of(folder))
         if not path or path in chosen:continue
-        if not fits(folder,False,path):
+        if not fits(folder,False):
+            if walking:supersede();continue
             later.append((folder,now,False));walker.gaps.add('update_deferred');continue
         if walker.directory_identity(path) is None:
             store.defer(previous['id'],now+3600*10**9,False);continue
@@ -352,7 +361,11 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
             # share of what is left, so one volume's churn cannot starve the others.
             # Walks go one volume at a time: one under way first, then in that order.
             outcomes=store.last_outcomes()
-            last={volume_id:outcome.get('entries') or 0 for volume_id,outcome in outcomes.items()}
+            # Each update's demand: what it re-listed last run and what is queued for it
+            # now, at the re-list rate. A walking volume's queue is superseded by its walk.
+            last={volume.id:RELIST_NS_PER_ENTRY*((outcomes.get(volume.id) or {}).get('entries') or 0)+
+                  (0 if volume.id in walks else RELIST_NS_PER_ENTRY*store.queued_entries(volume.id,time.time_ns()))
+                  for volume in volumes}
             listed_order={v.id:i for i,v in enumerate(volumes)}  # Results are reported in volume order.
             volumes=sorted(volumes,key=lambda v:last.get(v.id,0))
             walking=[]  # (volume, trigger, event uuid): paced walk work, after every update
@@ -480,16 +493,18 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     store.prepare(volume,full=False,lean=not full_disk_access)
                     walker=Walker(volume,policy,store,fs,grain)
                     store.phase('walk')
-                    share=Share(pace,len(volumes)-position)
+                    share=Share(pace,last[volume.id],sum(last[v.id] for v in volumes[position:]))
+                    store.superseded=0
                     complete=relist(store,walker,policy,volume,now,
                            ((os.path.normpath(os.path.join(volume.mount,relative.lstrip('/'))),recursive)
-                            for relative,recursive in replay.paths.items()),share)
+                            for relative,recursive in replay.paths.items()),share,walking=volume.id in walks)
                     if not complete:
                         root_failed=True
                         processed+=walker.entries
                         store.mark_failed('update_unreadable',end_run=False)
                         results.append({'volume_id':volume.id,'status':'update_unreadable','action':action,
-                                        'trigger':trigger,'entries':walker.entries,'gaps':sorted(walker.gaps)})
+                                        'trigger':trigger,'entries':walker.entries,'gaps':sorted(walker.gaps),
+                                        **({'superseded':store.superseded} if store.superseded else {})})
                         continue
                     # Read used space again: the walk took time, and the reconciliation's
                     # tolerance is how much it changed meanwhile.
@@ -515,13 +530,14 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     root_failed|=exc.code!='allowance_spent';published+=1;processed+=walker.entries
                     status=store.db.execute('SELECT status FROM volumes WHERE id=?',(volume.id,)).fetchone()[0]
                     results.append({'volume_id':volume.id,'status':status,'action':action,'trigger':trigger,
-                                    'entries':walker.entries,'gaps':sorted(walker.gaps),'merge':exc.code})
+                                    'entries':walker.entries,'gaps':sorted(walker.gaps),'merge':exc.code,
+                                    **({'superseded':store.superseded} if store.superseded else {})})
                     continue
                 published+=1
                 processed+=walker.entries
                 store.progress(processed)
                 results.append({'volume_id':volume.id,'status':'observed','action':action,'trigger':trigger,'entries':walker.entries,
-                                'gaps':sorted(walker.gaps)})
+                                'gaps':sorted(walker.gaps),**({'superseded':store.superseded} if store.superseded else {})})
             walking.sort(key=lambda item:item[0].id not in walks)
             for volume,trigger,event_uuid in walking:
                 outcome=paced_walk(store,events,fs,policy,grain,volume,trigger,event_uuid,pace,lean=not full_disk_access)

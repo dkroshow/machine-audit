@@ -538,14 +538,22 @@ Deferred name-withheld folders are found the same way. A failed attempt (an exce
 the scanner catches) does not resume: its checkpoint is dropped and the retry rules
 decide the next walk. So does a change of the volume's event UUID or name access.
 
-**Each volume's update gets its share.** Updates go smallest first, by their last
-run's entries, and each may spend what is left of the allowance divided by the volumes
-still to update, so one volume's churn cannot starve the others and what a volume leaves
-unused flows to the next. Before re-listing a folder, or a subtree when the re-list is
-recursive, an update compares its size in the map (about 500 µs an entry: a re-list
-costs 240-470 µs an entry on Big Mac, against 150-190 µs for the walk) with what is
-left of its share; one that does not fit is deferred, never longer than a day, since a
-single listing cannot pause part-way.
+**Each volume's update gets its share.** A volume's demand is what its update re-listed in
+the last run plus the folders queued for it, at about 500 µs an entry (a re-list costs
+240-470 µs an entry on Big Mac, against 150-190 µs for the walk). Each update may spend
+what is left of the allowance in proportion to its demand among the volumes still to
+update, but at least 10 s, so one volume's churn cannot starve another; what a volume
+leaves unused flows to the next. Before re-listing a folder, or a subtree when the
+re-list is recursive, an update compares its size in the map with what is left of its
+share, less 15% kept for finishing; one that does not fit waits for a run whose share
+covers it, and the weekly walk lists what never fits. A single listing cannot pause
+part-way.
+
+**A walking volume queues nothing.** Its walk lists every folder afresh, and the replay
+after it publishes re-lists every change since the walk began, so a folder its update
+cannot cover is dropped rather than queued, and its queue is dropped when the walk is
+under way. The run row counts them (`superseded`) with the gap `walk_supersedes`. A change
+its share does not cover reaches the published map at the walk's publication.
 
 **Volumes walk one at a time:** a walk under way goes on first. Every volume keeps its
 hourly update while its walk is under way or queued behind another's; only the walk

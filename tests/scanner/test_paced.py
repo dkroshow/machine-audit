@@ -158,26 +158,26 @@ class PacedWalkTests(unittest.TestCase):
         first = self.scan(data)  # Starts the walk; the published map stands.
         self.assertEqual(first['volumes'][0]['walk']['state'], 'paused')
         for folder in changed:(folder / 'added').write_bytes(b'y' * 8192)
-        # An allowance the update spends at once: both changed folders wait for the next run.
-        second = self.scan(data, events=events, floor=1)
+        # An allowance the update spends at once (no minimum share). The volume walks, so
+        # nothing is queued: its walk and the replay after it re-list both folders.
+        with patch.object(pace, 'MIN_SHARE_NS', 0):
+            second = self.scan(data, events=events, floor=1)
         update = second['volumes'][0]
         self.assertEqual((update['action'], update['status']), ('update', 'observed'))
-        self.assertIn('update_deferred', update['gaps'])
+        self.assertIn('walk_supersedes', update['gaps'])
+        self.assertEqual(update['superseded'], 2)
         with self.db(data) as db:
-            self.assertEqual(db.execute("SELECT count(*) FROM dirty WHERE volume='v'").fetchone()[0], 2)
-        # The next update re-lists them first and publishes; the walk goes on beside it.
-        third = self.scan(data, events=SimpleNamespace(uuid=lambda device: 'events', current_id=lambda: 22,
-                                                       replay=lambda device, since: Replay(up_to=22)))
-        self.assertEqual(third['volumes'][0]['action'], 'update')
-        with self.db(data) as db:
-            self.assertEqual(db.execute("SELECT count(*) FROM dirty WHERE volume='v'").fetchone()[0], 0)
-        nodes, files = self.published_map(data)
-        self.assertEqual(sum(1 for f in files if f[2] == 'added'), 2)
+            self.assertEqual(db.execute("SELECT count(*) FROM dirty WHERE volume='v'").fetchone()[0], 0, 'the backlog grew')
         self.assertIsNotNone(self.walk_row(data), 'the walk should still be running')
         while self.walk_row(data):self.scan(data)
         with self.db(data) as db:
             # It publishes with its own start bookmark: the next update replays every change since.
             self.assertEqual(db.execute("SELECT bookmark FROM volumes WHERE id='v'").fetchone()[0], 20)
+        self.now += 60 * SECOND  # The walk published 1 ns after that run's update: an hour on is 1 ns short.
+        catch_up = self.scan(data, events=events)
+        self.assertEqual(catch_up['volumes'][0]['action'], 'update')
+        nodes, files = self.published_map(data)
+        self.assertEqual(sum(1 for f in files if f[2] == 'added'), 2, 'the catch-up did not re-list them')
 
     def updating_store(self):
         """A published map of the tree, with an hourly update due."""
@@ -320,7 +320,7 @@ class PacedWalkTests(unittest.TestCase):
             changed = [self.tree / f'folder{a}' / f'sub{b}' for a in range(5) for b in range(2)]
             before = self.walk_row(data)['entries']
             result = self.scan(data, full=False, events=self.events(changed, 60), floor=25 * SECOND, clock=lambda: spent[0])
-        self.assertIn('update_deferred', result['volumes'][0]['gaps'])
+        self.assertIn('walk_supersedes', result['volumes'][0]['gaps'])
         # The update reached the 25 s allowance; the walk got its 20 s floor: two folders
         # of at most 6 entries each.
         self.assertTrue(0 < self.walk_row(data)['entries'] - before <= 2 * 6, (before, self.walk_row(data)['entries']))
@@ -379,11 +379,14 @@ class PacedWalkTests(unittest.TestCase):
             self.assertEqual(listed_ns(big), big_before, 'a 40 s folder was listed in a 25 s share')
             self.assertLessEqual(spent[0] - before, 25 * SECOND)
             self.assertTrue(all(listed_ns(folder) > big_before for folder in small))
-            # Never more than a day: then it is listed even though no share covers it.
+            # It waits, however long, for a share that covers it: never forced at a day...
             with self.db(data) as db:
                 db.execute('UPDATE dirty SET due_ns=due_ns-?', (25 * HOUR,))
             self.scan(data, events=self.events([], 71), floor=25 * SECOND, clock=lambda: spent[0])
-            self.assertGreater(listed_ns(big), big_before)
+            self.assertEqual(listed_ns(big), big_before, 'forced past its share at the day cap')
+        # ...and the weekly walk lists it.
+        self.assertEqual(self.scan(data, force=True)['status'], 'observed')
+        self.assertGreater(listed_ns(big), big_before)
 
     def test_a_churning_volume_does_not_starve_another_volumes_update(self):
         # Big Mac, Nov 12: the startup volume's churn took every run's allowance and the
@@ -434,9 +437,15 @@ class PacedWalkTests(unittest.TestCase):
         result = self.scan(data, events=self.events([], 90), floor=10**6, limit=limit)
         update = result['volumes'][0]
         self.assertEqual((update['action'], update['status']), ('update', 'observed'))
-        self.assertIn('update_deferred', update['gaps'])
+        # The walk supersedes the whole queue: it is dropped in bounded writes, and counted
+        # in the run row even when the update's merge pauses at the allowance.
+        self.assertEqual(update['superseded'], 1200)
         with self.db(data) as db:
-            self.assertEqual(db.execute("SELECT count(*) FROM dirty WHERE volume='v'").fetchone()[0], 1200)
+            recorded = json.loads(db.execute('SELECT volumes FROM runs ORDER BY started_ns DESC LIMIT 1').fetchone()[0])
+        self.assertEqual(recorded[0]['superseded'], 1200)
+        self.assertIn('walk_supersedes', update['gaps'])
+        with self.db(data) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM dirty WHERE volume='v'").fetchone()[0], 0)
 
     def test_a_refused_walk_write_keeps_the_checkpoint_and_resumes(self):
         # A walk dropped on a refusal restarts days of walking (criteria 1 and 2).

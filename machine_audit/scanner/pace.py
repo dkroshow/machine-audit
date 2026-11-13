@@ -107,15 +107,20 @@ class Allowance:
 FINISH_RESERVE = 0.15
 
 
+# Every volume's update gets at least this, so one volume's churn cannot starve another.
+MIN_SHARE_NS = 10 * 10**9
+
+
 class Share:
-    """The part of a run's allowance one volume's update may spend: what is left,
-    divided among the volumes still to update, so one volume's churn cannot starve
-    the others and what a volume leaves unused flows to the next. Re-listing stops
-    short of it by FINISH_RESERVE, kept for the update's finishing stages."""
-    def __init__(self, allowance, volumes_left):
+    """The part of a run's allowance one volume's update may spend: what is left of the
+    allowance in proportion to the volume's demand among the volumes still to update,
+    but at least MIN_SHARE_NS. What a volume leaves unused flows to the next. Re-listing
+    stops short of it by FINISH_RESERVE, kept for the update's finishing stages."""
+    def __init__(self, allowance, demand_ns, demand_left_ns):
         self.allowance = allowance
         self.start = allowance.spent()
-        self.limit = None if allowance.limit is None else max(0, allowance.limit - self.start) // max(1, volumes_left)
+        left = None if allowance.limit is None else max(0, allowance.limit - self.start)
+        self.limit = None if left is None else max(MIN_SHARE_NS, left * demand_ns // max(1, demand_left_ns))
 
     def remaining(self):
         return None if self.limit is None else self.limit - (self.allowance.spent() - self.start)
