@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from dataclasses import replace
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -14,6 +15,9 @@ from machine_audit.scanner.policy import Policy
 from machine_audit.scanner.runner import relist
 from machine_audit.scanner.store import MapStore, MapQuery
 from machine_audit.scanner.walker import Walker
+
+HOUR=3600*10**9
+DAY=24*HOUR
 
 
 class RelistTests(unittest.TestCase):
@@ -301,19 +305,35 @@ class RelistTests(unittest.TestCase):
         # were listed minutes after, while space was still reserved, and the space was
         # released later with no change to the folder. No event reported it, 1.82 GB
         # stayed counted, and the map stayed invalid.
-        written=self.tree/'written';linked=self.tree/'linked';written.mkdir();linked.mkdir()
-        for i in range(3):
-            (written/f'copy{i}').write_bytes(os.urandom(4*1024**2))
-        os.link(written/'copy0',linked/'copy0')
-        self.baseline()  # Listed while the copies hold 4 MB each.
-        for i in range(3):
-            info=(written/f'copy{i}').stat()
-            os.truncate(written/f'copy{i}',4096)  # Disposable synthetic file: its space released.
-            os.utime(written/f'copy{i}',ns=(info.st_atime_ns,info.st_mtime_ns))
-        walker=Walker(self.volume,self.policy,self.store)
-        relist(self.store,walker,self.policy,self.volume,0,[])  # No event reports it.
-        self.store.finish_volume(self.volume,None,walker.gaps,full=False,lean=True)
-        self.assertEqual(self.published_physical(),self.fresh_physical())
+        # Big Mac, Nov 14: a paced walk publishes days after it listed most folders, so
+        # the next update must look back to the walk's start, not to its publication.
+        for paced in (False,True):
+            with self.subTest(paced=paced):
+                self.store.close();data=self.root/f'data-{paced}';data.mkdir()
+                self.store=MapStore(data/'scanner.sqlite',Budget(data,limit_bytes=256*1024**2,free_margin_bytes=0))
+                self.tree=self.root/f'tree-{paced}';self.tree.mkdir()
+                self.volume=replace(self.volume,mount=str(self.tree))
+                written=self.tree/'written';linked=self.tree/'linked';written.mkdir();linked.mkdir()
+                for i in range(3):
+                    (written/f'copy{i}').write_bytes(os.urandom(4*1024**2))
+                os.link(written/'copy0',linked/'copy0')
+                start=time.time_ns()
+                if paced:  # Listed while the copies hold 4 MB each; published 3 days later.
+                    self.store.begin_walk(self.volume,lean=True,bookmark=None,event_uuid=None,trigger='weekly_full')
+                    walker=Walker(self.volume,self.policy,self.store);walker.walk()
+                    with patch('time.time_ns',return_value=start+3*DAY):
+                        self.store.finish_volume(self.volume,None,walker.gaps,full=True,lean=True)
+                        self.store.prepare(self.volume,full=False)
+                else:self.baseline()  # Listed while the copies hold 4 MB each.
+                for i in range(3):
+                    info=(written/f'copy{i}').stat()
+                    os.truncate(written/f'copy{i}',4096)  # Disposable synthetic file: its space released.
+                    os.utime(written/f'copy{i}',ns=(info.st_atime_ns,info.st_mtime_ns))
+                with patch('time.time_ns',return_value=start+3*DAY+HOUR):
+                    walker=Walker(self.volume,self.policy,self.store)
+                    relist(self.store,walker,self.policy,self.volume,0,[])  # No event reports it.
+                    self.store.finish_volume(self.volume,None,walker.gaps,full=False,lean=True)
+                self.assertEqual(self.published_physical(),self.fresh_physical())
 
     def test_an_update_repairs_a_map_that_counted_a_hard_link_twice(self):
         # The map an earlier release left: the old link's folder still counts the file.

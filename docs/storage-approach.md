@@ -587,13 +587,23 @@ Each waits for a run whose allowance plus the walk floor covers its estimate (ab
 volume), but never longer than a day. A run is bounded by the allowance plus the walk
 floor anyway, so a piece that ends within that bound adds no new overrun.
 
+**Known limit: a folder bigger than any run's bound.** One folder is listed whole, so a
+folder whose listing needs more than the allowance plus the walk floor fits no run at
+the floor. It waits for an hour with more room, and at the day's limit it is listed
+anyway, in one run that overruns once. On Big Mac (Nov 14) a second volume's walk was
+left with one folder of 862,571 entries, about 170 s to list: one run about 150 s over
+the 140 s bound, once per walk. There is no rule for such folders yet.
+
 **The map meanwhile.** The published map, the previous full walk plus hourly deltas,
 keeps serving and taking updates; the walk's generation is invisible to queries and
 never pruned. The walk publishes by the same pointer switch as before, with its start
 bookmark, so the next update replays every change since it began (on Big Mac, 9 hours
 of changes touched 31.7 k folders with 402 k entries, not counting the over-20 k
 folders limited to daily), paced by the same allowance. The weekly cadence counts from
-the walk's start, which becomes the map's full-scan time. The reconciliation's
+the walk's start, which becomes the map's full-scan time. The next update re-checks
+files that were recently written when the walk listed them, from the walk's start
+(`volumes.recheck_ns`), because space reserved while a file is written is released
+later with no event; later updates re-check only their own hour's listings. The reconciliation's
 tolerance is every move of used space while the walk ran, in either direction. The
 storage answer's volume rows carry `walk` (phase, entries, expected entries from the
 previous walk, start, runs, CPU), and the tab says how far along it is.

@@ -480,7 +480,9 @@ than restart days of walking.
 The store gains nullable `volumes.budget_retry_bytes` and `dirty.recursive` on
 first open. A release before them inserted `dirty` rows positionally and fails
 on a migrated store; rolling back needs a release that names `dirty`'s columns,
-whose rows then read as unknown scope.
+whose rows then read as unknown scope. It also gains nullable `volumes.recheck_ns`:
+an earlier release ignores it, and a volume published by one has none, so its next
+update re-checks only its own hour.
 
 The merge copies each differing staged row with one insert-or-update on its
 primary key, counted as one row. An update reserves

@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS volumes(
  observed_ns INTEGER,full_ns INTEGER,volume_used INTEGER,capacity INTEGER,free INTEGER,available INTEGER,
  valid INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL,lean INTEGER NOT NULL,bookmark INTEGER,
  no_progress INTEGER NOT NULL DEFAULT 0,event_uuid TEXT,gaps TEXT NOT NULL DEFAULT '[]',mounted INTEGER NOT NULL DEFAULT 1,full_attempt_ns INTEGER,budget_retry_bytes INTEGER,delta_generation INTEGER,
- used_change INTEGER,unplaced_shared INTEGER);
+ used_change INTEGER,unplaced_shared INTEGER,recheck_ns INTEGER);
 CREATE TABLE IF NOT EXISTS nodes(
  generation INTEGER NOT NULL,volume INTEGER NOT NULL,id INTEGER NOT NULL,parent INTEGER,label TEXT,kind TEXT NOT NULL,
  own_listed INTEGER NOT NULL,own_physical INTEGER NOT NULL,listed INTEGER,physical INTEGER,status TEXT NOT NULL,mtime INTEGER,
@@ -211,7 +211,8 @@ class MapStore:
                 with self.write(rows=len(missing_columns)):
                     for column in sorted(missing_columns):
                         self.db.execute(f'ALTER TABLE runs ADD COLUMN {column} {kinds[column]}')
-            for table,column in (('volumes','full_attempt_ns'),('volumes','budget_retry_bytes'),('dirty','recursive')):
+            for table,column in (('volumes','full_attempt_ns'),('volumes','budget_retry_bytes'),('dirty','recursive'),
+                                 ('volumes','recheck_ns')):
                 if column not in {r['name'] for r in self.db.execute(f'PRAGMA table_info({table})')}:
                     with self.write(rows=1):
                         self.db.execute(f'ALTER TABLE {table} ADD COLUMN {column} INTEGER')
@@ -622,18 +623,18 @@ class MapStore:
     def recently_written(self):
         """Files a recent listing may have caught while still being written: modified
         within the hour before their folder was listed, in folders listed since the
-        previous update (or, for the first updates after a full walk, since the walk
+        previous update (or, for the first update after a full walk, since the walk
         began). As (folder, file, allocated). Space reserved while a file is written is
         released afterwards with no change to its folder, so no event reports it (Big
         Mac, Nov 12: 269 such files counted 1.82 GB no longer allocated)."""
-        old=self.db.execute('SELECT observed_ns,full_ns,valid FROM volumes WHERE id=?',(self.volume,)).fetchone()
+        old=self.db.execute('SELECT observed_ns,full_ns,valid,recheck_ns FROM volumes WHERE id=?',(self.volume,)).fetchone()
         if old is None or old['observed_ns'] is None:return []
-        # Listings come before their publication: an hour's run, or a whole paced walk
-        # (whose full-scan time is its start), with an hour's slack. A map already
-        # invalid checks every listing since its full walk, which repairs it.
+        # Listings come before their publication: an update's within its hour, a full
+        # walk's since it began (`recheck_ns`, which a paced walk sets days back), with
+        # an hour's slack. A map already invalid checks every listing since its full
+        # walk, which repairs it.
         hour=3600*10**9
-        after_full=old['full_ns'] is not None and (old['observed_ns']-old['full_ns']<=2*hour or not old['valid'])
-        start=old['full_ns'] if after_full else old['observed_ns']
+        start=old['full_ns'] if not old['valid'] and old['full_ns'] is not None else old['recheck_ns'] or old['observed_ns']
         since=start-2*hour
         # The listings drive the join (CROSS JOIN fixes the order): driven by the file
         # rows it read all 11.9 M of Big Mac's startup volume, 8 s an update; now 0.1 s.
@@ -1173,14 +1174,17 @@ class MapStore:
                 # A volume's observation times never repeat: points and hierarchy epochs
                 # are keyed by them, and an update and a walk can publish in one run.
                 now=max(time.time_ns(),(old['observed_ns'] or 0)+1)
+                # A full walk's listings span its whole run, from its start: the next
+                # update re-checks them all (`recheck_ns`), then only its own hour's.
+                full_ns=(self.walk['started_ns'] if self.walk else now) if full else old['full_ns']
                 self._points(published,now,result['valid'],full,delta)
                 save_hierarchy(self.db,published,self.volume,now,volume_key=self.vid,delta=delta)
                 self.db.execute('''UPDATE volumes SET label=?,mount=?,generation=?,observed_ns=?,full_ns=?,volume_used=?,capacity=?,free=?,available=?,
                     valid=?,status=?,lean=?,bookmark=?,no_progress=?,event_uuid=?,gaps=?,mounted=1,budget_retry_bytes=NULL,delta_generation=?,
-                    used_change=?,unplaced_shared=? WHERE id=?''',
-                    (volume.label,volume.mount,published,now,(self.walk['started_ns'] if self.walk else now) if full else old['full_ns'],volume.used,volume.capacity,volume.free,volume.available,
+                    used_change=?,unplaced_shared=?,recheck_ns=? WHERE id=?''',
+                    (volume.label,volume.mount,published,now,full_ns,volume.used,volume.capacity,volume.free,volume.available,
                      int(result['valid']),result['status'],int(lean),bookmark,no_progress,
-                     event_uuid,gap_text,delta,used_change,unplaced,self.volume))
+                     event_uuid,gap_text,delta,used_change,unplaced,full_ns if full else None,self.volume))
                 if full and old['generation'] is not None:
                     self.db.execute("UPDATE generations SET status='retired' WHERE id=?",(old['generation'],))
                 self.db.execute("UPDATE generations SET status='published' WHERE id=?",(published,))
