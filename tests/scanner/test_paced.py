@@ -471,13 +471,18 @@ class PacedWalkTests(unittest.TestCase):
                 runs.append((spent[0] - before) // SECOND)
                 self.assertEqual(MapQuery(data / 'scanner.sqlite').query('volumes')['rows'][0]['valid'], True)
                 with self.db(data) as db:
-                    stages = json.loads(db.execute('SELECT stage_cpu FROM runs ORDER BY started_ns DESC LIMIT 1').fetchone()[0])
+                    stages, volumes = db.execute('SELECT stage_cpu,volumes FROM runs ORDER BY started_ns DESC LIMIT 1').fetchone()
+                    stages = json.loads(stages);volume, = json.loads(volumes)
                     left = db.execute("""SELECT (SELECT count(*) FROM dirty WHERE volume='v')+
                         (SELECT count(delta_generation) FROM volumes WHERE id='v')""").fetchone()[0]
                 if run == 0:
                     self.assertIn('update_deferred', result['volumes'][0]['gaps'])
-                    # An update's listing is its own stage, apart from a walk's.
+                    # An update's listing is its own stage, apart from a walk's, and the run
+                    # row splits its listing CPU from its change and deferral handling, beside
+                    # the entries it listed: a per-entry cost to compare with the walk's.
                     self.assertIn('relist', stages);self.assertNotIn('walk', stages)
+                    self.assertTrue(volume['entries'] > 0 and volume['list_ns'] > 0, volume)
+                    self.assertTrue({'events_ns', 'deferrals_ns'} <= volume.keys(), volume)
                 if not left:break
         # Each run stops within its 25 s share plus the one folder under way (at most
         # 8 entries); the folders left are listed by later runs, to the unpaced map.

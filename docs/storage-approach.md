@@ -532,8 +532,11 @@ spends the allowance in this order:
 
 The operator's `scan --full` is unpaced. The run row records `allowance_ns`, `room_ns`
 (null when unknown), CPU by stage (`stage_cpu`, ns: `walk` is a full walk's listing,
-`relist` the updates' listing, `sharing`, `aggregate` is totals, `publication`, `merge`,
-`prune`) and `extent_reads`.
+`relist` the updates' re-listing, `sharing`, `aggregate` is totals, `publication`,
+`merge`, `prune`) and `extent_reads`. Each update's volume entry in `runs.volumes` splits
+its re-listing CPU (ns): `list_ns` listing folders, `events_ns` resolving the hour's
+changes, `deferrals_ns` looking up and writing deferrals; the rest of `relist` is its
+checks. Beside `entries`, `list_ns` gives a per-entry cost to compare with the walk's.
 
 **The checkpoint.** One `walks` row per volume holds the walk's staged generation, its
 phase, its start bookmark and event UUID, the entries listed and the folders still to

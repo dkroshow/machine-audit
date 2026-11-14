@@ -90,14 +90,19 @@ def reallocated(store,walker):
     return changes
 
 
-def relist(store,walker,policy,volume,now,changes,pace=None,walking=False):
+def relist(store,walker,policy,volume,now,changes,pace=None,walking=False,parts=None):
     """Re-list changed folders, given as (absolute path, recursive), plus deferred ones now due.
     `pace` is the volume's share of the run: a folder, or a recursive subtree, whose size
     in the map exceeds what is left of it waits for a run whose share covers it; a single
     listing cannot pause part-way, and the weekly walk lists what never fits.
     While the volume `walking`, nothing is queued: its walk lists every folder afresh, and
     the replay after it publishes re-lists every change since it began, so what this
-    update leaves is superseded (counted in `store.superseded`, gap walk_supersedes)."""
+    update leaves is superseded (counted in `store.superseded`, gap walk_supersedes).
+    `parts`, when given, receives this re-list's CPU by part (ns): listing folders,
+    resolving changes, and looking up and writing deferrals; the rest is its checks."""
+    parts=parts if parts is not None else {}
+    for key in ('list_ns','events_ns','deferrals_ns'):parts.setdefault(key,0)
+    clock=time.process_time_ns
     def fits(identity,recursive):
         return pace is None or pace.covers(store.mapped_entries(identity,recursive)*RELIST_NS_PER_ENTRY)
     def supersede(count=1):
@@ -107,18 +112,20 @@ def relist(store,walker,policy,volume,now,changes,pace=None,walking=False):
         # A new folder has no size in the map to admit it by, and its subtree is listed
         # with it, so the listing pauses between folders once the share is spent. The
         # parents of the folders left are re-listed by a later run, which finds them again.
-        if pace is None:return walker.walk(path,parent,private,recursive=recursive)
         first=True;left=[]
         def bound(pending,identity):
             nonlocal first
             if first or pace.covers(0):
                 first=False;return 'go'
             left.extend(pending());return 'stop'
-        listed=walker.walk(path,parent,private,recursive=recursive,pace=bound)
+        mark=clock()
+        try:listed=walker.walk(path,parent,private,recursive=recursive,pace=None if pace is None else bound)
+        finally:parts['list_ns']+=clock()-mark
         parents={parent for _,parent,_ in left}
         if parents and walking:supersede(len(parents))
         elif parents:unfinished.update(parents);walker.gaps.add('update_deferred')
         return listed
+    mark=clock()
     if walking:
         dropped=store.drop_deferred()
         if dropped:supersede(dropped)
@@ -128,6 +135,7 @@ def relist(store,walker,policy,volume,now,changes,pace=None,walking=False):
     due=store.db.execute('SELECT id,recursive FROM dirty WHERE volume=? AND due_ns<=? ORDER BY due_ns',
                          (volume.id,now)).fetchall()
     due_scope={identity:recursive is None or bool(recursive) for identity,recursive in due}
+    parts['deferrals_ns']+=clock()-mark;mark=clock()
     decisions={}  # An event's ancestors are shared with the hour's other events.
     def decide(path):
         if path not in decisions:decisions[path]=policy.decide(shown_path(volume,path))
@@ -160,6 +168,7 @@ def relist(store,walker,policy,volume,now,changes,pace=None,walking=False):
                 continue
             events[path]=found
             if recursive:recursive_roots.add(path)
+    parts['events_ns']+=clock()-mark
     later=[]  # Left for the next run: the hour's allowance is spent.
     # Chosen folders, and those of them re-listed recursively: a path is covered when
     # chosen itself or below a recursive one, found by walking up its ancestors (the
@@ -213,14 +222,18 @@ def relist(store,walker,policy,volume,now,changes,pace=None,walking=False):
     gone=[]
     for identity,_ in due:
         if pace is not None and not pace.covers(0):break
+        mark=clock()
         saved=store.known_directory(identity)
+        # A name-withheld folder has no stored path; its inode finds it, in memory.
+        path=saved and (saved['path'] or walker.path_of(identity))
+        parts['deferrals_ns']+=clock()-mark
         if saved is None:
             # No longer in the map: removed with its parent's listing, which covers it.
             gone.append(identity);continue
-        # A name-withheld folder has no stored path; its inode finds it, in memory.
-        path=saved['path'] or walker.path_of(identity)
         if path:update(path,saved,due_scope[identity] or path in recursive_roots,True)
+    mark=clock()
     if gone:store.forget_deferred(gone)
+    parts['deferrals_ns']+=clock()-mark
     # Then the changes, by depth, so an ancestor covers its subtree.
     for path in sorted(events,key=len):
         found=events[path];recursive=path in recursive_roots
@@ -241,8 +254,10 @@ def relist(store,walker,policy,volume,now,changes,pace=None,walking=False):
         if walker.directory_identity(path) is None:
             store.defer(previous['id'],now+3600*10**9,False);continue
         if not list_paced(path,live_parent(store,walker,volume,path,previous['parent']),previous['kind']=='private',False):complete=False
+    mark=clock()
     if later:store.defer_all(later)
     if unfinished:store.defer_unfinished(unfinished,now)
+    parts['deferrals_ns']+=clock()-mark
     return complete
 
 
@@ -516,7 +531,7 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     results.append({'volume_id':volume.id,'status':old['status'] if old else 'building','action':'full','trigger':walk_trigger})
                     continue
                 bookmark=replay.up_to or replay.last_good or old['bookmark']
-                walker=None
+                walker=None;parts={}  # The re-list's CPU by part, beside the entries it listed.
                 try:
                     store.phase('prepare',action=action,trigger=trigger)
                     store.prepare(volume,full=False,lean=not full_disk_access)
@@ -526,13 +541,13 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     store.superseded=0
                     complete=relist(store,walker,policy,volume,now,
                            ((os.path.normpath(os.path.join(volume.mount,relative.lstrip('/'))),recursive)
-                            for relative,recursive in replay.paths.items()),share,walking=volume.id in walks)
+                            for relative,recursive in replay.paths.items()),share,walking=volume.id in walks,parts=parts)
                     if not complete:
                         root_failed=True
                         processed+=walker.entries
                         store.mark_failed('update_unreadable',end_run=False)
                         results.append({'volume_id':volume.id,'status':'update_unreadable','action':action,
-                                        'trigger':trigger,'entries':walker.entries,'gaps':sorted(walker.gaps),
+                                        'trigger':trigger,'entries':walker.entries,'gaps':sorted(walker.gaps),**parts,
                                         **({'superseded':store.superseded} if store.superseded else {})})
                         continue
                     # Read used space again: the walk took time, and the reconciliation's
@@ -559,14 +574,14 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     root_failed|=exc.code!='allowance_spent';published+=1;processed+=walker.entries
                     status=store.db.execute('SELECT status FROM volumes WHERE id=?',(volume.id,)).fetchone()[0]
                     results.append({'volume_id':volume.id,'status':status,'action':action,'trigger':trigger,
-                                    'entries':walker.entries,'gaps':sorted(walker.gaps),'merge':exc.code,
+                                    'entries':walker.entries,'gaps':sorted(walker.gaps),'merge':exc.code,**parts,
                                     **({'superseded':store.superseded} if store.superseded else {})})
                     continue
                 published+=1
                 processed+=walker.entries
                 store.progress(processed)
                 results.append({'volume_id':volume.id,'status':'observed','action':action,'trigger':trigger,'entries':walker.entries,
-                                'gaps':sorted(walker.gaps),**({'superseded':store.superseded} if store.superseded else {})})
+                                'gaps':sorted(walker.gaps),**parts,**({'superseded':store.superseded} if store.superseded else {})})
             walking.sort(key=lambda item:item[0].id not in walks)
             for volume,trigger,event_uuid in walking:
                 open_walks=store.walks()
