@@ -122,55 +122,44 @@ def relist(store,walker,policy,volume,now,changes,pace=None,walking=False):
     if walking:
         dropped=store.drop_deferred()
         if dropped:supersede(dropped)
-    roots_to_update={}
-    recursive_roots=set()
-    due_paths={}
-    due_at={};gone=[]
-    for due,recursive,due_ns in store.db.execute('SELECT id,recursive,due_ns FROM dirty WHERE volume=? AND due_ns<=?',(volume.id,now)).fetchall():
-        saved=store.known_directory(due)
-        if saved is None:
-            # No longer in the map: removed with its parent's listing, which covers it.
-            gone.append(due);continue
-        # A name-withheld folder has no stored path; its inode finds it, in memory.
-        path=saved and (saved['path'] or walker.path_of(due))
-        if path:
-            roots_to_update[path]=saved
-            due_paths[saved['id']]=path;due_at[path]=due_ns
-            if recursive is None or recursive:recursive_roots.add(path)
-    if gone:store.forget_deferred(gone)
+    # Due deferrals, oldest first, read as ids only: each is resolved to its path when
+    # reached, so a backlog costs what this run's share re-lists, not its size (Big Mac,
+    # Nov 14: resolving 39 k due rows up front spent 31 s before any listing).
+    due=store.db.execute('SELECT id,recursive FROM dirty WHERE volume=? AND due_ns<=? ORDER BY due_ns',
+                         (volume.id,now)).fetchall()
+    due_scope={identity:recursive is None or bool(recursive) for identity,recursive in due}
+    decisions={}  # An event's ancestors are shared with the hour's other events.
+    def decide(path):
+        if path not in decisions:decisions[path]=policy.decide(shown_path(volume,path))
+        return decisions[path]
+    events={};recursive_roots=set()
     changes=list(changes)+reallocated(store,walker)
     for path,recursive in changes:
         if os.path.commonpath([path,volume.mount])!=volume.mount:
             continue
         # Changes inside excluded folders or this store must not re-walk their parent.
-        if policy.decide(shown_path(volume,path)).reason in ('excluded','own_store'):
+        if decide(path).reason in ('excluded','own_store'):
             continue
         # A descendant can look ordinary while an ancestor requires access.
         # Check the complete path policy before any inode-resolution open.
         ancestor=path
-        while policy.decide(shown_path(volume,ancestor)).descend:
+        while decide(ancestor).descend:
             if ancestor==volume.mount:break
             ancestor=os.path.dirname(ancestor)
         else:continue
         path,found=resolve_mapped(store,walker,volume,path)
         if found:
-            # A >20k-entry directory is visited at most daily. One already due
-            # is re-listed now, with this event's scope merged in: its listing
+            # A >20k-entry directory is visited at most daily. One already due is
+            # re-listed with its deferral, this event's scope merged in: its listing
             # discharges the deferral, so it must cover what the event needs.
-            path=due_paths.get(found['id'],path)
             listing=store.listing(found['id'])
-            if path not in roots_to_update and listing and listing['count']>LARGE_FOLDER_ENTRIES and now-listing['listed_ns']<86400*10**9:
+            if found['id'] not in due_scope and listing and listing['count']>LARGE_FOLDER_ENTRIES and now-listing['listed_ns']<86400*10**9:
                 if walking:supersede();continue
                 store.defer(found['id'],listing['listed_ns']+86400*10**9,recursive)
                 walker.gaps.add('large_directory_deferred')
                 continue
-            roots_to_update[path]=found
+            events[path]=found
             if recursive:recursive_roots.add(path)
-    # The deepest event under an already selected ancestor needs no second walk.
-    # Deferred folders first, oldest first, so a backlog drains even when each run's
-    # allowance covers little more than the new changes; then by depth, so an
-    # ancestor covers its subtree.
-    paths=sorted(roots_to_update,key=lambda path:(path not in due_at,due_at.get(path,0),len(path)))
     later=[]  # Left for the next run: the hour's allowance is spent.
     # Chosen folders, and those of them re-listed recursively: a path is covered when
     # chosen itself or below a recursive one, found by walking up its ancestors (the
@@ -183,18 +172,18 @@ def relist(store,walker,policy,volume,now,changes,pace=None,walking=False):
             path=parent
         return False
     complete=True
-    for path in paths:
-        if covered(path):continue
+    def update(path,previous,recursive,queued):
+        """Re-list one folder, or defer it when its share cannot cover it. `queued`: its
+        deferral already holds this scope, so a deferral is not written again."""
+        nonlocal complete
+        if covered(path):return
         chosen.add(path)
-        if path in recursive_roots:covering.add(path)
-        previous=roots_to_update[path]
-        recursive=path in recursive_roots
+        if recursive:covering.add(path)
         if not fits(previous['id'],recursive):
-            if walking:supersede();continue
+            if walking:supersede();return
             # Its share cannot cover it: a later run re-lists it first.
-            # One already queued keeps its row; only a new deferral is written.
-            if path not in due_at:later.append((previous['id'],now,recursive))
-            walker.gaps.add('update_deferred');continue
+            if not queued:later.append((previous['id'],now,recursive))
+            walker.gaps.add('update_deferred');return
         # Open it before anything is cleared: a walk lists nothing when the open is
         # denied, and a cleared, unwalked directory orphans whatever is staged beneath.
         if walker.directory_identity(path) is None:
@@ -203,22 +192,40 @@ def relist(store,walker,policy,volume,now,changes,pace=None,walking=False):
             if present:
                 # Still there but not listable (the walker named why): its last map
                 # stands and it is retried next hour.
-                store.defer(previous['id'],now+3600*10**9,recursive);continue
+                store.defer(previous['id'],now+3600*10**9,recursive);return
         else:present=True
         if not present:
             # Gone, or no longer a directory: drop its subtree; its parent's listing
             # records the removal or replacement. A parent gone too is recorded by
             # its own ancestor's listing; only an unlistable parent fails the update.
             store.clear_subtree(previous['id'])
-            if path==volume.mount:complete=False;continue
+            if path==volume.mount:complete=False;return
             parent,above=resolve_mapped(store,walker,volume,os.path.dirname(path))
             # Each way this can fail names itself: the run record is the only evidence.
             if not above:walker.gaps.add('parent_unresolved');complete=False
             elif not list_paced(parent,live_parent(store,walker,volume,parent,above['parent']),above['kind']=='private',False):
                 if os.path.lexists(parent):walker.gaps.add('parent_unlistable');complete=False
-            continue
+            return
         if recursive:store.clear_subtree(previous['id'])
         if not list_paced(path,live_parent(store,walker,volume,path,previous['parent']),previous['kind']=='private',recursive):complete=False
+    # Deferred folders first, oldest first, so a backlog drains even when each run's
+    # share covers little more than the new changes. Those not reached stay queued.
+    gone=[]
+    for identity,_ in due:
+        if pace is not None and not pace.covers(0):break
+        saved=store.known_directory(identity)
+        if saved is None:
+            # No longer in the map: removed with its parent's listing, which covers it.
+            gone.append(identity);continue
+        # A name-withheld folder has no stored path; its inode finds it, in memory.
+        path=saved['path'] or walker.path_of(identity)
+        if path:update(path,saved,due_scope[identity] or path in recursive_roots,True)
+    if gone:store.forget_deferred(gone)
+    # Then the changes, by depth, so an ancestor covers its subtree.
+    for path in sorted(events,key=len):
+        found=events[path];recursive=path in recursive_roots
+        # A due deferral not reached this run already queues it, unless the event widens it.
+        update(path,found,recursive,found['id'] in due_scope and (due_scope[found['id']] or not recursive))
     # A file hard-linked since a folder holding it was listed is a plain file there and
     # a holder in the re-listed folder, so its bytes would count twice. Re-list the
     # folders that still hold it as a plain file: every link is then a holder and the

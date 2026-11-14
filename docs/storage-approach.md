@@ -515,7 +515,10 @@ spends the allowance in this order:
 1. Every volume's hourly update, including merging its delta into the base. An update
    that reaches the allowance defers the folders it has not re-listed through the
    deferral table; the next run re-lists deferred folders first, oldest first, so a
-   backlog drains even at the floor. A merge that reaches it stops between batches:
+   backlog drains even at the floor. Each deferred folder is looked up only when its
+   turn comes, and those not reached stay queued, so a backlog costs what the share
+   re-lists, not its size (Big Mac, Nov 14: looking up 39 k due folders first spent
+   31 s of every run). A merge that reaches it stops between batches:
    the delta stays published over the base, so the map is unchanged, and the next run
    finishes the merge before scanning. A single folder's re-list is not split. A
    deferred refresh of a folder no longer in the map is dropped: the listing that
@@ -523,7 +526,9 @@ spends the allowance in this order:
 2. Paced walk work, which always gets at least 20 s even when the updates spent the
    allowance, so a walk of Big Mac (about 3,100 s with pruning and finishing) ends
    within a week. At the room measured on Nov 7–10 it takes about 1.5–2 days.
-3. Pruning a replaced map, in what is left.
+3. Pruning a replaced map, in what is left. A walk that is due prunes first, within
+   the walk floor, and records it as `prune`: Big Mac's replaced startup map (about
+   14 M rows) took about 2.4 M rows a run.
 
 The operator's `scan --full` is unpaced. The run row records `allowance_ns`, `room_ns`
 (null when unknown), CPU by stage (`stage_cpu`, ns: `walk` is a full walk's listing,

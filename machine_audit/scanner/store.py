@@ -417,7 +417,10 @@ class MapStore:
             self.db.execute('INSERT OR IGNORE INTO volumes(id,label,mount,status,lean) VALUES(?,?,?,?,?)',
                             (volume.id,volume.label,volume.mount,'building',int(lean)))
             self.db.execute('UPDATE volumes SET full_attempt_ns=? WHERE id=?',(time.time_ns(),volume.id))
+        # Recorded as pruning: a replaced map can take several runs' walk floor.
+        self.phase('prune')
         if not self.prune_generations(True,pace):return False
+        self.phase('prepare')
         old=self.db.execute('SELECT * FROM volumes WHERE id=?',(volume.id,)).fetchone()
         # How far along a walk is: the entries the previous full walk listed.
         expected=self.db.execute('SELECT sum(count) FROM listings WHERE generation=? AND volume=?',

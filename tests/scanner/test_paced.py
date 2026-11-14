@@ -289,6 +289,66 @@ class PacedWalkTests(unittest.TestCase):
             return original(store, identity, entries)
         return spent, patch.object(MapStore, 'listed', counted)
 
+    def test_a_deferral_backlog_drains_over_runs_within_the_bound_and_a_walk_keeps_its_floor(self):
+        # Big Mac, Nov 14 12:24-3:36 AM PT: after the startup volume's walk published,
+        # its 39 k due deferrals were each resolved to a path before any listing (31 s a
+        # run), and every run overran (135-173 s of 120) while another volume walked.
+        other = self.base / 'other'
+        for d in range(8):
+            (other / f'd{d}').mkdir(parents=True)
+            for f in range(4):(other / f'd{d}' / f'f{f}').write_bytes(b'o')
+        second = replace(self.volume, id='w', label='Second', mount=str(other))
+        filesystem = SimpleNamespace(volumes=lambda: [self.volume, second], sharing=lambda *args: None)
+        data = self.base / 'backlog'
+        self.assertEqual(self.scan(data, force=True, fs=filesystem)['status'], 'observed')
+        expected = self.published_map(data)
+        folders = [self.tree] + [p for p in self.tree.rglob('*') if p.is_dir()]
+        with self.db(data) as db:
+            db.execute("UPDATE volumes SET full_ns=? WHERE id='w'", (self.now - 8 * 24 * HOUR,))  # Its walk is due.
+            db.executemany("INSERT INTO dirty VALUES('v',?,?,0)", [(str(p.stat().st_ino), self.now - HOUR) for p in folders])
+        spent, counting = self.listing_clock(SECOND)
+        original = MapStore.known_directory
+        def looked_up(store, identity):  # Resolving a folder of the map costs 2 s.
+            spent[0] += 2 * SECOND
+            return original(store, identity)
+        def walked_entries():  # The second volume's walk: entries listed, or None once published.
+            with self.db(data) as db:
+                row = db.execute("SELECT entries FROM walks WHERE volume='w'").fetchone()
+            return row and row[0]
+        costs = [];walked = []
+        with counting, patch.object(MapStore, 'known_directory', looked_up):
+            for run in range(30):
+                before = spent[0];walk = walked_entries()
+                self.scan(data, events=self.events([], 50 + run), fs=filesystem, floor=25 * SECOND, clock=lambda: spent[0])
+                costs.append((spent[0] - before) // SECOND)
+                if walk is not None:walked.append((walked_entries() or 10**9) - walk)
+                with self.db(data) as db:
+                    if not db.execute("SELECT count(*) FROM dirty WHERE volume='v'").fetchone()[0]:break
+        # Each run: the 25 s allowance, the walk's 12 s floor and the one folder under
+        # way (a 2 s lookup and at most 6 entries); the backlog drains over many runs.
+        self.assertTrue(all(cost <= 25 + 12 + 8 for cost in costs), costs)
+        self.assertGreater(len(costs), 3, costs)
+        self.assertTrue(walked and all(step > 0 for step in walked), walked)
+        self.assertEqual(self.published_map(data), expected)
+
+    def test_pruning_a_replaced_map_before_a_walk_is_recorded_as_pruning(self):
+        # Big Mac, Nov 14: a due walk spent its 20 s floor each run pruning the startup
+        # volume's replaced map, recorded as 'prepare', which read as unexplained work.
+        data = self.updating_store()
+        with self.db(data) as db:
+            db.execute("INSERT INTO generations VALUES(99,1,'retired')")
+            for table in ('nodes', 'files', 'listings'):
+                db.execute(f'CREATE TEMP TABLE copy_{table} AS SELECT * FROM {table} WHERE generation=1')
+                db.execute(f'UPDATE copy_{table} SET generation=99')
+                db.execute(f'INSERT INTO {table} SELECT * FROM copy_{table}')
+            db.execute('UPDATE volumes SET full_ns=?', (self.now - 8 * 24 * HOUR,))
+        self.scan(data)
+        with self.db(data) as db:
+            stages = json.loads(db.execute('SELECT stage_cpu FROM runs ORDER BY started_ns DESC LIMIT 1').fetchone()[0])
+            self.assertIsNone(db.execute('SELECT 1 FROM generations WHERE id=99').fetchone())
+        self.assertIn('prune', stages)
+        self.assertIsNotNone(self.walk_row(data), 'the walk did not start after the pruning')
+
     def test_a_volume_queued_for_a_walk_keeps_its_hourly_update(self):
         # Big Mac, Nov 11 8:43 and 9:46 PM PT: while the startup volume walked, the
         # other eight volumes waited their turn with no hourly update.
