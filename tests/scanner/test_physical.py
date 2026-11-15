@@ -9,13 +9,15 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import json
 import unittest
+from unittest.mock import patch
 
 from machine_audit.budget import Budget
 from machine_audit.scanner.native import Volume
 from machine_audit.scanner.policy import Policy
 from machine_audit.scanner.runner import relist
-from machine_audit.scanner.store import MapStore, MapQuery
+from machine_audit.scanner.store import MapStore, MapQuery, MergePending
 from machine_audit.scanner.encoding import source_id
 from machine_audit.scanner.walker import Node, Walker
 
@@ -231,6 +233,95 @@ class SharingUpdateCostTests(unittest.TestCase):
             written = {r[0] for r in store.db.execute('SELECT id FROM nodes WHERE generation=?', (staged,))}
             self.assertEqual({str(source) for source in map(source_id, written)}, {'c7', 'family', 'root'})
             self.assertEqual(MapQuery(store.path).query('volumes')['rows'][0]['physical'], before)
+
+
+class ClonePairTests(unittest.TestCase):
+    """Four pairs of clones, each pair in two folders: 1 GB shared, 1 MB of each its own,
+    the shape of the image copies on Big Mac's startup volume (Nov 14)."""
+    PAIRS = 4
+    TRUE = PAIRS * (GB + 2 * MB)  # Each shared gigabyte once, every private megabyte.
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=SCRATCH)
+        self.addCleanup(self.temp.cleanup)
+        self.store = MapStore(Path(self.temp.name) / 'scanner.sqlite', Budget(self.temp.name, free_margin_bytes=0))
+        self.addCleanup(self.store.close)
+        self.volume = Volume('v', 'Synthetic', '/synthetic', 'apfs', 1, 100 * GB, 50 * GB, 50 * GB, self.TRUE)
+        self.extents = {}
+        for k in range(self.PAIRS):
+            for side in (0, 1):
+                self.extents[f'f{k}{side}'] = [(k * 10 * GB, GB), (k * 10 * GB + (5 + side) * GB, MB)]
+
+    def copy(self, k, side, allocated=GB + MB, private=MB):
+        folder = f'd{k}{side}'
+        self.store.directory(Node(folder, 'root', folder, 'directory', allocated, 0, 'observed', None, 0))
+        # A real map keys clone streams by integer and partial copies by text: both here.
+        stream = 1000 + 2 * k + side if k == 0 else f'f{k}{side}'
+        self.store.holder(f'f{k}{side}', folder, stream, allocated, private, True)
+
+    def publish(self, reader):
+        self.store.prepare(self.volume)
+        self.store.directory(Node('root', None, 'root', 'directory', 0, 0, 'observed', None, 0))
+        for k in range(self.PAIRS):
+            for side in (0, 1):self.copy(k, side)
+        self.store.finish_volume(self.volume, reader, [], full=True, lean=True)
+
+    def update(self, folders, *, stop=None):
+        self.store.prepare(self.volume, full=False)
+        for k, side in folders:
+            self.store.begin_directory(f'd{k}{side}')
+            self.copy(k, side)
+        try:self.store.finish_volume(self.volume, self.extents.__getitem__, [], full=False, lean=True, stop=stop)
+        except MergePending:pass  # Published; the spent budget only stops the merge.
+        return MapQuery(self.store.path).query('volumes')['rows'][0]
+
+    def test_relisting_unchanged_copies_with_the_reads_spent_keeps_their_sharing(self):
+        # Big Mac, Nov 14 10:27 AM PT: a catch-up update re-listed folders of 4 GB clone
+        # pairs; past its re-read cap it counted every stream by its allocation, and the
+        # folder above them gained 62.5 GB that is not on disk.
+        self.publish(self.extents.__getitem__)
+        with patch('machine_audit.scanner.store.SHARING_REREADS', 0, create=True):
+            row = self.update([(k, side) for k in range(self.PAIRS) for side in (0, 1)], stop=lambda: True)
+        self.assertEqual(row['physical'], self.TRUE)
+
+    def test_a_copy_left_unread_counts_only_its_own_bytes(self):
+        # A changed copy the update's share cannot read counts what APFS says is its own;
+        # the rest is unplaced, never counted beside its partner.
+        self.publish(self.extents.__getitem__)
+        self.store.prepare(self.volume, full=False)
+        self.store.begin_directory('d01')
+        self.copy(0, 1, allocated=GB + 2 * MB, private=2 * MB)
+        self.extents['f01'] = [(0, GB), (6 * GB, 2 * MB)]
+        try:self.store.finish_volume(self.volume, self.extents.__getitem__, [], full=False, lean=True, stop=lambda: True)
+        except MergePending:pass
+        row = MapQuery(self.store.path).query('volumes')['rows'][0]
+        self.assertLessEqual(row['physical'], self.TRUE + MB)
+        gaps = json.loads(self.store.db.execute("SELECT gaps FROM volumes WHERE id='v'").fetchone()[0])
+        self.assertIn('sharing_reread_capped', gaps)
+
+    def test_a_copy_made_beside_an_unchanged_original_is_measured_against_it(self):
+        # Only changed streams are read again, but a new copy's unchanged original in the
+        # same folder is read with it: the pair is one group, nothing left unplaced.
+        self.publish(self.extents.__getitem__)
+        self.store.prepare(self.volume, full=False)
+        self.store.begin_directory('d00')
+        self.copy(0, 0)
+        self.store.holder('g00', 'd00', 'g00', GB + MB, MB, True)
+        self.extents['g00'] = [(0, GB), (7 * GB, MB)]
+        self.store.finish_volume(self.volume, self.extents.__getitem__, [], full=False, lean=True)
+        row = MapQuery(self.store.path).query('volumes')['rows'][0]
+        self.assertEqual((row['physical'], row['unplaced_shared']), (self.TRUE + MB, 0))
+
+    def test_a_map_over_its_used_space_re_reads_copies_counted_apart_with_a_walk_open(self):
+        # Big Mac, Nov 14-15: the pairs an update counted apart stayed counted twice, the
+        # map stayed over its used space, and went invalid when the next walk began,
+        # until that walk would publish days later.
+        self.publish(None)  # Every copy by its allocation, as the capped update left them.
+        self.assertFalse(MapQuery(self.store.path).query('volumes')['rows'][0]['valid'])
+        self.store.begin_walk(self.volume, lean=True, bookmark=None, event_uuid=None, trigger='weekly_full')
+        self.store.walk = None  # The walk stays open while the hourly update runs.
+        row = self.update([])
+        self.assertEqual((row['valid'], row['physical']), (True, self.TRUE))
 
 
 class SharingProgressTests(unittest.TestCase):

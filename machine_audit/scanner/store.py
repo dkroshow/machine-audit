@@ -118,8 +118,6 @@ MERGE_ROWS=4096
 WRITE_ROWS=4096
 DIRTY_BATCH=256  # 16 pages a row: about 17 MB reserved a write.
 NODE_INSERT='INSERT OR REPLACE INTO nodes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)'
-# Re-read at most this many streams' extents in one hourly update.
-SHARING_REREADS=20_000
 # Format 3 adds a published delta. Format 4 measures physical space; its
 # folder figures mean something else, so a format 3 reader must refuse it.
 FORMAT=4
@@ -833,34 +831,48 @@ class MapStore:
         if self.base_gen is None:return None
         return self.db.execute('SELECT * FROM nodes WHERE generation=? AND volume=? AND id=?',(self.base_gen,self.vid,key)).fetchone()
 
-    def _sharing(self,reader,full):
+    def _sharing(self,reader,full,stop=None,repair=False):
         """Stage the sharing groups and per-folder terms of the streams this run touched.
 
-        A full walk takes every stream. An update takes the streams of re-listed or
-        removed folders, plus every stream
-        in their groups, so a changed copy is measured against the unchanged copies
-        it shares blocks with. `reader` gives a file's extents by inode, or is None
-        where none can be read (each stream then counts once, by its allocation).
+        A full walk takes every stream. An update takes the streams whose holders in
+        re-listed or removed folders changed, plus every stream in their groups, so a
+        changed copy is measured against the unchanged copies it shares blocks with;
+        an unchanged stream's terms stand. `repair` (a map over its used space) adds
+        the streams it counts in full though APFS says they share blocks
+        (_shared_in_full). `reader` gives a file's extents by inode, or is None where
+        none can be read (each stream then counts once, by its allocation). An update
+        reads extents until `stop` (its share is spent); a stream left unread counts
+        only the bytes APFS says are its own, the rest unplaced, so a stream never
+        counts blocks its partners hold.
         Returns (folders whose totals an update changes, gap codes)."""
-        gaps=set();known={};old_groups=set()
+        gaps=set();known={};old_groups=set();unread=set();repaired=set()
         if full:
             by_stream=((stream,list(found)) for stream,found in groupby(self._holder_pages(),key=lambda row:row[0]))
         else:
-            touched={r[0] for r in self.db.execute('''SELECT stream FROM holders WHERE generation=? AND volume=? AND dir IN
-                 (SELECT id FROM reset_dirs WHERE generation=? AND volume=? UNION SELECT id FROM removed WHERE generation=? AND volume=?)''',
-                 (self.base_gen,self.vid,self.generation,self.vid,self.generation,self.vid))}
-            touched.update(r[0] for r in self.db.execute('SELECT DISTINCT stream FROM holders WHERE generation=? AND volume=?',
-                                                         (self.generation,self.vid)))
+            def holding(generation,where,args):
+                found=defaultdict(set)
+                for row in self.db.execute(f'''SELECT stream,dir,file_id,allocated,private FROM holders
+                        WHERE generation=? AND volume=? AND {where}''',(generation,self.vid,*args)):
+                    found[row[0]].add(tuple(row[1:]))
+                return found
+            # Big Mac, Nov 14: re-measuring every stream of every re-listed folder took a
+            # catch-up past its reads, and the streams then counted in full (+62 GB).
+            listed_before=holding(self.base_gen,'''dir IN (SELECT id FROM reset_dirs WHERE generation=? AND volume=?
+                UNION SELECT id FROM removed WHERE generation=? AND volume=?)''',(self.generation,self.vid,self.generation,self.vid))
+            listed_now=holding(self.generation,'1',())
+            touched={s for s in listed_before.keys()|listed_now.keys() if listed_before.get(s)!=listed_now.get(s)}
+            # A copy made beside its original, in a folder whose other streams did not
+            # change, is measured against them: every stream of such a folder is read.
+            folders={row[0] for s in touched for row in listed_before.get(s,set())|listed_now.get(s,set())}
+            touched|={s for side in (listed_before,listed_now) for s,rows in side.items() if any(row[0] in folders for row in rows)}
+            if repair:
+                repaired=self._shared_in_full()-touched;touched|=repaired
             for stream in touched:
                 row=self._rows('streams','stream=?',(stream,)).fetchone()
                 if row:known[stream]=row;old_groups.add(row['grp'])
             for group in old_groups:
                 for row in self._rows('streams','grp=?',(group,)):
                     known[row['stream']]=row;touched.add(row['stream'])
-            if reader and len(touched)>SHARING_REREADS:
-                # Counted by stream until the next full walk: shared blocks between
-                # different streams may count twice, and the run says so.
-                reader=None;gaps.add('sharing_reread_capped')
             by_stream=((stream,[(stream,h['dir'],h['file_id'],h['allocated'],h['private'])
                                 for h in self._rows('holders','stream=?',(stream,))]) for stream in touched)
         # stream -> (holding folders, APFS private bytes, held by one file)
@@ -871,7 +883,8 @@ class MapStore:
                 files=tuple(dict.fromkeys(row[2] for row in found))
                 streams[stream]=(tuple(dict.fromkeys(row[1] for row in found)),found[0][4],len(files)==1)
                 ranges=None
-                if reader:
+                if reader and stop is not None and stop():unread.add(stream)
+                elif reader:
                     # A file deleted or replaced since the walk, or an extent the system
                     # reports oddly, costs that stream its sharing, never the run.
                     for file_id in files:
@@ -886,14 +899,17 @@ class MapStore:
                 yield stream,max(row[3] for row in found),ranges
         order,private,shared,group,overflowed=accounting.pieces(read())
         if overflowed:gaps.add('block_map_budget')
+        if unread:gaps.add('sharing_reread_capped')
         unplaced={}
         if reader and not full:
             # A copy made since the last full walk can share blocks with a file the
             # update did not read. APFS says how much of a single file is private;
-            # the rest is held, and counted, where its partner is.
+            # the rest is held, and counted, where its partner is. So too for a stream
+            # this update left unread, or one a repair found still alone.
             for i,stream in enumerate(order):
                 _,apfs_private,single=streams[stream];previous=known.get(stream)
-                if apfs_private is None or not single or (previous is not None and not previous['unplaced']):continue
+                if apfs_private is None or not single or group.get(stream) is not None:continue
+                if previous is not None and not previous['unplaced'] and stream not in unread|repaired:continue
                 unknown=min(private[i]-apfs_private,private[i])
                 if unknown>0:private[i]-=unknown;unplaced[stream]=unknown
         holding={stream:entry[0] for stream,entry in streams.items()}
@@ -950,6 +966,25 @@ class MapStore:
                             (self.generation,self.vid,stream,key,unplaced.get(stream,0)))
         self.flush()
         return affected,gaps
+
+    def _shared_in_full(self):
+        """Streams the published map counts in full though APFS says part of them is
+        shared: one holder, alone in its group, private bytes below its allocation; and
+        streams with bytes left unplaced. Re-read together while a map is over, a pair
+        an earlier update counted apart is measured as one group again."""
+        alone=[r[0] for r in self.db.execute('''SELECT stream FROM holders INDEXED BY holder_stream
+            WHERE generation=? AND volume=? AND private IS NOT NULL GROUP BY stream
+            HAVING count(*)=1 AND max(private)<max(allocated)''',(self.base_gen,self.vid))]
+        found=set()
+        for first in range(0,len(alone),500):
+            part=alone[first:first+500];marks=','.join('?'*len(part))
+            found.update(r[0] for r in self.db.execute(f'''SELECT s.stream FROM streams s WHERE s.generation=? AND s.volume=?
+                AND s.stream IN ({marks}) AND s.unplaced=0 AND NOT EXISTS(SELECT 1 FROM streams o INDEXED BY stream_group
+                WHERE o.generation=s.generation AND o.volume=s.volume AND o.grp=s.grp AND o.stream!=s.stream)''',
+                (self.base_gen,self.vid,*part)))
+        found.update(r[0] for r in self.db.execute('SELECT stream FROM streams INDEXED BY stream_unplaced WHERE generation=? AND volume=? AND unplaced>0',
+                                                   (self.base_gen,self.vid)))
+        return found
 
     def _holder_pages(self,size=20_000):
         """The staged holders in stream order, a page at a time. Each page is read in
@@ -1105,7 +1140,9 @@ class MapStore:
         if shared:affected,sharing_gaps=set(),set()
         else:
             self.phase('sharing')
-            affected,sharing_gaps=self._sharing(reader,full)
+            # A map over its used space re-reads what it may count twice (_shared_in_full).
+            over=old is not None and (not old['valid'] or 'reconciliation_deferred' in json.loads(old['gaps'] or '[]'))
+            affected,sharing_gaps=self._sharing(reader,full,stop,repair=not full and over)
         self.phase('aggregate')
         if full:self._aggregate_full()
         else:self._aggregate(affected|self.changed)

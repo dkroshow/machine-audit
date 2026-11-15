@@ -120,11 +120,18 @@ start of sharing. On Big Mac's startup volume (1.55 M folders, 1.06 M holders,
 267 k streams, Nov 10 2026) the whole pass took 127 s of CPU and 215 s, with
 560 k extent reads and a peak of 471 MiB.
 
-An hourly update re-reads the extents of every stream in the groups it
-touches, so a changed copy is measured against the unchanged copies it shares
-blocks with. At most 20,000 streams are read in one update; above that the
-update counts each stream once by its allocation and reports
-`sharing_reread_capped` until the next full walk. A copy made since the last
+An hourly update re-reads the extents of the streams whose holders changed and
+of every stream in their groups, so a changed copy is measured against the
+unchanged copies it shares blocks with; an unchanged stream in a re-listed
+folder keeps its terms. Reads stop when the update's share of the run is spent,
+like its listing: a stream left unread counts only the bytes APFS says are its
+own, the rest unplaced (`unplaced_shared`), and the run reports
+`sharing_reread_capped`. Neither ever counts a block its partner holds. (A fixed
+cap of 20,000 reads, which then counted each stream by its allocation, made a
+catch-up after a paced walk count 62.5 GB of clone pairs twice on Big Mac, Nov 14.)
+A map over its used space also re-reads, together, the streams it counts in full
+though APFS says they share blocks, so a pair counted apart is measured as one
+group again and the map can be judged valid before the next walk. A copy made since the last
 full walk and already changed when the update sees it has its own stream and
 a partner the update cannot know without saved addresses. APFS reports how
 many of its bytes are private; the rest is counted where the partner is. Its

@@ -382,7 +382,7 @@ at the volume root, or a deferred whole-root update, uses the full walker and
 full staging path. Recursive child
 events remain incremental subtree updates. The `shared_copy_placed_at_full_walk`
 and `sharing_reread_capped` gaps do not schedule a full scan; they wait for an
-independently required full.
+independently required full, and neither can count a shared block twice.
 There is no fixed ten-hour FSEvents expiration rule in this implementation.
 
 A selected directory replaced by a file before it opens records
