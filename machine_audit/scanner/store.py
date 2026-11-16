@@ -1,6 +1,6 @@
 """Private, compact scanner maps with staged atomic publication."""
 from __future__ import annotations
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from collections import defaultdict, deque
 from itertools import groupby, islice
 from array import array
@@ -117,6 +117,9 @@ MERGE_ROWS=4096
 # 8,192 rows reserved 0.54 GB there, 4,096 rows 0.27 GB.
 WRITE_ROWS=4096
 DIRTY_BATCH=256  # 16 pages a row: about 17 MB reserved a write.
+# How long a record of the run waits out a reader that pins the WAL checkpoint (Big Mac,
+# Nov 15 8:41 PM PT: the failure could not be written, and the run stayed 'running').
+PINNED_WAIT_S=60
 NODE_INSERT='INSERT OR REPLACE INTO nodes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)'
 # Format 3 adds a published delta. Format 4 measures physical space; its
 # folder figures mean something else, so a format 3 reader must refuse it.
@@ -273,8 +276,19 @@ class MapStore:
             self.db.execute(f'PRAGMA user_version={FORMAT}')
 
     @contextmanager
-    def write(self,growth=None,*,rows=None,payload_bytes=0):
-        with self.budget.sqlite_write(self.db,self.path,max_growth_bytes=growth,rows=rows,payload_bytes=payload_bytes) as admitted:
+    def write(self,growth=None,*,rows=None,payload_bytes=0,wait=False):
+        """One admitted transaction. `wait`: a record of the run, which waits up to
+        PINNED_WAIT_S for a reader that pins the checkpoint, rather than be lost."""
+        deadline=time.monotonic()+(PINNED_WAIT_S if wait else 0)
+        with ExitStack() as stack:
+            while True:
+                try:
+                    admitted=stack.enter_context(self.budget.sqlite_write(self.db,self.path,max_growth_bytes=growth,
+                                                                          rows=rows,payload_bytes=payload_bytes))
+                    break
+                except BudgetExceeded as exc:
+                    if exc.code!='checkpoint_pinned_by_reader' or time.monotonic()>=deadline:raise
+                    time.sleep(1)
             self.db.execute('BEGIN IMMEDIATE')
             try:
                 yield
@@ -331,20 +345,25 @@ class MapStore:
         if self.stage_mark is not None and self.run_context['stage'] is not None:
             stages[self.run_context['stage']]=stages.get(self.run_context['stage'],0)+cpu-self.stage_mark
         stages=json.dumps(stages,separators=(',',':'),sort_keys=True)
-        with self.write(rows=1,payload_bytes=sum(len(v.encode()) for v in context if v is not None)+len(stages)):
-            self.db.execute('''UPDATE runs SET updated_ns=?,entries=?,cpu_ns=?,peak_rss_bytes=?,written_bytes=?,status=?,ended_ns=?,
-                volume_id=?,action=?,trigger=?,stage=?,stage_cpu=?,extent_reads=?,allowance_ns=?,room_ns=? WHERE id=?''',
-                (time.time_ns(),self.entries,cpu,int(r.ru_maxrss*(1 if sys.platform=='darwin' else 1024)),
-                 written,status,
-                 None if status=='running' else time.time_ns(),*context,stages,self.extent_reads,
-                 self.allowance_ns,self.room_ns,self.run))
+        try:
+            # A run's last row waits out a reader; a progress row is skipped, the next one lands.
+            with self.write(rows=1,payload_bytes=sum(len(v.encode()) for v in context if v is not None)+len(stages),
+                            wait=status!='running'):
+                self.db.execute('''UPDATE runs SET updated_ns=?,entries=?,cpu_ns=?,peak_rss_bytes=?,written_bytes=?,status=?,ended_ns=?,
+                    volume_id=?,action=?,trigger=?,stage=?,stage_cpu=?,extent_reads=?,allowance_ns=?,room_ns=? WHERE id=?''',
+                    (time.time_ns(),self.entries,cpu,int(r.ru_maxrss*(1 if sys.platform=='darwin' else 1024)),
+                     written,status,
+                     None if status=='running' else time.time_ns(),*context,stages,self.extent_reads,
+                     self.allowance_ns,self.room_ns,self.run))
+        except BudgetExceeded as exc:
+            if status!='running' or exc.code!='checkpoint_pinned_by_reader':raise
 
     def record_volumes(self,results):
         """Each volume's outcome codes for this run (status, action, trigger, gaps,
         reason, entries): the scheduled scanner keeps no output, so the run row is
         the only place a per-volume failure can be read back."""
         data=json.dumps(results,separators=(',',':'))
-        with self.write(rows=1,payload_bytes=len(data)):
+        with self.write(rows=1,payload_bytes=len(data),wait=True):
             self.db.execute('UPDATE runs SET volumes=? WHERE id=?',(data,self.run))
 
     def prepare(self,volume,full=True,lean=True):
@@ -451,12 +470,15 @@ class MapStore:
         self.walk['runs']+=1
         return self.walk
 
-    def walk_valid(self,walk,*,lean,event_uuid):
-        """A checkpoint is dropped, and its walk starts over, when the volume's event
-        history was replaced (its start bookmark means nothing), when name access
-        changed, or when its generation is gone (an older release pruned it)."""
-        return (walk['event_uuid']==event_uuid and walk['lean']==int(lean) and
-                self.db.execute("SELECT 1 FROM generations WHERE id=? AND status='building'",(walk['generation'],)).fetchone() is not None)
+    def walk_stale(self,walk,*,lean,event_uuid):
+        """Why a checkpoint is dropped and its walk starts over, or None: the volume's
+        event history was replaced (its start bookmark means nothing), name access
+        changed, or its generation is gone (an older release pruned it)."""
+        if walk['event_uuid']!=event_uuid:return 'event_history_replaced'
+        if walk['lean']!=int(lean):return 'name_access_changed'
+        if self.db.execute("SELECT 1 FROM generations WHERE id=? AND status='building'",(walk['generation'],)).fetchone() is None:
+            return 'generation_gone'
+        return None
 
     def staged_count(self,table):
         """Rows of `table` in the generation being built: the size of a walk's pieces."""
@@ -1385,7 +1407,7 @@ class MapStore:
         # failure is the run's, not the map's.
         if self.db.execute('SELECT 1 FROM volumes WHERE id=? AND ? IN (generation,delta_generation)',
                            (self.volume,self.generation)).fetchone():return
-        with self.write(rows=1,payload_bytes=len(status.encode())):
+        with self.write(rows=1,payload_bytes=len(status.encode()),wait=True):
             self.db.execute('UPDATE volumes SET status=?,budget_retry_bytes=? WHERE id=?',(status,retry_bytes,self.volume))
 
     def close(self):self.db.close()

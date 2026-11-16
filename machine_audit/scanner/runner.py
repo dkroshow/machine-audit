@@ -501,13 +501,33 @@ def run_scan(data_dir, *, full_disk_access=False, full=False, grain='files', roo
                     action,trigger=('update','hourly_update') if update_due else ('wait',trigger)
                 store.phase('events',action=action,trigger=trigger)
                 event_uuid=events.uuid(volume.device)
-                if walk and not store.walk_valid(walk,lean=not full_disk_access,event_uuid=event_uuid):
-                    store.drop_walk(volume.id);walk=None;walk_trigger='walk_restarted'
+                if event_uuid is None and (old and old['event_uuid'] or walk):
+                    # No answer is not a replaced history: the map, its bookmark and any
+                    # walk's checkpoint stand, and the next run asks again.
+                    store.phase('complete',action='skip',trigger='events_unavailable')
+                    results.append({'volume_id':volume.id,'status':old['status'] if old else 'building',
+                                    'action':'skip','trigger':'events_unavailable'})
+                    continue
+                stale=walk and store.walk_stale(walk,lean=not full_disk_access,event_uuid=event_uuid)
+                if stale:  # The reason is recorded with the walk that starts over.
+                    store.drop_walk(volume.id);walk=None;walk_trigger='walk_restarted_'+stale
                 if action=='update' and old['event_uuid']!=event_uuid:action,trigger,walk_trigger='wait','event_uuid_mismatch',walk_trigger or 'event_uuid_mismatch'
                 replay=None
                 if action=='update':
-                    replay=events.replay(volume.device,old['bookmark'])
-                    if replay.lost:
+                    # Big Mac, Nov 15, under load: fseventsd refused to start the replay
+                    # stream three runs running, and each run failed whole. The map and
+                    # its bookmark stand, so the next run replays the same window; after a
+                    # day without one, the volume walks.
+                    try:replay=events.replay(volume.device,old['bookmark'])
+                    except OSError:replay=None
+                    if replay is None and now-old['observed_ns']<86400*10**9:
+                        if walk_trigger:walking.append((volume,walk_trigger,event_uuid))
+                        store.phase('complete',action='skip',trigger='events_unavailable')
+                        results.append({'volume_id':volume.id,'status':old['status'],'action':'skip',
+                                        'trigger':'events_unavailable'})
+                        continue
+                    if replay is None:action,trigger='wait','events_unavailable'
+                    elif replay.lost:
                         action,trigger='wait',replay.loss_reason or 'events_lost'
                     elif any(recursive and not os.path.normpath('/'+relative.lstrip('/')).strip('/')
                              for relative,recursive in replay.paths.items()):

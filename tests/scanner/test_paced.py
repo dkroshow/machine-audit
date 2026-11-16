@@ -349,6 +349,52 @@ class PacedWalkTests(unittest.TestCase):
         self.assertIn('prune', stages)
         self.assertIsNotNone(self.walk_row(data), 'the walk did not start after the pruning')
 
+    def open_walk(self, data):
+        """A published map of the tree with a paced walk under way and paused."""
+        self.assertEqual(self.scan(data, force=True)['status'], 'observed')
+        with self.db(data) as db:
+            db.execute('UPDATE volumes SET full_ns=?', (self.now - 8 * 24 * HOUR,))
+        spent, counting = self.listing_clock(10 * SECOND)
+        with counting:self.scan(data, floor=25 * SECOND, clock=lambda: spent[0])
+        walk = self.walk_row(data)
+        self.assertEqual(walk['phase'], 'listing')
+        return walk, spent, counting
+
+    def test_an_unanswered_event_history_keeps_the_walk_checkpoint(self):
+        # The volume's event-history id unread (fseventsd not answering under load) is not
+        # a replaced history: the walk keeps its checkpoint and goes on when it answers.
+        data = self.base / 'unanswered'
+        walk, spent, counting = self.open_walk(data)
+        silent = SimpleNamespace(uuid=lambda device: None, current_id=lambda: 30, replay=lambda device, since: Replay(up_to=30))
+        result = self.scan(data, events=silent)
+        self.assertEqual(result['volumes'][0]['trigger'], 'events_unavailable')
+        self.assertEqual(self.walk_row(data), walk)
+        with counting:self.scan(data, floor=25 * SECOND, clock=lambda: spent[0])
+        self.assertGreater((self.walk_row(data) or {'entries': 10**9})['entries'], walk['entries'])
+        # A history that is replaced (Big Mac, Nov 15 after a kernel panic) restarts the
+        # walk by rule, and the run row says why.
+        replaced = SimpleNamespace(uuid=lambda device: 'replaced', current_id=lambda: 5, replay=lambda device, since: Replay(up_to=5))
+        with counting:result = self.scan(data, events=replaced, floor=25 * SECOND, clock=lambda: spent[0])
+        self.assertEqual(result['volumes'][0]['trigger'], 'walk_restarted_event_history_replaced')
+        self.assertEqual(self.walk_row(data)['trigger'], 'walk_restarted_event_history_replaced')
+
+    def test_a_replay_error_skips_the_volume_keeping_its_bookmark_and_walks_after_a_day(self):
+        # Big Mac, Nov 15 12:48, 2:08 and 3:23 PM PT: fseventsd refused to start the
+        # replay stream, and each run failed whole with os_error_OSError.
+        data = self.updating_store()
+        def refused(device, since):raise OSError('events_start_failed')
+        failing = SimpleNamespace(uuid=lambda device: 'events', current_id=lambda: 40, replay=refused)
+        with self.db(data) as db:
+            before = db.execute("SELECT bookmark,observed_ns FROM volumes WHERE id='v'").fetchone()
+        result = self.scan(data, events=failing)
+        self.assertEqual(result['status'], 'observed')
+        self.assertEqual((result['volumes'][0]['action'], result['volumes'][0]['trigger']), ('skip', 'events_unavailable'))
+        with self.db(data) as db:
+            self.assertEqual(db.execute("SELECT bookmark,observed_ns FROM volumes WHERE id='v'").fetchone(), before)
+        self.now += 24 * HOUR  # A day without a replay: the volume walks instead.
+        self.scan(data, events=failing)
+        self.assertEqual(self.walk_row(data)['trigger'], 'events_unavailable')
+
     def test_a_volume_queued_for_a_walk_keeps_its_hourly_update(self):
         # Big Mac, Nov 11 8:43 and 9:46 PM PT: while the startup volume walked, the
         # other eight volumes waited their turn with no hourly update.

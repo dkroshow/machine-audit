@@ -6,6 +6,7 @@ import json
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
 import unittest
@@ -481,6 +482,30 @@ class RootPublicationTests(unittest.TestCase):
         self.assertEqual((status, result['failure_recorded'], result['stage']), ('unexpected_error_RuntimeError', True, 'sharing'))
         self.assertIn('test_open:pinned_failure', ' '.join(result['at']))
         self.assertNotIn('synthetic failure', repr(result))
+
+    def test_a_refusal_is_recorded_once_a_reader_that_pins_the_checkpoint_lets_go(self):
+        # Big Mac, Nov 15 8:41 PM PT: a reader pinned the WAL, the walk's write was
+        # refused, recording the refusal was refused too, and the run stayed 'running'.
+        held = threading.Event()
+        def reader():
+            db = sqlite3.connect(f'file:{self.data / "scanner.sqlite"}?mode=ro', uri=True, isolation_level=None, timeout=0)
+            db.execute('BEGIN');db.execute('SELECT count(*) FROM runs').fetchone()
+            held.set();time.sleep(7);db.close()  # Past the 5 s busy timeout, as the live reader was.
+        def refused(store, *args):
+            threading.Thread(target=reader).start();held.wait()
+            # A frame newer than the reader's snapshot: no checkpoint can pass it. With no
+            # busy wait, each checkpoint is refused at once, as the live ones were.
+            store.db.execute("UPDATE map_meta SET value=value WHERE key='next_generation'")
+            store.db.execute('PRAGMA busy_timeout=0')
+            raise BudgetExceeded('checkpoint_pinned_by_reader')
+        with patch.object(MapStore, '_aggregate_full', refused), \
+             patch('machine_audit.scanner.runner.time.time_ns', return_value=86500*10**9):
+            result, status = self.scan([self.volume])  # The run row ends: not left 'running'.
+        # The walk's refusal is recorded and the run finishes: a progress row the reader
+        # pins is skipped, not fatal.
+        self.assertNotIn('at', result)
+        with sqlite3.connect(self.data/'scanner.sqlite') as db:
+            self.assertEqual(db.execute('SELECT status FROM volumes').fetchone()[0], 'budget_blocked_checkpoint_pinned_by_reader')
 
     def test_failed_volume_retries_requested_full_before_successful_map_cooldown(self):
         with sqlite3.connect(self.data/'scanner.sqlite') as db:

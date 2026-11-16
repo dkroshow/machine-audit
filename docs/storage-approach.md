@@ -547,7 +547,19 @@ resumes. A resumed folder's path is found again from its inode (`fsgetpath`), in
 only; a folder gone since is skipped, and its parent's change event corrects the map.
 Deferred name-withheld folders are found the same way. A failed attempt (an exception
 the scanner catches) does not resume: its checkpoint is dropped and the retry rules
-decide the next walk. So does a change of the volume's event UUID or name access.
+decide the next walk. So does a replaced event history (a new event UUID, as every
+volume of Big Mac had after a kernel panic on Nov 15: the walk's start bookmark points into
+a history that is gone, so the changes during the walk could never be replayed) or a
+change of name access. The new walk's trigger records why: `walk_restarted_` and
+`event_history_replaced`, `name_access_changed` or `generation_gone`. A transient lack of
+answer keeps the checkpoint: a run that cannot prove Full Disk Access skips a
+full-access volume (`access_unverified`), and one whose event UUID cannot be read skips
+the volume (`events_unavailable`).
+
+**A replay the system refuses.** When fseventsd will not start the replay stream (Big
+Mac, Nov 15, under load: three runs failed whole), that volume's update is skipped
+(`events_unavailable`); its map and bookmark stand, so the next run replays the same
+window and the other volumes go on. After a day without a replay, the volume walks.
 
 **Each volume's update gets its share.** A volume's demand is what its update re-listed in
 the last run plus the folders queued for it, at about 500 µs an entry (a re-list costs
